@@ -1,0 +1,29 @@
+{
+  "name": "kest",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch src/index.ts",
+    "check": "bun check --no-script",
+    "fmt": "bun fmt --no-script",
+    "fmt:check": "bun fmt --check --no-script",
+    "test": "bun test",
+    "build": "bun run scripts/build.ts",
+    "build:exe": "bun run scripts/build.ts --standalone",
+    "test:live": "bun run scripts/smoke-live.ts"
+  },
+  "dependencies": {
+    "@opentui/core": "0.7.0",
+    "diff": "9.0.0",
+    "openai": "7.45.1"
+  },
+  "engines": {
+    "bun": ">=1.4.4"
+  },
+  "packageManager": "bun@1.4.4",
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
