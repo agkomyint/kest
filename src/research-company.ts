@@ -363,7 +363,7 @@ export class CompanyRuntime {
 }
 export function formatCompany(state?: CompanyState | null) {
   if (!state)
-    return "No research run yet. /research <objective> starts a budgeted company workflow.";
+    return "No research run yet. /research start <objective> (or /research <objective>) starts a budgeted company workflow.";
   validateCompany(state);
   const used = state.inputTokens + state.outputTokens + state.estimatedTokens;
   let tokens = `Tokens: ${used.toLocaleString("en-US")}/${state.maxTokens === null ? "no token cap" : state.maxTokens.toLocaleString("en-US")} · input ${state.inputTokens.toLocaleString("en-US")} + output ${state.outputTokens.toLocaleString("en-US")} + estimated ${state.estimatedTokens.toLocaleString("en-US")} (pending/missing provider usage)`;

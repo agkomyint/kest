@@ -26,6 +26,7 @@ export type SlashCommand = (typeof slashCommands)[number];
 
 export const slashSubcommands: Record<string, string[]> = {
   "/research": [
+    "start",
     "prepare",
     "resume",
     "budget",

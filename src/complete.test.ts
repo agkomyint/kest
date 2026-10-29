@@ -11,6 +11,8 @@ test("top-level prefix suggests research and resume", () => {
 });
 
 test("child level suggests research subcommands", () => {
+  expect(completeCandidates("/research ")).toContain("/research start");
+  expect(completeCandidates("/research ")).toContain("/research resume");
   expect(completeCandidates("/research ")).toContain("/research budget");
   expect(completeCandidates("/research ")).toContain("/research tokens");
   expect(completeCandidates("/research b")).toEqual(["/research budget"]);
@@ -18,6 +20,7 @@ test("child level suggests research subcommands", () => {
     "/research models",
     "/research model",
   ]);
+  expect(completeCandidates("/research s")).toEqual(["/research start"]);
   expect(completeCandidates("/connect ")).toEqual([
     "/connect modal",
     "/connect baseten",
