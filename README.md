@@ -42,7 +42,8 @@ A small loading indicator appears while the agent works; only the completed fina
 | `shell`      | Runs TypeScript directly in Bun; follows permission setting       |
 | `set_plan`   | Replaces the agent's task plan; tracked step by step              |
 | `update_task`| Marks a plan task pending, doing, or done                         |
-| `spawn_subagent` | Delegates exploration to a read-only subagent; returns findings as text |
+| `spawn_subagent` | Delegates exploration to a read-only subagent; returns findings as text. With `background: true`, returns at once and wakes the agent with the findings in a later turn |
+| `background_status` / `background_cancel` | Lists background tasks and results, or cancels one by ID |
 
 Press **y** to approve or **n** to deny. File tools stay inside the workspace, check symlinks, exclude credential files, and detect changes made while awaiting approval. Existing files must be read before editing. Large diffs require smaller edits. Shell commands run with your permissions and are not sandboxed; inspect the displayed command before approving. Shell output is bounded and commands have a 60-second timeout. Cancellation terminates their process tree. Modal environment credentials are omitted from shell subprocesses.
 
@@ -51,6 +52,8 @@ The agent can run up to 20 model/tool rounds per message. It keeps completed too
 ## Goals, plans, and subagents
 
 Set an objective with `/goal <text>` — it is stored in the session, survives `/resume`, and steers every reply. For multi-step work the agent breaks the goal into tasks with `set_plan` and tracks them with `update_task`; `/tasks` shows the checklist and progress. Research delegation supports leads, workers, reviewers, configured model profiles and bounded teams; see the research-company workflow below. Usage from all workers counts in `/usage`, and cancelling the director cancels its descendants.
+
+The agent estimates each call's cost from its own observed tool timings. Independent read-only calls in one reply run in parallel; long independent research can be delegated with `spawn_subagent` `background: true` (at most three at once), which returns immediately while the agent keeps working. When a background task finishes or fails, its result wakes the agent in a new turn — or, if a turn is already active, it is injected as a reminder at the head of the next turn, exactly once. Dependent, stateful, or approval-gated work stays sequential, and background findings still require the director's evidence check and independent review before they support a conclusion.
 
 ## Research company
 

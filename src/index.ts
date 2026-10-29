@@ -50,37 +50,55 @@ if (args.includes("--help") || args.includes("-h")) {
       session.research = agent.research;
       await saveSession(session);
     }
+    const emit = (event: import("./agent").AgentEvent) => {
+      if (event.type === "usage") {
+        void recordUsage(event.model, event.input, event.output).catch(() =>
+          console.error("Could not save token usage to disk."),
+        );
+      }
+      if (
+        event.type === "tool" &&
+        event.state !== "running" &&
+        event.durationMs !== undefined
+      ) {
+        (session.toolStats ??= []).push({
+          name: event.name,
+          durationMs: event.durationMs,
+          error: event.state === "error",
+        });
+      }
+      if (event.type === "text")
+        process.stdout.write(
+          event.delta.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, ""),
+        );
+      if (event.type === "tool")
+        console.error(`[${event.state}] ${event.name}`);
+      if (event.type === "checkpoint")
+        console.error(`\n[Research checkpoint ${event.cycle} · continuing]`);
+      if (event.type === "background")
+        console.error(
+          `[background ${event.state}] ${event.taskId.slice(0, 8)} ${event.task}`,
+        );
+      if (event.type === "worker" && event.event?.type !== "text")
+        console.error(
+          `[${event.workerId.slice(0, 8)} ${event.role} ${event.model}] ${event.event?.type === "tool" ? `${event.event.name}: ${event.event.state}` : event.event?.type === "status" ? event.event.text : event.state}`,
+        );
+    };
     try {
-      await agent.run(prompt, credentials, controller.signal, (event) => {
-        if (event.type === "usage") {
-          void recordUsage(event.model, event.input, event.output).catch(() =>
-            console.error("Could not save token usage to disk."),
-          );
-        }
-        if (
-          event.type === "tool" &&
-          event.state !== "running" &&
-          event.durationMs !== undefined
-        ) {
-          (session.toolStats ??= []).push({
-            name: event.name,
-            durationMs: event.durationMs,
-            error: event.state === "error",
-          });
-        }
-        if (event.type === "text")
-          process.stdout.write(
-            event.delta.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, ""),
-          );
-        if (event.type === "tool")
-          console.error(`[${event.state}] ${event.name}`);
-        if (event.type === "checkpoint")
-          console.error(`\n[Research checkpoint ${event.cycle} · continuing]`);
-        if (event.type === "worker" && event.event?.type !== "text")
-          console.error(
-            `[${event.workerId.slice(0, 8)} ${event.role} ${event.model}] ${event.event?.type === "tool" ? `${event.event.name}: ${event.event.state}` : event.event?.type === "status" ? event.event.text : event.state}`,
-          );
-      });
+      await agent.run(prompt, credentials, controller.signal, emit);
+      // Background wake-up: let finished background work start a new turn
+      // instead of stranding its result until the user happens to return.
+      while (!controller.signal.aborted && agent.hasRunningBackground()) {
+        await agent.waitForBackground();
+        const wakes = agent.takeBackgroundWakeups();
+        if (!wakes.length) break;
+        await agent.run(
+          wakes.join("\n\n"),
+          credentials,
+          controller.signal,
+          emit,
+        );
+      }
       console.log();
     } catch {
       console.error(

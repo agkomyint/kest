@@ -40,7 +40,6 @@ test("manual summaries reserve persisted project budget and cannot bypass its li
   });
   const agent = new Agent(cwd, async () => false);
   agent.research = newCompany("Summary accounting");
-  agent.research.maxRequests = 1;
   agent.connectionOverride = {
     provider: "fixture",
     baseURL: `http://127.0.0.1:${server.port}/v1`,
@@ -55,6 +54,8 @@ test("manual summaries reserve persisted project budget and cannot bypass its li
       () => {},
     );
     expect(agent.research.requests).toBe(1);
+    // Exhaust the time budget: the next summary must not start a request.
+    agent.research.elapsedMs = agent.research.maxMs;
     await expect(
       agent.summarizeContext(
         "History",
@@ -70,7 +71,7 @@ test("manual summaries reserve persisted project budget and cannot bypass its li
   }
 });
 
-test("a 13-to-12 request transition enters final review, even for long objectives", async () => {
+test("entering the last 10% of the time budget enters final review, even for long objectives", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "kest-company-final-review-"));
   let reviewerCalls = 0,
     reconciled = false;
@@ -112,7 +113,8 @@ test("a 13-to-12 request transition enters final review, even for long objective
   });
   const agent = new Agent(cwd, async () => false);
   agent.research = newCompany("Long research objective. ".repeat(150));
-  agent.research.maxRequests = 14;
+  agent.research.maxMs = 60_000;
+  agent.research.elapsedMs = 55_000;
   agent.connectionOverride = {
     provider: "fixture",
     baseURL: `http://127.0.0.1:${server.port}/v1`,
@@ -129,7 +131,7 @@ test("a 13-to-12 request transition enters final review, even for long objective
     expect(reviewerCalls).toBe(1);
     expect(reconciled).toBe(true);
     expect(agent.research.reviews).toBe(1);
-    expect(agent.research.requests).toBe(4);
+    expect(agent.research.requests).toBe(2);
   } finally {
     server.stop(true);
     await agent.browser.close();
@@ -137,9 +139,8 @@ test("a 13-to-12 request transition enters final review, even for long objective
   }
 });
 
-test("company request reservations enforce shared concurrency and hard request limits", async () => {
+test("company reservations enforce shared concurrency; requests are metered, not limited", async () => {
   const state = newCompany("Test budget");
-  state.maxRequests = 5;
   state.parallel = 2;
   const runtime = new CompanyRuntime(state);
   let active = 0,
@@ -161,8 +162,8 @@ test("company request reservations enforce shared concurrency and hard request l
       }
     }),
   );
-  expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(5);
-  expect(state.requests).toBe(5);
+  expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(8);
+  expect(state.requests).toBe(8);
   expect(peak).toBe(2);
   expect(() => runtime.addAgent(4)).toThrow("depth");
   state.agents = 11;
@@ -301,6 +302,13 @@ test("company prompt is refreshed once and research teams cannot expand read-onl
   const resumed = new Agent(process.cwd(), async () => false, [
     { role: "system", content: systemPrompt(process.cwd()) },
   ]);
+  // Plain sessions carry no research block; opting in adds exactly one.
+  expect(
+    String(resumed.messages[0]!.content).match(/<kest-research-company>/g),
+  ).toBeNull();
+  resumed.research = newCompany("resumed study");
+  resumed.refreshResearchPrompt();
+  resumed.refreshResearchPrompt();
   const prompt = String(resumed.messages[0]!.content);
   expect(prompt.match(/<kest-research-company>/g)).toHaveLength(1);
   expect(prompt).toContain("REVIEW BOARD");

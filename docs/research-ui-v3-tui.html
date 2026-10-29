@@ -1,0 +1,67 @@
+<meta charset="utf-8"><title>Kest Research UI v3 — TUI-integrated</title>
+<style>
+*{box-sizing:border-box}body{background:#070a10;color:#d6deeb;font:14px/1.5 system-ui;margin:0;padding:24px}main{max-width:1060px;margin:auto}
+h1{font-size:20px;margin:0 0 4px}h2{font-size:12px;letter-spacing:.09em;text-transform:uppercase;color:#8b98a9;margin:26px 0 9px}
+.sub,.dim{color:#8b98a9}.mono{font-family:ui-monospace,Consolas,monospace;font-size:13px}
+.tui{background:#0c111b;border:1px solid #26303d;border-radius:10px;padding:12px 16px;font-family:ui-monospace,Consolas,monospace;font-size:13px;white-space:pre;overflow:auto;line-height:1.45}
+.g{color:#50dca0}.y{color:#f5c26b}.r{color:#ff7b86}.b{color:#6cb6ff}.p{color:#d5acff}.m{color:#a8b5c9}.w{color:#e6edf7}
+table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid #232b36;padding:7px 8px;text-align:left;vertical-align:top}th{color:#8b98a9;font-size:12px}
+details{margin:3px 0}summary{cursor:pointer;color:#79c0ff;list-style:none}pre{background:#0d1117;border:1px solid #232b36;border-radius:8px;padding:10px;overflow:auto;color:#9fb0c3;font:12px ui-monospace}
+.note{background:#10161f;border:1px solid #232b36;border-radius:8px;padding:11px 14px;color:#aebac7}
+kbd{background:#1c242f;border:1px solid #2a3441;border-radius:4px;padding:0 5px;font:11px ui-monospace;color:#c9d4e3}
+</style><main>
+<h1>v3 — Integrated into your actual TUI</h1>
+<p class="sub">Audited layout (<span class="mono">src/ui.ts:253-370</span>): <span class="mono">scroll (flexGrow) → activity → status (1 line) → hints (1 line) → modelTag → promptBox h=5 → footer</span>. No sidebar exists, terminal width is scarce. v3 uses only these slots — zero new layout regions.</p>
+
+<h2>A · Normal research run (mid-experiment)</h2>
+<div class="tui"><span class="b">&gt;</span> <span class="w">Research binary-heavy benchmarks, review literature, make ours faster. Prove it.</span>
+
+<span class="g">●</span> <span class="w">Literature: 9 papers matter</span>  <span class="m">3 contradictions · 14m</span>            <span class="b">▸</span>
+<span class="g">●</span> <span class="w">Baseline reproduced 1.00× ±0.8%</span>  <span class="m">11m</span>                    <span class="b">▸</span>
+<span class="y">◐</span> <span class="w">E2 value-separation running</span>  <span class="m">run 3/5 · +17.9% so far</span>       <span class="b">▸</span>
+<span class="m">──────────────────────────────────────────────────────────────</span>
+<span class="y">⠹ E2 · bench run 3/5…</span>   <span class="m">│</span> <span class="w">⏱ 41/120m</span> <span class="g">▓▓▓░░░░░</span> <span class="w">tok 118/400k</span> <span class="g">▓▓░░░░░░</span> <span class="w">req 63/300</span> <span class="g">▓▓░░░░░░</span> <span class="w">agents 4/8</span>
+<span class="m">goal: binary-heavy… · Tasks 3/6 · ↑↓ explore · Ctrl+O raw · ? ask Kest</span>
+<span class="p">● baseten:a · Muse-Spark</span>                                    <span class="m">D:\kest</span></div>
+<p class="sub">Budget HUD lives in the existing 1-line <span class="mono">status</span> (<span class="mono">ui.ts:272, 581-589</span> already renders goal+tasks there) — extended, not added. Bars only turn <span style="color:#f5c26b">amber ≥70%</span> / <span style="color:#ff7b86">red ≥90%</span>; below that they're dim. One glance, no numbers wall.</p>
+
+<h2>B · Mid-experiment question — Decision Sheet (reuses your approval UI)</h2>
+<p class="sub">Your TUI already has the pattern: <span class="mono">ask()</span> at <span class="mono">ui.ts:1401</span> hides composer, y/n only. v3 generalizes it to <b>multiple-choice at safe checkpoints only</b> (between phases/experiments — never mid-tool). Agent pauses, work is checkpointed first (<span class="mono">research-company.ts:350</span>), so answering late costs nothing.</p>
+<div class="tui"><span class="y">◐</span> <span class="w">E2 finished +18.2% · E3 (256B values) regressed −6%</span>
+
+<span class="w">? Direction needed — literature contradiction confirmed</span>
+<span class="m">  WiscKey gain only holds ≥1KB. Our workload is mixed (median 700B).</span>
+
+<span class="g">&gt; 1  Optimize for ≥1KB path, accept 256B as-is</span>   <span class="m">~15m · est. 40k tok</span>
+<span class="m">  2  Try adaptive: separate only values ≥512B</span>    <span class="m">~35m · est. 90k tok · risk: complexity</span>
+<span class="m">  3  Stop experimenting, go to review + report</span>   <span class="m">saves remaining budget</span>
+<span class="m">  4  Type your own direction…</span>
+
+<span class="y">⏸ Paused at checkpoint · budget frozen</span> <span class="m">│ ⏱ 41/120m ▓▓▓░░░░░ · tok 121/400k</span>
+<span class="m">↑↓ choose · Enter confirm · 1-4 quick pick · Esc = keep going with option 1</span></div>
+
+<table><tr><th>Trigger (auto)</th><th>Question type</th><th>Default on Esc/timeout</th></tr>
+<tr><td>Experiment contradicts hypothesis / kill-criterion hit</td><td>Direction (2–4 options + cost each)</td><td>Pre-declared plan default</td></tr>
+<tr><td>Any budget ≥80% (<span class="mono">research-company.ts:263,291</span> already throws)</td><td>Extend / narrow scope / wrap up</td><td>Wrap up: checkpoint + report</td></tr>
+<tr><td>Literature gap: no artifact, single-source claim</td><td>Trust it / verify empirically / drop claim</td><td>Verify empirically</td></tr>
+<tr><td>Reviewer failed (your 7623e1e9 case)</td><td>Retry / accept 2-of-3 / replace reviewer</td><td>Accept + note limitation</td></tr>
+<tr><td>Novelty claim about to be written</td><td>Confirm scope of claim</td><td>Weaken claim wording</td></tr></table>
+<p class="sub">Hard cap: <b>≤1 question per phase, batched</b>. Questions queue at checkpoint, never interrupt a running tool. Non-urgent ones degrade to a <span class="mono">? 2 decisions pending</span> chip on the L0 line — explorer pulls them when ready. This is the anti-cognitive-overload guard.</p>
+
+<h2>C · Budget UI — three states only</h2>
+<div class="tui"><span class="m">HEALTHY (&lt;70%)</span>  <span class="w">⏱ 41/120m</span> <span class="g">▓▓▓░░░░░</span>  <span class="w">tok 118/400k</span> <span class="g">▓▓░░░░░░</span>  <span class="m">— dim, ignore it</span>
+<span class="y">WATCH   (70–90%)</span>  <span class="y">⏱ 96/120m ▓▓▓▓▓▓░░</span>  <span class="m">+ forecast on L1: “at current burn, review won't fit → reserve locked”</span>
+<span class="r">CRITICAL (≥90%)</span>  <span class="r">⏱ 114/120m ▓▓▓▓▓▓▓░</span>  <span class="m">+ Decision Sheet auto-opens at next checkpoint (extend/narrow/stop)</span></div>
+<p class="sub">Reserve is already real in your code: director reserve at <span class="mono">research-company.ts:213,306</span>. HUD shows it as the hollow segment <span class="mono">░░</span> = protected for review+report, so user sees <i>usable</i> vs <i>total</i>. Extend-budget reuses existing commands (<span class="mono">ui.ts:1852 budget</span>, <span class="mono">1826 tokens</span>) — Decision Sheet just calls them. Also add per-phase burn in L1 only: <span class="mono">Literature 62k · Experiments 41k · Review reserved 80k</span>.</p>
+
+<h2>D · What changes in code (small, additive)</h2>
+<table><tr><th>Piece</th><th>Where</th><th>Change</th></tr>
+<tr><td>Run-card accumulator</td><td class="mono">ui.ts:1473 event()</td><td>Buffer per-turn; render L0 line instead of add("tool") per call (1549/1573)</td></tr>
+<tr><td>Budget HUD</td><td class="mono">ui.ts:581 ready() + status</td><td>Append 3 mini-bars from session.research (maxMs/maxTokens/maxRequests already tracked)</td></tr>
+<tr><td>Decision Sheet</td><td class="mono">ui.ts:1401 ask()</td><td>Generalize {finish(bool)} → {finish(optionId)}; reuse listPicker rendering (ui.ts:197, 1194)</td></tr>
+<tr><td>Decision triggers</td><td class="mono">agent.ts checkpoint + research-company.ts:263</td><td>Emit new AgentEvent "decision" at phase boundaries; UI opens sheet ≤1/phase</td></tr>
+<tr><td>Raw depth</td><td class="mono">ui.ts:714 renderTool()</td><td>Unchanged — becomes L2/L3 under ▸ / Ctrl+O</td></tr>
+<tr><td>Colors</td><td class="mono">theme.ts:2-15</td><td>No new colors: accent=ok, tool=amber, error=red, user=blue links</td></tr></table>
+
+<div class="note"><b>Net TUI delta:</b> same 7 layout slots, same keys plus <kbd>↑↓</kbd> explore / <kbd>1-4</kbd> decide / <kbd>Ctrl+O</kbd> raw. Scrollback: 214 tool rows → 6 outcome lines + decision moments the user actually made. Their decisions are recorded in the report (“user chose option 2 at E2”) — provenance for direction, not just data.</div>
+</main>

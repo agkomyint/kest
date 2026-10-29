@@ -1,0 +1,86 @@
+<meta charset="utf-8"><title>Kest — Explorer Tool UI v2</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#0b0f14;color:#d6deeb;font:14px/1.5 ui-monospace,Consolas,monospace;padding:28px;max-width:1100px;margin:auto}
+h1{font:600 20px system-ui;margin:0 0 4px}h2{font:600 12px system-ui;letter-spacing:.09em;text-transform:uppercase;color:#8b98a9;margin:28px 0 10px}
+.sub,p{color:#9fb0c3;font-family:system-ui}.term{background:#0d1117;border:1px solid #232b36;border-radius:10px;padding:16px}
+.dim{color:#5f6d7d}.ok{color:#3fb950}.err{color:#f85149}.warn{color:#e3b341}.link{color:#79c0ff;cursor:pointer}
+/* L0 */
+.l0{display:flex;gap:10px;align-items:baseline;padding:8px 10px;border-radius:8px;cursor:pointer}
+.l0:hover{background:#131a24}.l0 .t{color:#e6edf3;font-family:system-ui;font-weight:600}.grow{flex:1}
+details{margin:2px 0}summary{list-style:none;cursor:pointer}summary::-webkit-details-marker{display:none}
+/* L1 */
+.l1{margin:4px 0 8px 26px;border-left:1px solid #232b36;padding-left:14px}
+.node{padding:5px 8px;border-radius:6px;cursor:pointer;font-family:system-ui}
+.node:hover{background:#131a24}.node small{color:#6e7b8b;font-family:ui-monospace}
+.l2{margin:4px 0 6px 22px;color:#9fb0c3;font-size:13px}
+pre{background:#090c10;border:1px solid #1c242f;border-radius:6px;padding:9px;overflow:auto;color:#7d8da1;font-size:12px}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#3fb950;vertical-align:middle}.dot.r{background:#f85149}.dot.y{background:#e3b341}
+table{width:100%;border-collapse:collapse;font-family:system-ui}td,th{border-bottom:1px solid #232b36;padding:7px 8px;text-align:left;vertical-align:top}th{color:#8b98a9;font-size:12px}
+kbd{background:#1c242f;border:1px solid #2a3441;border-bottom-width:2px;border-radius:4px;padding:0 5px;font:11px ui-monospace;color:#c9d4e3}
+.note{font-family:system-ui;color:#aebac7;background:#10161f;border:1px solid #232b36;border-radius:8px;padding:12px 14px}
+</style>
+<h1>Kest Tool UI v2 — Explorer model</h1>
+<p class="sub">Principle: <b style="color:#e6edf3">show the minimum, make everything findable.</b> User is an explorer, not a monitor. They glance, spot what interests them, pull that thread. Click the ▸ below — it's live.</p>
+
+<h2>Layer 0 — Glance (default, &le;1 line per turn)</h2>
+<div class="term">
+  <details>
+    <summary><span class="l0"><span class="dot r"></span><span class="t">Benchmark improved +18.2%</span><span class="grow dim">review incomplete — 2 of 3</span><span class="dim">1m 48s</span><span class="link">▸ explore</span></span></summary>
+
+    <!-- L1 -->
+    <div class="l1">
+      <details><summary><div class="node">✓ &nbsp;What was tested <small>· experiment</small></div></summary>
+        <div class="l2">Binary-heavy benchmark, 4 runs. 3 bugs fixed along the way <span class="link">(which?)</span>
+          <details><summary class="link" style="font-size:12px">▸ the 3 fixes</summary><pre>edit bench/cp.ts      Windows cp path   +6 −2   [diff]
+edit bench/measure.ts timing bug        +9 −5   [diff]
+edit bench/prng.ts    PRNG seed         +12 −4  [diff]</pre></details>
+        </div></details>
+
+      <details><summary><div class="node"><span class="err">✕</span> &nbsp;Why review is incomplete <small>· the interesting bit</small></div></summary>
+        <div class="l2">Reviewer B timed out after 42.8s. A &amp; C independently concur (+18.0%, +18.4%). Checkpoint already notes this limitation.
+          <details><summary class="link" style="font-size:12px">▸ reviewer B log</summary><pre>[error] reviewer 7623… timeout 42.8s · Muse-Spark-Open-816B
+[last] re-running benchmark3.json from scratch… (no return)</pre></details>
+          <div><span class="link">[ retry B ]</span> <span class="link">[ accept 2/3 ]</span></div>
+        </div></details>
+
+      <details><summary><div class="node">✓ &nbsp;What changed <small>· 4 files</small></div></summary>
+        <div class="l2"><pre>analysis3.md  +84   ledger.md  updated   bench/*.ts  3 fixes</pre></div></details>
+
+      <details><summary><div class="node dim">· &nbsp;13 tools, 62k tokens, raw log <small>— only if you go looking</small></div></summary>
+        <div class="l2"><pre>▸ read ×3  342ms · ▸ shell bench ×4  19.4s · ▸ spawn ×3  42.8s … (current flat view, preserved)</pre></div></details>
+    </div>
+  </details>
+  <div class="l0"><span class="dot"></span><span class="t">Ledger updated</span><span class="grow dim">all checks pass</span><span class="dim">12s</span><span class="link">▸</span></div>
+</div>
+<p style="font-size:13px">Success = one dim line. Anomaly words (<span class="err">incomplete</span>) are the only thing in color — that's the explorer's hook.</p>
+
+<h2>The 4-layer contract</h2>
+<table>
+<tr><th>Layer</th><th>User intent</th><th>Show</th><th>Hide</th></tr>
+<tr><td><b>L0 Glance</b></td><td>“did it work?”</td><td>Outcome sentence in human words, 1 status dot, total time</td><td>Tool names, counts, IDs, ms, files</td></tr>
+<tr><td><b>L1 Explore</b></td><td>“what catches my eye?”</td><td>3–5 curiosity nodes phrased as questions/topics, anomalies first</td><td>Chronology — order by interest, not time</td></tr>
+<tr><td><b>L2 Investigate</b></td><td>“show me that one”</td><td>Only the opened node: diff, result, or reviewer log + actions (retry/accept)</td><td>Everything else stays shut</td></tr>
+<tr><td><b>L3 Audit</b></td><td>“prove it”</td><td>Full raw log — current view, behind <kbd>Ctrl+O</kbd></td><td>Never in default scrollback</td></tr>
+</table>
+
+<h2>Cognitive-load cuts vs v1</h2>
+<table>
+<tr><th>v1 (still heavy)</th><th>v2</th></tr>
+<tr><td>4 phases always visible + chips per phase</td><td>Phases become L1 nodes, only seen on explore</td></tr>
+<tr><td>“13 tools · 3 workers · 4 files · 62k tokens” stats line</td><td>Deleted. Stats are L3 curiosity, not a headline</td></tr>
+<tr><td>Fixed order: Evidence→Experiment→Review→Synthesis</td><td><b>Interest-ordered:</b> anomaly first, then result, then changes. Boring-but-fine sinks</td></tr>
+<tr><td>Labels are system nouns (<code>spawn_subagent</code>)</td><td>Nodes are user questions: “Why is review incomplete?”</td></tr>
+<tr><td>Expand-all expands everything</td><td>One node open at a time (accordion); closing turn collapses all</td></tr>
+</table>
+
+<h2>Explorer affordances</h2>
+<div class="note">
+• <b>Hooks, not summaries:</b> L0 deliberately leaves one open loop (<i>“review incomplete”</i>) — explorers pull threads, monitors read reports.<br>
+• <b>Keyboard:</b> <kbd>Tab</kbd> jumps between L1 nodes · <kbd>Enter</kbd> opens · <kbd>Ctrl+O</kbd> raw · <kbd>Esc</kbd> collapses to L0.<br>
+• <b>Follow-thread:</b> opening a node offers its next thread only (<i>fixes → diff → that file</i>), never siblings.<br>
+• <b>While running:</b> L0 line rewrites in place: <span class="warn">⠹ Reviewing — 2 of 3 back…</span> No rows accumulate.<br>
+• <b>Memory:</b> collapsed turns persist as L0 lines only, so scrollback reads as a story of outcomes, searchable by result.
+</div>
+
+<h2>Implementation (unchanged cost)</h2>
+<p>Same buffer in <code>src/ui.ts:1473 event()</code>: accumulate per turn → render L0 on completion. L1 nodes derived from data already present: errors (worker <code>ui.ts:1462</code>), writes (diff stats), slowest tool. Existing <code>renderTool()</code> (<code>ui.ts:714</code>) becomes L2/L3. Accordion = one <code>expandedNode</code> id per run card.</p>

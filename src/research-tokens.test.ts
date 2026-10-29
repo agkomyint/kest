@@ -129,18 +129,19 @@ test("in-flight token reservations survive a crash before provider usage arrives
   }
 });
 
-test("research workers preserve director experiment budget while reviewers can use the review reserve", async () => {
+test("research requests are metered, not limited, for workers and reviewers", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "kest-director-reserve-"));
   const state = newCompany("Implementation reserve");
   state.requests = 70;
   const runtime = new CompanyRuntime(state, cwd);
   try {
-    await expect(
-      runtime.acquire("fixture", "worker", AbortSignal.timeout(5000), {
-        id: "worker",
-        depth: 1,
-      }),
-    ).rejects.toThrow("director implementation");
+    const workerRelease = await runtime.acquire(
+      "fixture",
+      "worker",
+      AbortSignal.timeout(5000),
+      { id: "worker", depth: 1 },
+    );
+    workerRelease();
     const release = await runtime.acquire(
       "fixture",
       "reviewer",
@@ -148,7 +149,7 @@ test("research workers preserve director experiment budget while reviewers can u
       { id: "reviewer", depth: 1, role: "reviewer" },
     );
     release();
-    expect(state.requests).toBe(71);
+    expect(state.requests).toBe(72);
   } finally {
     await rm(cwd, {
       recursive: true,

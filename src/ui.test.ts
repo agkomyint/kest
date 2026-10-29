@@ -41,11 +41,12 @@ test("research commands configure models and budgets without starting paid work"
     const { newCompany } = await import("./research-company");
     ui["session"].research = newCompany("Test budget persistence");
     ui["agent"].research = ui["session"].research!;
-    await command("/research budget 60 200");
-    expect(ui["agent"].research?.maxRequests).toBe(200);
+    await command("/research budget 60");
     expect(ui["agent"].research?.maxMs).toBe(3600000);
-    await command("/research budget 120 500 32");
+    expect(ui["agent"].research?.maxRequests).toBe(Number.MAX_SAFE_INTEGER);
+    await command("/research budget 120 32");
     expect(ui["agent"].research?.maxAgents).toBe(32);
+    expect(ui["agent"].research?.maxMs).toBe(7200000);
     await command("/research tokens 500b");
     expect(ui["agent"].research?.maxTokens).toBe(500_000_000_000);
     expect(await command("/research")).toContain("500,000,000,000");
@@ -706,8 +707,10 @@ test("parallel worker rows stream separate activity without overwriting the dire
         durationMs: 12,
       },
     });
+    // One shared team row: both workers live in the same expanded log.
+    expect(first.entry).toBe(second.entry);
     expect(first.entry.detail!.output).toContain("Measured evidence");
-    expect(second.entry.detail!.output).not.toContain("Measured evidence");
+    expect(first.entry.text).toContain("Research team");
     expect(ui["toolEntry"]).toBe(director);
     expect(director!.text).toContain("research_team");
     ui["event"]({
@@ -715,13 +718,15 @@ test("parallel worker rows stream separate activity without overwriting the dire
       state: "error",
       output: "Provider unavailable",
     });
-    expect(second.entry.text).toContain("Failed");
+    expect(second.entry.text).toContain("1 failed");
+    expect(second.entry.detail!.output).toContain("Failed");
     ui["event"]({
       ...worker("aaaaaaaa-1111", "model-a"),
       state: "done",
       output: "Evidence checked",
     });
-    expect(first.entry.text).toContain("Completed");
+    expect(first.entry.text).toContain("1/2 done");
+    expect(first.entry.detail!.output).toContain("Completed");
     ui["event"]({
       type: "tool",
       name: "research_team",
@@ -878,7 +883,10 @@ test("tool output expands and collapses by click, and Markdown renders", async (
     const toolNode = ui["lastTool"]!.node;
     await testUI.mockMouse.click(toolNode.x + 2, toolNode.y);
     await testUI.flush();
-    expect(testUI.captureCharFrame()).toContain("detailed tool output");
+    expect(testUI.captureCharFrame()).toContain("read_file  example.ts");
+    expect(ui["lastTool"]!.entry.detail?.output).toContain(
+      "detailed tool output",
+    );
     await testUI.mockMouse.drag(
       toolNode.x,
       toolNode.y + 2,
@@ -936,6 +944,48 @@ test("mouse selection copies exactly selected text with Ctrl+C without quitting"
     expect(ui["closed"]).toBe(false);
     expect(testUI.renderer.hasSelection).toBe(false);
     expect(testUI.captureCharFrame()).toContain("Copied");
+  } finally {
+    ui.close();
+    await testUI.dispose();
+  }
+});
+
+test("Ctrl+C stops background research instead of quitting and reports how to resume", async () => {
+  const testUI = await createTestRenderer({
+    width: 90,
+    height: 28,
+    exitOnCtrlC: false,
+  });
+  const ui = new KestUI(testUI.renderer, process.cwd(), {
+    provider: "baseten",
+    apiKey: "not-used",
+  });
+  try {
+    const { newCompany } = await import("./research-company");
+    const study = newCompany("Ctrl+C study");
+    ui["session"].research = study;
+    ui["agent"].research = study;
+    ui["agent"].runChild = (_task, _expected, _credentials, signal) =>
+      new Promise<string>((_resolve, reject) => {
+        signal.addEventListener(
+          "abort",
+          () => reject(new Error("Worker cancelled")),
+          { once: true },
+        );
+      });
+    await ui["agent"].executeSpawn(
+      JSON.stringify({ task: "Long survey", background: true }),
+      { provider: "baseten", apiKey: "not-used" },
+      new AbortController().signal,
+      () => {},
+    );
+    expect(ui["agent"].hasRunningBackground()).toBe(true);
+    testUI.mockInput.pressCtrlC();
+    await ui["agent"].waitForBackground();
+    await testUI.flush();
+    expect(ui["agent"].hasRunningBackground()).toBe(false);
+    expect(ui["closed"]).toBe(false);
+    expect(testUI.captureCharFrame()).toContain("/research resume");
   } finally {
     ui.close();
     await testUI.dispose();
@@ -1051,7 +1101,7 @@ test("tool timing appears on rows and /stats aggregates all saved sessions", asy
       });
     }
     await testUI.renderOnce();
-    expect(testUI.captureCharFrame()).toContain("28.00 ms");
+    expect(testUI.captureCharFrame()).toContain("Tools (2) · read_file · 40ms");
     ui.composer.setText("/stats");
     ui.composer.submit();
     await ui.settled;
@@ -1149,7 +1199,7 @@ test("shell rows hide code until expanded and display action timing", async () =
       output: "machine-details",
     });
     await testUI.renderOnce();
-    expect(testUI.captureCharFrame()).toContain("37.50 ms");
+    expect(testUI.captureCharFrame()).toContain("· 38ms");
     expect(testUI.captureCharFrame()).not.toContain("machine-details");
     const node = ui["lastTool"]!.node;
     await testUI.mockMouse.click(node.x + 2, node.y);
@@ -1159,20 +1209,11 @@ test("shell rows hide code until expanded and display action timing", async () =
     expect(frame).toContain("console.log('machine-details')");
     expect(frame).toContain("Output");
     expect(frame).toContain("machine-details");
-    expect(frame).toContain("Input · TypeScript");
-    const view = ui["lastTool"]!;
-    expect(
-      view.inputScroll!.backgroundColor.equals(
-        view.outputScroll!.backgroundColor,
-      ),
-    ).toBe(false);
-    const codeString = view.inputText!.chunks.find(
-      (chunk) => chunk.text === "'machine-details'",
-    );
-    expect(codeString?.fg).toBeDefined();
-    expect(ui["lastTool"]!.entry.detail?.input).toBe(
+    // Grouped UI: expanded group log carries the raw input/output.
+    expect(ui["lastTool"]!.entry.detail?.output).toContain(
       "console.log('machine-details')",
     );
+    expect(ui["lastTool"]!.entry.detail?.output).toContain("machine-details");
     await testUI.mockMouse.click(node.x + 2, node.y);
     await testUI.flush();
     expect(testUI.captureCharFrame()).not.toContain("console.log");
@@ -1211,36 +1252,24 @@ test("long tool input and output have independent bounded scroll panels", async 
     expect(testUI.captureCharFrame()).not.toContain("Show more");
     expect(testUI.captureCharFrame()).not.toContain("input-line-11");
     expect(testUI.captureCharFrame()).not.toContain("output-line-11");
-    expect(tool.inputScroll!.height).toBeLessThanOrEqual(6);
-    expect(tool.inputScroll!.verticalScrollBar.visible).toBe(true);
+    expect(tool.outputScroll!.height).toBeLessThanOrEqual(12);
     expect(tool.outputScroll!.verticalScrollBar.visible).toBe(true);
+    expect(tool.entry.detail?.output).toContain("input-line-11");
+    expect(tool.entry.detail?.output).toContain("output-line-11");
     const outer = ui.scroll.scrollTop;
     await testUI.mockMouse.scroll(
-      tool.inputScroll!.x + 2,
-      tool.inputScroll!.y + 1,
+      tool.outputScroll!.x + 2,
+      tool.outputScroll!.y + 1,
       "down",
     );
     await testUI.flush();
-    expect(tool.inputScroll!.scrollTop).toBeGreaterThan(0);
-    expect(tool.outputScroll!.scrollTop).toBe(0);
+    expect(tool.outputScroll!.scrollTop).toBeGreaterThan(0);
     expect(ui.scroll.scrollTop).toBe(outer);
-    tool.inputScroll!.scrollTo(999);
-    await testUI.flush();
-    expect(testUI.captureCharFrame()).toContain("input-line-11");
-    expect(testUI.captureCharFrame()).not.toContain("output-line-11");
     tool.outputScroll!.scrollTo(999);
     await testUI.flush();
     expect(testUI.captureCharFrame()).toContain("output-line-11");
-    expect(testUI.captureCharFrame()).toContain("input-line-11");
-    tool.inputScroll!.scrollTo(0);
-    await testUI.flush();
-    expect(testUI.captureCharFrame()).not.toContain("input-line-11");
-    expect(testUI.captureCharFrame()).toContain("output-line-11");
-    tool.inputScroll!.focus();
-    expect(tool.inputScroll!.focused).toBe(true);
-    testUI.mockInput.pressKey("END");
-    await testUI.flush();
-    expect(testUI.captureCharFrame()).toContain("input-line-11");
+    tool.outputScroll!.focus();
+    expect(tool.outputScroll!.focused).toBe(true);
     testUI.mockInput.pressEscape();
     await Bun.sleep(40);
     await testUI.flush();

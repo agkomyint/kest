@@ -73,6 +73,12 @@ import {
   saveResearchEndpoint,
 } from "./research-models";
 import { formatContext, describeMessages, type ContextState } from "./context";
+import {
+  budgetHud,
+  formatDuration,
+  shouldOpenBudgetDecision,
+  truncateMiddle,
+} from "./research-hud";
 
 const clean = (s: string) => s.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
 // Kestrel vocabulary for ambient states, Claude-style.
@@ -203,6 +209,20 @@ export class KestUI {
     confirm: (value: string) => void;
   } | null = null;
   private approval: { finish: (value: boolean) => void } | null = null;
+  private pauseDecisionPending = false;
+  private budgetSyncedAt = 0;
+  private teamGroup: { entry: Entry; node: TextRenderable } | null = null;
+  private toolGroup: {
+    entry: Entry;
+    node: TextRenderable;
+    count: number;
+    failures: number;
+    totalMs: number;
+    running: number;
+    log: string;
+    names: string[];
+    titles: string[];
+  } | null = null;
   private closed = false;
   settled: Promise<void> = Promise.resolve();
   private inputHistory: string[] = [];
@@ -403,6 +423,7 @@ export class KestUI {
     renderer.on("destroy", () => {
       this.closed = true;
       this.active?.abort();
+      this.agent.cancelBackground();
       this.approval?.finish(false);
       this.stopLoading();
       void this.clipboard?.dispose().catch(() => {});
@@ -427,7 +448,131 @@ export class KestUI {
     );
     agent.modelOverride = this.effectiveModel();
     agent.research = this.session?.research ?? null;
+    agent.onBackground = () => {
+      void this.wakeFromBackground();
+    };
     return agent;
+  }
+
+  // Ctrl+C / Esc: stop the active turn and any background work with it.
+  // During a research run this is a PAUSE: state flips to paused, the
+  // session is saved, and a decision sheet opens once the turn unwinds.
+  private stopActiveWork() {
+    const study = this.agent.research ?? this.session.research;
+    if (study && this.active) {
+      study.status = "paused";
+      this.session.research = study;
+      this.pauseDecisionPending = true;
+      void saveSession(this.session).catch(() => {});
+    }
+    this.agent.cancelBackground();
+    this.active?.abort();
+  }
+
+  private stoppedMessage(): string {
+    const study = this.agent.research ?? this.session.research;
+    return study
+      ? `Research paused · progress checkpointed in research/${study.id}/ · choose below or /research resume.`
+      : "Stopped. Completed tool actions are kept.";
+  }
+
+  // Live HUD: snapshot elapsed + local clock since last budget sync.
+  private liveHud(): string {
+    const study = this.agent.research ?? this.session.research;
+    if (!study) return "";
+    const live =
+      this.active && this.budgetSyncedAt
+        ? study.elapsedMs + (performance.now() - this.budgetSyncedAt)
+        : study.elapsedMs;
+    return budgetHud(study, live);
+  }
+
+  // Decision sheet after a research pause: resume, extend, wrap up, stay.
+  private openPauseDecision() {
+    const study = this.session.research;
+    if (!study || this.closed || this.listPicker) return;
+    const over = shouldOpenBudgetDecision(study);
+    this.info(
+      `⏸ Research paused at checkpoint · ${this.liveHud()}${over ? " · budget watch/critical" : ""}`,
+    );
+    this.openListPicker(
+      "? Research paused — direction?",
+      [
+        "Resume research",
+        "Extend time budget (+30 min) and resume",
+        "Wrap up: review + final report now",
+        "Stay paused (resume later with /research resume)",
+      ],
+      ["resume", "extend", "wrapup", "stay"],
+      (value) => {
+        if (value === "stay" || !this.session.research) {
+          this.ready();
+          return;
+        }
+        if (value === "extend") {
+          study.maxMs += 30 * 60_000;
+        }
+        study.status = "running";
+        void saveSession(this.session).catch(() => {});
+        this.composer.setText(
+          value === "wrapup"
+            ? "Wrap up now: stop new experiments, run independent review of existing evidence, and write the final report with limitations and the evidence chain."
+            : "Resume the research from the last checkpoint. Continue within budget; do not repeat completed work.",
+        );
+        this.settled = this.submit();
+      },
+    );
+  }
+
+  // A finished background task wakes the agent in its own turn. If a turn
+  // is already active, the wake-up stays queued and is drained at the head
+  // of the next turn instead.
+  private async wakeFromBackground() {
+    if (
+      this.closed ||
+      this.active ||
+      this.connectStep ||
+      this.listPicker ||
+      !this.credentials
+    )
+      return;
+    const wakes = this.agent.takeBackgroundWakeups();
+    if (!wakes.length) return;
+    this.info("Background result arrived · waking the agent to review it.");
+    this.active = new AbortController();
+    const start = performance.now();
+    try {
+      await this.agent.run(
+        wakes.join("\n\n"),
+        this.credentials,
+        this.active.signal,
+        (event) => this.event(event),
+      );
+      this.stopLoading();
+      this.flushResponse();
+      this.status.content = `Landed · ${((performance.now() - start) / 1000).toFixed(1)}s`;
+    } catch (error) {
+      if (!this.active?.signal.aborted)
+        this.info(
+          error instanceof Error ? clean(error.message) : "Action failed.",
+        );
+    } finally {
+      this.stopLoading();
+      this.pendingText = "";
+      this.active = null;
+      this.session.messages = this.agent.messages;
+      this.session.context = this.agent.context;
+      this.session.research = this.agent.research ?? undefined;
+      this.session.tasks = this.agent.tasks;
+      try {
+        await saveSession(this.session);
+      } catch {
+        if (!this.closed) this.info("Could not save session to disk.");
+      }
+      if (!this.closed && !this.connectStep && !this.approval)
+        this.composer.focus();
+      void this.wakeFromBackground();
+    }
   }
   private activeKeyCredential(provider: Provider): Credentials | null {
     if (this.credentials?.provider === provider) return this.credentials;
@@ -518,7 +663,8 @@ export class KestUI {
     const total = this.session.tasks.length;
     const done = this.session.tasks.filter((t) => t.status === "done").length;
     const tasks = total ? `Tasks ${done}/${total}` : "";
-    this.status.content = [goal, tasks].filter(Boolean).join(" · ");
+    const hud = this.session.research ? this.liveHud() : "";
+    this.status.content = [goal, tasks, hud].filter(Boolean).join(" · ");
     if (!this.credentials) {
       this.modelTag.visible = true;
       this.modelTag.content = "○ /connect";
@@ -854,8 +1000,13 @@ export class KestUI {
     }
     if (key.name === "c" && key.ctrl) {
       key.preventDefault();
-      if (this.active) this.active.abort();
-      else this.close();
+      if (this.active) this.stopActiveWork();
+      else if (this.agent.hasRunningBackground()) {
+        // Ctrl+C with only background work running stops that work and
+        // stays open; a second Ctrl+C with nothing running quits.
+        this.agent.cancelBackground();
+        this.info(this.stoppedMessage());
+      } else this.close();
       return;
     }
     const panel = this.lastTool?.inputScroll?.focused
@@ -895,7 +1046,7 @@ export class KestUI {
         this.secretValue = this.tokenId = "";
         this.restoreInput();
       } else if (this.approval) this.approval.finish(false);
-      else if (this.active) this.active.abort();
+      else if (this.active) this.stopActiveWork();
       else this.composer.setText("");
       return;
     }
@@ -1361,19 +1512,22 @@ export class KestUI {
   private workerEvent(event: Extract<AgentEvent, { type: "worker" }>) {
     let worker = this.workerViews.get(event.workerId);
     if (!worker) {
-      const added = this.add(
-        "tool",
-        `→ ${event.role} ${event.workerId.slice(0, 8)} · ${event.model}`,
-        {
-          input: `Task: ${event.task}\nRole: ${event.role}\nModel: ${event.model}\nParent: ${event.parentId}\nDepth: ${event.depth}\n\nClick this row for live activity. /agents ${event.workerId.slice(0, 8)} inspects its transcript.`,
+      // All workers share ONE team row — never a row per researcher.
+      if (!this.teamGroup) {
+        const added = this.add("tool", "→ Research team", {
+          input: "Research team — expand for per-worker activity. /agents <id> inspects a transcript.",
           output: "Starting…",
           language: "text",
-        },
-      );
+        });
+        this.teamGroup = {
+          entry: added.entry,
+          node: added.node as TextRenderable,
+        };
+      }
       worker = {
         meta: event,
-        entry: added.entry,
-        view: this.toolViews.get(added.node as TextRenderable)!,
+        entry: this.teamGroup.entry,
+        view: this.toolViews.get(this.teamGroup.node)!,
         log: "",
         latest: "Starting",
         renderedAt: 0,
@@ -1384,7 +1538,7 @@ export class KestUI {
     const activity = event.event;
     if (activity?.type === "tool") {
       worker.latest = `${activity.name} · ${activity.state}`;
-      worker.log += `\n[${activity.state}] ${activity.name}${activity.durationMs === undefined ? "" : ` · ${activity.durationMs.toFixed(1)} ms`}\n${activity.state === "running" ? activity.args : (activity.output ?? "")}\n`;
+      worker.log += `\n[${activity.state}] ${activity.name}${activity.durationMs === undefined ? "" : ` · ${formatDuration(activity.durationMs)}`}\n${activity.state === "running" ? activity.args : (activity.output ?? "")}\n`;
       if (activity.state !== "running" && activity.durationMs !== undefined)
         (this.session.toolStats ??= []).push({
           name: activity.name,
@@ -1405,15 +1559,39 @@ export class KestUI {
       worker.log =
         "[Earlier activity omitted from live preview; see saved transcript]\n" +
         worker.log.slice(-23000);
-    worker.entry.text = `${event.state === "done" ? "✓" : event.state === "error" ? "✕" : "→"} ${"  ".repeat(Math.max(0, event.depth - 1))}${event.role} ${event.workerId.slice(0, 8)} · ${event.model} · ${brief(worker.latest, 70)}`;
-    worker.entry.detail!.output = worker.log || "Starting…";
     if (
       activity?.type === "text" &&
       performance.now() - worker.renderedAt < 100
     )
       return;
     worker.renderedAt = performance.now();
-    if (!worker.view.node.isDestroyed) this.renderTool(worker.view);
+    this.renderTeamGroup();
+  }
+
+  private renderTeamGroup() {
+    const team = this.teamGroup;
+    if (!team) return;
+    const workers = [...this.workerViews.values()];
+    const running = workers.filter((w) => w.meta.state === "running").length;
+    const done = workers.filter((w) => w.meta.state === "done").length;
+    const failed = workers.filter((w) => w.meta.state === "error").length;
+    const roles = [...new Set(workers.map((w) => w.meta.role))].join(", ");
+    team.entry.text =
+      running > 0
+        ? `→ Research team · ${workers.length} ${roles} · ${running} running${done ? ` · ${done} done` : ""}${failed ? ` · ${failed} failed` : ""}`
+        : `${failed ? "✕" : "✓"} Research team · ${done}/${workers.length} done${failed ? ` · ${failed} failed` : ""}`;
+    team.entry.detail!.output = brief(
+      workers
+        .map(
+          (w) =>
+            `— ${w.meta.state === "done" ? "✓" : w.meta.state === "error" ? "✕" : "→"} ${w.meta.role} ${w.meta.workerId.slice(0, 8)} · ${truncateMiddle(w.meta.model, 36)} · ${w.latest}\n${w.log || "Starting…"}`,
+        )
+        .join("\n"),
+      24_000,
+    );
+    const view = this.toolViews.get(team.node);
+    if (view && failed > 0 && running === 0) view.expanded = true;
+    if (view && !view.node.isDestroyed) this.renderTool(view);
   }
 
   private event(event: AgentEvent) {
@@ -1423,11 +1601,29 @@ export class KestUI {
       return;
     }
     if (event.type === "checkpoint") {
+      this.toolGroup = null;
+      this.teamGroup = null;
       this.add(
         "info",
         `Research checkpoint ${event.cycle} · continuing\n${brief(event.text, 6000)}`,
       );
       this.pendingText = "";
+      return;
+    }
+    if (event.type === "background") {
+      this.info(
+        event.state === "running"
+          ? `Background task ${event.taskId.slice(0, 8)} started · ${brief(event.task, 120)} · the agent keeps working`
+          : `Background task ${event.taskId.slice(0, 8)} ${event.state} · ${brief(event.task, 120)}`,
+      );
+      return;
+    }
+    if (event.type === "budget") {
+      // Live runtime sync: timer/tokens/requests tick from here, plus the
+      // local clock in liveHud() between model calls.
+      this.session.research = event.state;
+      this.agent.research = event.state;
+      this.budgetSyncedAt = performance.now();
       return;
     }
     if (event.type === "usage") {
@@ -1448,6 +1644,7 @@ export class KestUI {
       return;
     }
     if (event.type === "response") {
+      this.toolGroup = null;
       this.pendingText = "";
       return;
     }
@@ -1484,19 +1681,35 @@ export class KestUI {
           /* Keep raw input. */
         }
       }
-      const tool = this.add(
-        "tool",
-        event.name === "shell"
-          ? `${heading}\n\nInput\n${brief(input, 12_000)}\n\nOutput\nRunning…`
-          : heading,
-        {
-          input,
-          output: "Running…",
-          language: event.name === "shell" ? "TypeScript" : "JSON",
-        },
-      );
-      this.toolNode = tool.node as TextRenderable;
-      this.toolEntry = tool.entry;
+      // Grouped tool UI: one collapsible entry per response segment.
+      // Individual calls live in the expanded log, not as scrollback rows.
+      if (!this.toolGroup) {
+        const tool = this.add("tool", "→ Tools", {
+          input: "Tools in this step",
+          output: "",
+          language: "text",
+        });
+        this.toolGroup = {
+          entry: tool.entry,
+          node: tool.node as TextRenderable,
+          count: 0,
+          failures: 0,
+          totalMs: 0,
+          running: 0,
+          log: "",
+          names: [],
+          titles: [],
+        };
+      }
+      const group = this.toolGroup;
+      group.count++;
+      group.running++;
+      if (!group.names.includes(event.name)) group.names.push(event.name);
+      group.titles.push(heading.slice(2));
+      group.log += `${heading}\nInput\n${brief(input, 4000)}\n\n`;
+      this.renderToolGroup();
+      this.toolNode = group.node;
+      this.toolEntry = group.entry;
       const verb = toolVerbs[event.name];
       this.showLoading(verb ? `${event.name} · ${verb}…` : event.name);
     } else {
@@ -1507,33 +1720,46 @@ export class KestUI {
           error: event.state === "error",
         });
       }
-      if (this.toolNode && this.toolEntry) {
-        const title = `${event.state === "error" ? "✕" : "✓"} ${this.toolEntry.text.split("\n")[0]!.slice(2)}${event.durationMs === undefined ? "" : ` · ${event.durationMs.toFixed(2)} ms`}`;
-        let input = event.args;
-        if (event.name === "shell") {
-          try {
-            input = JSON.parse(event.args).command ?? event.args;
-          } catch {
-            /* Keep raw input. */
-          }
-        }
-        this.toolEntry.text =
-          event.name === "shell"
-            ? `${title}\n\nInput\n${brief(input, 12_000)}\n\nOutput\n${brief(event.output ?? "", 12_000)}`
-            : `${title}\n\n${brief(event.output ?? "", 12_000)}`;
-        this.toolEntry.detail = {
-          input,
-          output: event.output ?? "",
-          language: event.name === "shell" ? "TypeScript" : "JSON",
-        };
-        const tool = this.toolViews.get(this.toolNode);
-        if (tool) this.renderTool(tool);
+      const group = this.toolGroup;
+      if (group) {
+        group.running = Math.max(0, group.running - 1);
+        if (event.state === "error") group.failures++;
+        if (event.durationMs !== undefined) group.totalMs += event.durationMs;
+        group.log += `${event.state === "error" ? "✕" : "✓"} ${event.name}${event.durationMs === undefined ? "" : ` · ${formatDuration(event.durationMs)}`}\n${brief(event.output ?? "", 8000)}\n\n`;
+        this.renderToolGroup();
       }
       this.toolNode = null;
       this.toolEntry = null;
     }
   }
+  private renderToolGroup() {
+    const group = this.toolGroup;
+    if (!group) return;
+    const done = group.count - group.running;
+    const summary =
+      group.running > 0
+        ? group.count === 1
+          ? `→ ${group.titles[0]}`
+          : `→ Tools · ${done}/${group.count} done · ${group.names.join(", ")}`
+        : group.count === 1
+          ? `${group.failures ? "✕" : "✓"} ${group.titles[0]} · ${formatDuration(group.totalMs)}`
+          : `${group.failures ? "✕" : "✓"} Tools (${group.count}) · ${group.names.join(", ")} · ${formatDuration(group.totalMs)}${group.failures ? ` · ${group.failures} failed` : ""}`;
+    group.entry.text = summary;
+    group.entry.detail = {
+      input: "Tools in this step — click group to expand",
+      output: brief(group.log, 24_000),
+      language: "text",
+    };
+    const view = this.toolViews.get(group.node);
+    // Failures auto-expand so they are never buried in the group.
+    if (view && group.failures > 0 && group.running === 0) view.expanded = true;
+    if (view) this.renderTool(view);
+    // Group stays open for the whole response segment (sequential tools
+    // included); it is closed by response/checkpoint/turn-end handlers.
+  }
+
   private flushResponse() {
+    this.toolGroup = null;
     if (this.pendingText && !this.closed) this.add("kest", this.pendingText);
     this.pendingText = "";
   }
@@ -1544,8 +1770,14 @@ export class KestUI {
     const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let frame = 0;
     const draw = () => {
-      if (!this.closed)
-        this.status.content = `${frames[frame++ % frames.length]} ${this.loadingLabel}`;
+      if (!this.closed) {
+        const study = this.agent.research ?? this.session.research;
+        const hud = study ? ` │ ${this.liveHud()}` : "";
+        this.status.content = `${frames[frame++ % frames.length]} ${this.loadingLabel}${hud}`;
+        this.status.fg = study && shouldOpenBudgetDecision(study)
+          ? theme.error
+          : theme.tool;
+      }
     };
     draw();
     this.loadingTimer = setInterval(draw, 120);
@@ -1598,8 +1830,7 @@ export class KestUI {
       this.flushResponse();
       this.status.content = `Landed · ${((performance.now() - start) / 1000).toFixed(1)}s`;
     } catch (error) {
-      if (this.active?.signal.aborted)
-        this.info("Recalled. Completed tool actions are kept.");
+      if (this.active?.signal.aborted) this.info(this.stoppedMessage());
       else if (error instanceof OpenAI.APIError)
         this.info(
           `Endpoint error ${error.status ?? "network"}. ${error.status === 401 || error.status === 403 ? "Use /connect to update credentials." : "Try again; /new clears context."}`,
@@ -1625,6 +1856,10 @@ export class KestUI {
       }
       if (!this.closed && !this.connectStep && !this.approval)
         this.composer.focus();
+      if (this.pauseDecisionPending) {
+        this.pauseDecisionPending = false;
+        this.openPauseDecision();
+      } else void this.wakeFromBackground();
     }
   }
 
@@ -1769,22 +2004,19 @@ export class KestUI {
         return;
       }
       if (action === "budget") {
-        const minutes = Number(parts[0]),
-          requests = Number(parts[1]);
+        // Only time (+ token via /research tokens) is limited now.
+        // Syntax: /research budget <total-minutes> [total-agents]
+        const minutes = Number(parts[0]);
         const agents =
-          parts[2] === undefined
+          parts[1] === undefined
             ? this.session.research?.maxAgents
-            : Number(parts[2]);
+            : Number(parts[1]);
         if (
           !this.session.research ||
-          (parts.length !== 2 && parts.length !== 3) ||
+          (parts.length !== 1 && parts.length !== 2) ||
           !Number.isInteger(minutes) ||
           minutes < 1 ||
           minutes > 1440 ||
-          !Number.isInteger(requests) ||
-          requests < 1 ||
-          requests > 10000 ||
-          requests < this.session.research.requests ||
           !Number.isInteger(agents) ||
           agents! < 1 ||
           agents! > 64 ||
@@ -1792,10 +2024,9 @@ export class KestUI {
           minutes * 60000 < this.session.research.elapsedMs
         )
           throw new Error(
-            "Start a research objective first, then /research budget <total-minutes 1–1440> <total-requests 1–10000> [total-agents 1–64]. Totals cannot be below usage already consumed.",
+            "Start a research objective first, then /research budget <total-minutes 1–1440> [total-agents 1–64]. Token cap: /research tokens <total|off>. Requests are not limited.",
           );
         this.session.research.maxMs = minutes * 60000;
-        this.session.research.maxRequests = requests;
         this.session.research.maxAgents = agents!;
         this.session.research.status = "paused";
         await saveSession(this.session);
@@ -1832,10 +2063,10 @@ export class KestUI {
       this.agent.tasks = this.session.tasks.map((t) => ({ ...t }));
       await saveSession(this.session);
       this.info(
-        `Research company started with ${study.maxRequests - study.requests} requests remaining. Experiments still follow /permission; Esc cancels. Logs: research/${study.id}/`,
+        `Research company started · budget: ${formatDuration(study.maxMs)}${study.maxTokens === null ? " · no token cap" : ` · ${study.maxTokens.toLocaleString("en-US")} tokens`} · requests metered, not limited. Experiments still follow /permission; Ctrl+C pauses. Logs: research/${study.id}/`,
       );
       this.composer.setText(
-        `Research objective: ${study.objective}\nUse the company workflow, preserve reproducible evidence and negative findings, and reserve time for independent review. Persist source, raw logs, results and the paper in research/${study.id}/. Continue within the shared request/time budget; never fabricate results or claim unsupported novelty.`,
+        `Research objective: ${study.objective}\nUse the company workflow, preserve reproducible evidence and negative findings, and reserve time for independent review. Persist source, raw logs, results and the paper in research/${study.id}/. Continue within the shared token/time budget (requests are not limited); never fabricate results or claim unsupported novelty.`,
       );
       await this.submit();
       return;
@@ -2201,6 +2432,7 @@ export class KestUI {
     if (this.closed) return;
     this.closed = true;
     this.active?.abort();
+    this.agent.cancelBackground();
     this.approval?.finish(false);
     this.secretValue = this.tokenId = "";
     this.stopLoading();

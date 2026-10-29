@@ -1,0 +1,108 @@
+<meta charset="utf-8"><title>Kest — End-to-End Research Session UI</title>
+<style>
+*{box-sizing:border-box}body{background:#0b0f14;color:#d6deeb;font:14px/1.55 system-ui;margin:0;padding:26px}main{max-width:1080px;margin:auto}
+h1{font-size:21px;margin:0 0 4px}h2{font-size:12px;letter-spacing:.09em;text-transform:uppercase;color:#8b98a9;margin:28px 0 10px}
+.sub,.dim{color:#8b98a9}.mono{font-family:ui-monospace,Consolas,monospace}.ok{color:#3fb950}.err{color:#f85149}.warn{color:#e3b341}.link{color:#79c0ff;cursor:pointer}
+.term{background:#0d1117;border:1px solid #232b36;border-radius:12px;padding:16px}
+.prompt{background:#131a24;border-left:3px solid #79c0ff;border-radius:8px;padding:12px 14px}
+.l0{display:flex;gap:10px;align-items:baseline;padding:7px 10px;border-radius:8px}.l0:hover{background:#131a24}
+.l0 .t{font-weight:600;color:#e6edf3}.grow{flex:1}.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#3fb950}.dot.y{background:#e3b341}.dot.r{background:#f85149}.dot.b{background:#79c0ff}
+details{margin:2px 0}summary{list-style:none;cursor:pointer}summary::-webkit-details-marker{display:none}
+.l1{margin:2px 0 10px 28px;border-left:1px solid #232b36;padding-left:14px}
+.node{padding:4px 8px;border-radius:6px}.node:hover{background:#131a24}.node small{color:#6e7b8b;font-family:ui-monospace}
+.l2{margin:4px 0 8px 22px;color:#9fb0c3;font-size:13px}
+table{width:100%;border-collapse:collapse;font-size:13px}td,th{border-bottom:1px solid #1f2833;padding:6px 8px;text-align:left;vertical-align:top}th{color:#8b98a9}
+pre{background:#090c10;border:1px solid #1c242f;border-radius:6px;padding:9px;overflow:auto;color:#7d8da1;font:12px ui-monospace}
+.chip{display:inline-block;border:1px solid #2a3441;border-radius:99px;padding:0 7px;font-size:11px;color:#9fb0c3;margin-left:5px}
+.progress{height:5px;background:#1c242f;border-radius:99px;overflow:hidden;margin:8px 0}.progress i{display:block;height:100%;background:#3fb950}
+.final{background:#0e1710;border:1px solid #23402c;border-radius:12px;padding:18px}
+.verdict{font-size:19px;font-weight:700;color:#e6edf3}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:12px 0}
+.card{background:#10161f;border:1px solid #26303d;border-radius:8px;padding:10px}.card b{font-size:17px;color:#e6edf3;display:block}
+.art{display:flex;justify-content:space-between;border-bottom:1px solid #1f2833;padding:7px 2px}
+kbd{background:#1c242f;border:1px solid #2a3441;border-radius:4px;padding:0 5px;font:11px ui-monospace}
+.spin{color:#e3b341}
+</style>
+<main>
+<h1>End-to-End Research Session</h1><p class="sub">Example: user asks Kest to research &amp; improve something. Everything below is one session — L0 by default, click ▸ to go deep (live).</p>
+
+<h2>1 · User prompt</h2>
+<div class="prompt"><span class="dim mono">&gt;</span> Research binary-heavy storage benchmarks, review the literature, reproduce the best baseline, then make ours faster. Prove it.</div>
+
+<h2>2 · Live session — what user sees while it runs (rewrites in place, no row flood)</h2>
+<div class="term mono"><span class="spin">⠹</span> <b>Literature review — 34 papers found, screening abstracts…</b> <span class="dim">phase 1/6 · 3 workers parallel · Esc interrupt · Ctrl+O raw</span>
+<div class="progress"><i style="width:22%"></i></div><span class="dim">Next: shortlist → reproduce baseline → experiments → independent review → report</span></div>
+
+<h2>3 · Same session, finished — scrollback is a story of outcomes (L0)</h2>
+<div class="term">
+
+<details><summary><span class="l0"><span class="dot b"></span><span class="t">Plan agreed</span><span class="grow dim">6 phases · budget 2h / 400k tokens</span><span class="dim">18s</span><span class="link">▸</span></span></summary>
+<div class="l1"><div class="l2">Q decomposed: literature → baseline → bottleneck → intervention → proof → write-up. Kill-criteria: stop if baseline not reproducible within 5%.</div></div></details>
+
+<details><summary><span class="l0"><span class="dot"></span><span class="t">Literature review: 9 papers matter</span><span class="grow dim">of 47 screened · 3 contradictions found</span><span class="dim">14m</span><span class="link">▸ explore</span></span></summary>
+<div class="l1">
+  <details><summary><div class="node">▸ The 9 that matter <small>· ranked by relevance × credibility</small></div></summary><div class="l2">
+    <table><tr><th>Paper</th><th>Claim used</th><th>Trust</th></tr>
+    <tr><td>RocksDB tuning (Dong et al.)</td><td>Compaction dominates binary-heavy writes</td><td><span class="ok">●</span> replicated ×12</td></tr>
+    <tr><td>WiscKey (Lu et al., FAST'17)</td><td>Value separation cuts write-amp 3–10×</td><td><span class="ok">●</span> artifact avail.</td></tr>
+    <tr><td>BlobDB notes (vendor blog)</td><td>“+40% with blob tier”</td><td><span class="warn">●</span> no methodology</td></tr></table>
+    <span class="link">▸ all 47 · screening reasons · search strings</span></div></details>
+  <details><summary><div class="node">▸ Where papers disagree <small>· the interesting thread</small></div></summary><div class="l2">WiscKey assumes value ≥1KB; BlobDB claim uses 256B values, so its +40% likely doesn't transfer. → Experiment E2 tests both sizes.</div></details>
+  <details><summary><div class="node dim">· 47 screened, 38 excluded <small>· dedup, off-topic, no artifact</small></div></summary></details>
+</div></details>
+
+<details><summary><span class="l0"><span class="dot"></span><span class="t">Environment ready</span><span class="grow dim">pinned, seeded, reproducible</span><span class="dim">3m</span><span class="link">▸</span></span></summary>
+<div class="l1"><div class="l2 mono">bun 1.4.4 · dataset gen seeded (PRNG fixed) · machine profile saved · <span class="link">env.lock · rerun cmd</span></div></div></details>
+
+<details><summary><span class="l0"><span class="dot"></span><span class="t">Baseline reproduced: 1.00× ±0.8%</span><span class="grow dim">matches paper within 5% ✓ kill-criterion passed</span><span class="dim">11m</span><span class="link">▸</span></span></summary>
+<div class="l1"><div class="l2">5 runs, median reported. <span class="link">▸ raw runs · profile flamegraph</span></div></div></details>
+
+<details><summary><span class="l0"><span class="dot y"></span><span class="t">Improved +18.2% ±0.7%</span><span class="grow dim">3 experiments · E2 won, E1/E3 rejected</span><span class="dim">46m</span><span class="link">▸ explore</span></span></summary>
+<div class="l1">
+  <details><summary><div class="node">▸ Why E2 won <small>· value separation @ ≥1KB</small></div></summary><div class="l2">Write-amp 4.1→1.3. No gain at 256B — confirms literature contradiction above. <span class="link">▸ diff (+12 −4) · bench ×4 raw</span></div></details>
+  <details><summary><div class="node dim">· E1 compaction tuning +2.1% (noise) · E3 cache ↑ regressed −6%</div></summary></details>
+</div></details>
+
+<details><summary><span class="l0"><span class="dot r"></span><span class="t">Independent review: 2 of 3 concur</span><span class="grow dim">1 reviewer failed — limitation, not hidden</span><span class="dim">9m</span><span class="link">▸ explore</span></span></summary>
+<div class="l1"><div class="l2">A: concurs (+18.0%). C: concurs (+18.4%). <span class="err">B: timed out</span> <span class="link">[retry] [accept 2/3] ▸ B log</span></div></div></details>
+</div>
+
+<h2>4 · End of session — final research report (the deliverable)</h2>
+<div class="final">
+<div class="verdict">Verdict: Adopt value-separation — +18.2% on binary-heavy writes <span class="chip">confidence: medium-high</span></div>
+<p class="dim" style="margin:6px 0">Claim holds for values ≥1KB only. Below that: no benefit (E2/E3). Review 2/3, one reviewer timed out.</p>
+<div class="cards">
+<div class="card"><b>+18.2% ±0.7</b><span class="dim">vs reproduced baseline, n=5</span></div>
+<div class="card"><b>9 / 47</b><span class="dim">papers used / screened</span></div>
+<div class="card"><b>3 exp.</b><span class="dim">1 adopted, 2 rejected w/ reasons</span></div>
+<div class="card"><b>1h 24m</b><span class="dim">312k tokens · within budget</span></div></div>
+
+<details><summary class="link">▸ Evidence chain (every claim → source)</summary><div class="l2"><table>
+<tr><th>Claim</th><th>Evidence</th><th>Source</th></tr>
+<tr><td>+18.2% throughput</td><td>benchmark3.json, 5 runs</td><td class="mono">results/ · E2</td></tr>
+<tr><td>No gain @256B</td><td>E3 regression −6%</td><td class="mono">results/e3.json</td></tr>
+<tr><td>Mechanism: write-amp ↓</td><td>profile before/after</td><td class="mono">WiscKey + profile/</td></tr></table></div></details>
+
+<details><summary class="link">▸ Limitations &amp; what would change the verdict</summary><div class="l2">Single machine profile; reviewer B missing; dataset synthetic. Re-run on NVMe RAID + complete 3/3 review to raise confidence to high.</div></details>
+
+<details><summary class="link">▸ Reproduce this session</summary><div class="l2 mono">kest resume ses_… · env.lock · seed 42 · <kbd>Ctrl+O</kbd> full raw log (214 tools)</div></details>
+
+<div style="margin-top:12px">
+<div class="art"><span class="mono">📄 report.md</span><span><span class="link">open</span> · <span class="link">export PDF</span></span></div>
+<div class="art"><span class="mono">📊 results/ (benchmark1-3.json, profiles)</span><span class="link">open</span></div>
+<div class="art"><span class="mono">📚 literature/ (9 papers, screening log)</span><span class="link">open</span></div>
+<div class="art"><span class="mono">🧾 ledger.md · checkpoint</span><span class="link">open</span></div>
+</div>
+<div style="margin-top:14px"><span class="link">[ Accept &amp; commit changes ]</span> &nbsp; <span class="link">[ Retry reviewer B ]</span> &nbsp; <span class="link">[ Run follow-up experiment ]</span> &nbsp; <span class="link">[ New session from this one ]</span></div>
+</div>
+
+<h2>Session lifecycle at a glance</h2>
+<table><tr><th>Phase</th><th>L0 line (default view)</th><th>Explorer pulls →</th></tr>
+<tr><td>1 Plan</td><td>Plan agreed</td><td>decomposition, kill-criteria, budget</td></tr>
+<tr><td>2 Literature</td><td>9 papers matter · 3 contradictions</td><td>ranked table, trust, disagreements → hypotheses</td></tr>
+<tr><td>3 Setup</td><td>Environment ready · reproducible</td><td>env.lock, seeds, machine profile</td></tr>
+<tr><td>4 Baseline</td><td>Reproduced 1.00× ±0.8%</td><td>raw runs, flamegraph</td></tr>
+<tr><td>5 Improve</td><td>+18.2% · E2 won, E1/E3 rejected</td><td>per-experiment diff + data</td></tr>
+<tr><td>6 Verify</td><td>Review 2/3 concur ⚠</td><td>reviewer logs, retry</td></tr>
+<tr><td>7 Report</td><td>Verdict card + artifacts + actions</td><td>evidence chain → raw log (L3)</td></tr></table>
+<p class="dim">Total scrollback for a 1.5h session: <b style="color:#e6edf3">7 lines + 1 report card.</b> Total data retained: everything. Depth is pulled via ▸ / <kbd>Ctrl+O</kbd>, never pushed.</p>
+</main>

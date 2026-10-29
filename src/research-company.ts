@@ -40,7 +40,9 @@ export function newCompany(objective: string): CompanyState {
     objective,
     requests: 0,
     agents: 0,
-    maxRequests: 100,
+    // Deprecated: requests are counted for stats, never limited.
+    // Only token (maxTokens) and time (maxMs) budgets bind.
+    maxRequests: Number.MAX_SAFE_INTEGER,
     maxAgents: 12,
     maxDepth: 3,
     parallel: 3,
@@ -119,7 +121,7 @@ export function validateCompany(state: CompanyState): CompanyState {
     !/^[\da-f]{8}-(?:[\da-f]{4}-){3}[\da-f]{12}$/i.test(state.id) ||
     typeof state.objective !== "string" ||
     state.objective.length > 100000 ||
-    !integer(state.maxRequests, 1, 10000) ||
+    !integer(state.maxRequests, 1, Number.MAX_SAFE_INTEGER) ||
     !integer(state.requests, 0, 10000) ||
     !integer(state.maxAgents, 1, 64) ||
     !integer(state.agents, 0, 64) ||
@@ -182,6 +184,12 @@ export class CompanyRuntime {
     validateCompany(state);
     this.directory = cwd ? join(cwd, "research", state.id) : null;
   }
+  liveElapsedMs() {
+    return this.state.elapsedMs + performance.now() - this.started;
+  }
+  snapshot(): CompanyState {
+    return { ...this.state, elapsedMs: this.liveElapsedMs() };
+  }
   get remainingMs() {
     return Math.max(
       0,
@@ -191,7 +199,15 @@ export class CompanyRuntime {
     );
   }
   get remainingRequests() {
-    return Math.max(0, this.state.maxRequests - this.state.requests);
+    return Infinity; // requests are metered, not limited
+  }
+  // Low when <10% of time or token budget remains (drives final-review).
+  get budgetLow() {
+    const timeLow = this.remainingMs <= Math.max(60_000, this.state.maxMs * 0.1);
+    const tokenLow =
+      this.state.maxTokens !== null &&
+      this.remainingTokens <= this.state.maxTokens * 0.1;
+    return timeLow || tokenLow;
   }
   get usedTokens() {
     return (
@@ -292,18 +308,13 @@ export class CompanyRuntime {
       await Bun.sleep(10);
     }
     signal.throwIfAborted();
-    if (!this.remainingMs || !this.remainingRequests)
+    if (!this.remainingMs)
       throw new ResearchBudgetError(
-        "Research request/time budget reached. Checkpoint the findings; no further model requests were started.",
+        "Research time budget reached. Checkpoint the findings; no further model requests were started.",
       );
     if (reserved > this.remainingTokens)
       throw new ResearchBudgetError(
         `Research token budget cannot fit the next request (${reserved.toLocaleString("en-US")} tokens of conservative headroom required; ${this.remainingTokens.toLocaleString("en-US")} available). Existing artifacts are preserved.`,
-      );
-    const reserve = agent?.role === "reviewer" ? 2 : this.directorReserve;
-    if (agent && agent.depth > 0 && this.remainingRequests <= reserve)
-      throw new ResearchBudgetError(
-        `The remaining ${reserve} model requests are reserved for director implementation, experiments, review and checkpoint. Return to the director instead of delegating again.`,
       );
     // Reserve synchronously before any await so parallel workers cannot overspend.
     this.state.requests++;
@@ -358,5 +369,5 @@ export function formatCompany(state?: CompanyState | null) {
   let tokens = `Tokens: ${used.toLocaleString("en-US")}/${state.maxTokens === null ? "no token cap" : state.maxTokens.toLocaleString("en-US")} · input ${state.inputTokens.toLocaleString("en-US")} + output ${state.outputTokens.toLocaleString("en-US")} + estimated ${state.estimatedTokens.toLocaleString("en-US")} (pending/missing provider usage)`;
   if (state.untrackedRequests)
     tokens += `\n${state.untrackedRequests} earlier requests predate token accounting; their token usage is unknown and excluded.`;
-  return `Kest Research · ${state.status}\nObjective: ${state.objective}\n${tokens}\n${state.maxTokens === null ? "" : "Additional safeguards remain active:\n"}Requests: ${state.requests}/${state.maxRequests} (includes workers and summaries)\nAgents: ${state.agents}/${state.maxAgents} · max depth ${state.maxDepth} · max parallel model calls ${state.parallel}\nIndependent reviews returned: ${state.reviews} (model reviews, not empirical certification)\nActive time: ${(state.elapsedMs / 60_000).toFixed(1)}/${(state.maxMs / 60_000).toFixed(1)} minutes · cycles ${state.cycles}\nArtifacts: research/${state.id}/\n/research resume · /research tokens <total|off> · /research budget <minutes> <total-requests> [total-agents] · /research models`;
+  return `Kest Research · ${state.status}\nObjective: ${state.objective}\n${tokens}\n${state.maxTokens === null ? "" : "Additional safeguards remain active:\n"}Requests: ${state.requests} (metered only — no request limit; token + time budgets bind)\nAgents: ${state.agents}/${state.maxAgents} · max depth ${state.maxDepth} · max parallel model calls ${state.parallel}\nIndependent reviews returned: ${state.reviews} (model reviews, not empirical certification)\nActive time: ${(state.elapsedMs / 60_000).toFixed(1)}/${(state.maxMs / 60_000).toFixed(1)} minutes · cycles ${state.cycles}\nArtifacts: research/${state.id}/\n/research resume · /research tokens <total|off> · /research budget <minutes> [total-agents] · /research models`;
 }

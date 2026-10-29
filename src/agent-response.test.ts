@@ -1,9 +1,32 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Agent, type AgentEvent } from "./agent";
+import { Agent, estimateToolMs, systemPrompt, type AgentEvent } from "./agent";
 import { CompanyRuntime, newCompany } from "./research-company";
+
+test("plain chat does not load research mode; research opt-in does", () => {
+  expect(systemPrompt("/tmp")).not.toContain("kest-research-company");
+  expect(systemPrompt("/tmp", true)).toContain("kest-research-company");
+  const agent = new Agent("/tmp", async () => false);
+  expect(String(agent.messages[0]!.content)).not.toContain(
+    "kest-research-company",
+  );
+  const names = agent
+    .toolDefs()
+    .map((t) => (t.type === "function" ? t.function.name : ""));
+  expect(names).not.toContain("research_team");
+  expect(names).not.toContain("research_status");
+  agent.research = newCompany("opted in");
+  agent.refreshResearchPrompt();
+  expect(String(agent.messages[0]!.content)).toContain(
+    "kest-research-company",
+  );
+  const researchNames = agent
+    .toolDefs()
+    .map((t) => (t.type === "function" ? t.function.name : ""));
+  expect(researchNames).toContain("research_team");
+});
 
 async function fixture(
   responses: { delta: unknown; finish: string }[],
@@ -116,6 +139,75 @@ test("empty responses retry the same model step, account usage, and never replay
   );
 });
 
+test("time estimates prefer observed timings over tool defaults", () => {
+  expect(estimateToolMs("read_file", [])).toBeLessThan(
+    estimateToolMs("spawn_subagent", []),
+  );
+  expect(estimateToolMs("read_file", [100, 300, 200])).toBe(200);
+  expect(estimateToolMs("shell", [10])).toBe(10);
+});
+
+test("independent read-only calls in one reply run concurrently and hook results back in call order", async () => {
+  const call = (index: number, id: string, path: string) => ({
+    index,
+    id,
+    type: "function",
+    function: {
+      name: "read_file",
+      arguments: JSON.stringify({ path }),
+    },
+  });
+  await fixture(
+    [
+      {
+        delta: {
+          tool_calls: [
+            call(0, "read-a", "a.txt"),
+            call(1, "read-b", "b.txt"),
+            call(2, "read-c", "c.txt"),
+          ],
+        },
+        finish: "tool_calls",
+      },
+      { delta: { content: "All three files read" }, finish: "stop" },
+    ],
+    async (agent, events) => {
+      await writeFile(join(agent.cwd, "a.txt"), "alpha");
+      await writeFile(join(agent.cwd, "b.txt"), "beta");
+      await writeFile(join(agent.cwd, "c.txt"), "gamma");
+      await agent.run(
+        "Read the three fixture files",
+        credentials,
+        AbortSignal.timeout(5000),
+        (event) => events.push(event),
+        2,
+      );
+      const toolEvents = events.filter((e) => e.type === "tool");
+      // Every call starts before any finishes: one long read cannot block the others.
+      expect(toolEvents.slice(0, 3).every((e) => e.state === "running")).toBe(
+        true,
+      );
+      expect(
+        toolEvents
+          .slice(0, 3)
+          .every((e) => e.type === "tool" && e.estimatedMs !== undefined),
+      ).toBe(true);
+      const results = agent.messages.filter((m) => m.role === "tool");
+      expect(results.map((m) => m.tool_call_id)).toEqual([
+        "read-a",
+        "read-b",
+        "read-c",
+      ]);
+      expect(results.map((m) => String(m.content))).toEqual([
+        expect.stringContaining("alpha"),
+        expect.stringContaining("beta"),
+        expect.stringContaining("gamma"),
+      ]);
+      expect(agent.messages.at(-1)?.content).toBe("All three files read");
+    },
+  );
+});
+
 test("persistent empty responses stop after three counted attempts without adding invalid assistant messages", async () => {
   await fixture([empty], async (agent, events, runtime) => {
     await expect(
@@ -151,9 +243,9 @@ test("provider filtering is reported without automatic retries", async () => {
   );
 });
 
-test("empty-response retries cannot overrun a research request budget", async () => {
+test("empty-response retries cannot overrun a research time budget", async () => {
   await fixture([empty], async (agent, events, runtime) => {
-    runtime.state.maxRequests = 1;
+    runtime.state.elapsedMs = runtime.state.maxMs;
     agent.research = runtime.state;
     await agent.run(
       "Fixture task",
@@ -161,7 +253,7 @@ test("empty-response retries cannot overrun a research request budget", async ()
       AbortSignal.timeout(5000),
       (event) => events.push(event),
     );
-    expect(runtime.state.requests).toBe(1);
+    expect(runtime.state.requests).toBe(0);
     expect(agent.messages.at(-1)?.content).toContain("Research budget reached");
   });
 });
