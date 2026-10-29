@@ -50,11 +50,14 @@ export function normalizeContext(value?: ContextState): ContextState {
   };
 }
 // A configurable local operating budget, NOT a claim about the model's actual window.
+// 20k default (trigger ~13.5k input/request): the full history is resent on
+// every call, so a 40k budget meant cruising at 20-30k input per request and
+// burning millions of tokens in ~100 requests. KEST_CONTEXT_BUDGET overrides.
 export function contextBudget() {
   const value = Number(process.env.KEST_CONTEXT_BUDGET);
   return Number.isSafeInteger(value) && value >= 12000 && value <= 200000
     ? value
-    : 40000;
+    : 20000;
 }
 export function estimateTokens(value: unknown): number {
   return Math.ceil(Buffer.byteLength(JSON.stringify(value) ?? "", "utf8") / 4);

@@ -159,7 +159,7 @@ test("automatic compaction triggers from the configured budget, including tool d
     expect(report.tools).toBeGreaterThan(100);
     expect(report.budget).toBe(12000);
     process.env.KEST_CONTEXT_BUDGET = "invalid";
-    expect(contextReport(messages, [], state).budget).toBe(40000);
+    expect(contextReport(messages, [], state).budget).toBe(20000);
   } finally {
     if (previous === undefined) delete process.env.KEST_CONTEXT_BUDGET;
     else process.env.KEST_CONTEXT_BUDGET = previous;

@@ -145,6 +145,7 @@ const commands = [
 type ToolView = {
   entry: Entry;
   node: TextRenderable;
+  block?: BoxRenderable;
   expanded: boolean;
   panels: BoxRenderable;
   inputScroll?: ScrollBoxRenderable;
@@ -215,14 +216,16 @@ export class KestUI {
   private toolGroup: {
     entry: Entry;
     node: TextRenderable;
+    view: ToolView;
+    children: ToolView[];
     count: number;
     failures: number;
     totalMs: number;
     running: number;
-    log: string;
     names: string[];
-    titles: string[];
   } | null = null;
+  private groupHeads = new Set<ToolView>();
+  private pendingTools: ToolView[] = [];
   private closed = false;
   settled: Promise<void> = Promise.resolve();
   private inputHistory: string[] = [];
@@ -765,6 +768,7 @@ export class KestUI {
       const tool: ToolView = {
         entry,
         node: node as TextRenderable,
+        block,
         expanded: false,
         panels,
       };
@@ -787,6 +791,8 @@ export class KestUI {
           tool.expanded = !tool.expanded;
           this.lastTool = tool;
           this.renderTool(tool);
+          // Group heads also show/hide their individual tool rows.
+          if (this.groupHeads.has(tool)) this.applyGroupVisibility();
         }
         pressed = false;
       };
@@ -1684,35 +1690,47 @@ export class KestUI {
           /* Keep raw input. */
         }
       }
-      // Grouped tool UI: one collapsible entry per response segment.
-      // Individual calls live in the expanded log, not as scrollback rows.
+      // Hybrid grouped UI: one group head per turn; each tool keeps its
+      // OWN row (old UI) hidden under the head until the head is expanded.
+      // Every row individually expands to its own Input/Output panels.
       if (!this.toolGroup) {
-        const tool = this.add("tool", "→ Tools", {
-          input: "Tools in this step",
-          output: "",
-          language: "text",
-        });
+        const head = this.add("tool", "→ Tools");
+        const view = this.toolViews.get(head.node as TextRenderable)!;
+        this.groupHeads.add(view);
         this.toolGroup = {
-          entry: tool.entry,
-          node: tool.node as TextRenderable,
+          entry: head.entry,
+          node: head.node as TextRenderable,
+          view,
+          children: [],
           count: 0,
           failures: 0,
           totalMs: 0,
           running: 0,
-          log: "",
           names: [],
-          titles: [],
         };
       }
       const group = this.toolGroup;
       group.count++;
       group.running++;
       if (!group.names.includes(event.name)) group.names.push(event.name);
-      group.titles.push(heading.slice(2));
-      group.log += `${heading}\nInput\n${brief(input, 4000)}\n\n`;
+      const tool = this.add(
+        "tool",
+        event.name === "shell"
+          ? `${heading}\n\nInput\n${brief(input, 12_000)}\n\nOutput\nRunning…`
+          : heading,
+        {
+          input,
+          output: "Running…",
+          language: event.name === "shell" ? "TypeScript" : "JSON",
+        },
+      );
+      const childView = this.toolViews.get(tool.node as TextRenderable)!;
+      group.children.push(childView);
+      this.pendingTools.push(childView);
+      if (childView.block) childView.block.visible = group.view.expanded;
       this.renderToolGroup();
-      this.toolNode = group.node;
-      this.toolEntry = group.entry;
+      this.toolNode = tool.node as TextRenderable;
+      this.toolEntry = tool.entry;
       const verb = toolVerbs[event.name];
       this.showLoading(verb ? `${event.name} · ${verb}…` : event.name);
     } else {
@@ -1724,41 +1742,60 @@ export class KestUI {
         });
       }
       const group = this.toolGroup;
+      const child = this.pendingTools.shift();
+      if (child) {
+        // Old per-tool rendering: this row's own title, detail and panels.
+        const title = `${event.state === "error" ? "✕" : "✓"} ${child.entry.text.split("\n")[0]!.slice(2)}${event.durationMs === undefined ? "" : ` · ${formatDuration(event.durationMs)}`}`;
+        let input = event.args;
+        if (event.name === "shell") {
+          try {
+            input = JSON.parse(event.args).command ?? event.args;
+          } catch {
+            /* Keep raw input. */
+          }
+        }
+        child.entry.text =
+          event.name === "shell"
+            ? `${title}\n\nInput\n${brief(input, 12_000)}\n\nOutput\n${brief(event.output ?? "", 12_000)}`
+            : `${title}\n\n${brief(event.output ?? "", 12_000)}`;
+        child.entry.detail = {
+          input,
+          output: event.output ?? "",
+          language: event.name === "shell" ? "TypeScript" : "JSON",
+        };
+        this.renderTool(child);
+      }
       if (group) {
         group.running = Math.max(0, group.running - 1);
         if (event.state === "error") group.failures++;
         if (event.durationMs !== undefined) group.totalMs += event.durationMs;
-        group.log += `${event.state === "error" ? "✕" : "✓"} ${event.name}${event.durationMs === undefined ? "" : ` · ${formatDuration(event.durationMs)}`}\n${brief(event.output ?? "", 8000)}\n\n`;
         this.renderToolGroup();
       }
       this.toolNode = null;
       this.toolEntry = null;
     }
   }
+  private applyGroupVisibility() {
+    const group = this.toolGroup;
+    if (!group) return;
+    for (const child of group.children)
+      if (child.block) child.block.visible = group.view.expanded;
+  }
+
   private renderToolGroup() {
     const group = this.toolGroup;
     if (!group) return;
     const done = group.count - group.running;
-    const summary =
+    group.entry.text =
       group.running > 0
-        ? group.count === 1
-          ? `→ ${group.titles[0]}`
-          : `→ Tools · ${done}/${group.count} done · ${group.names.join(", ")}`
-        : group.count === 1
-          ? `${group.failures ? "✕" : "✓"} ${group.titles[0]} · ${formatDuration(group.totalMs)}`
-          : `${group.failures ? "✕" : "✓"} Tools (${group.count}) · ${group.names.join(", ")} · ${formatDuration(group.totalMs)}${group.failures ? ` · ${group.failures} failed` : ""}`;
-    group.entry.text = summary;
-    group.entry.detail = {
-      input: "Tools in this step — click group to expand",
-      output: brief(group.log, 24_000),
-      language: "text",
-    };
-    const view = this.toolViews.get(group.node);
-    // Failures auto-expand so they are never buried in the group.
-    if (view && group.failures > 0 && group.running === 0) view.expanded = true;
-    if (view) this.renderTool(view);
-    // Group stays open for the whole response segment (sequential tools
-    // included); it is closed by response/checkpoint/turn-end handlers.
+        ? `→ Tools · ${done}/${group.count} done · ${group.names.join(", ")}`
+        : `${group.failures ? "✕" : "✓"} Tools (${group.count}) · ${group.names.join(", ")} · ${formatDuration(group.totalMs)}${group.failures ? ` · ${group.failures} failed` : ""}`;
+    // Failures auto-expand the head so the failed row is visible.
+    if (group.failures > 0 && group.running === 0) group.view.expanded = true;
+    this.renderTool(group.view);
+    this.applyGroupVisibility();
+    // Group stays open for the whole turn (sequential tools included);
+    // closed by checkpoint/flushResponse handlers.
   }
 
   private flushResponse() {

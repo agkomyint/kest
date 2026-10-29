@@ -880,10 +880,15 @@ test("tool output expands and collapses by click, and Markdown renders", async (
     });
     await testUI.renderOnce();
     expect(testUI.captureCharFrame()).not.toContain("detailed tool output");
+    // Expand group head, then the individual row and its own output panel.
     const toolNode = ui["lastTool"]!.node;
-    await testUI.mockMouse.click(toolNode.x + 2, toolNode.y);
+    const head = ui["toolGroup"]!.view.node;
+    await testUI.mockMouse.click(head.x + 2, head.y);
     await testUI.flush();
     expect(testUI.captureCharFrame()).toContain("read_file  example.ts");
+    await testUI.mockMouse.click(toolNode.x + 2, toolNode.y);
+    await testUI.flush();
+    expect(testUI.captureCharFrame()).toContain("Output");
     expect(ui["lastTool"]!.entry.detail?.output).toContain(
       "detailed tool output",
     );
@@ -1090,10 +1095,17 @@ test("sequential tools across model rounds collapse into one group row", async (
     const toolEntries = ui["session"].entries.filter(
       (e) => e.role === "tool",
     );
-    expect(toolEntries).toHaveLength(1);
+    // 1 group head + 3 individual rows (rows hidden until head expands).
+    expect(toolEntries).toHaveLength(4);
     expect(toolEntries[0]!.text).toContain("Tools (3)");
     await testUI.renderOnce();
-    expect(testUI.captureCharFrame()).toContain("Tools (3)");
+    const collapsed = testUI.captureCharFrame();
+    expect(collapsed).toContain("Tools (3)");
+    expect(collapsed).not.toContain("✓ set_plan");
+    const head = ui["toolGroup"]!.view.node;
+    await testUI.mockMouse.click(head.x + 2, head.y);
+    await testUI.flush();
+    expect(testUI.captureCharFrame()).toContain("✓ set_plan");
   } finally {
     ui.close();
     await testUI.dispose();
@@ -1215,7 +1227,9 @@ test("shell rows hide code until expanded and display action timing", async () =
     });
     ui["event"]({ type: "tool", name: "shell", args, state: "running" });
     await testUI.renderOnce();
-    expect(testUI.captureCharFrame()).toContain(
+    // Collapsed by default: only the group head shows.
+    expect(testUI.captureCharFrame()).toContain("Tools ·");
+    expect(testUI.captureCharFrame()).not.toContain(
       "Inspect machine specifications",
     );
     expect(testUI.captureCharFrame()).not.toContain("console.log");
@@ -1230,7 +1244,14 @@ test("shell rows hide code until expanded and display action timing", async () =
     await testUI.renderOnce();
     expect(testUI.captureCharFrame()).toContain("· 38ms");
     expect(testUI.captureCharFrame()).not.toContain("machine-details");
+    // Expand the group head -> the individual tool row appears.
     const node = ui["lastTool"]!.node;
+    const head = ui["toolGroup"]!.view.node;
+    await testUI.mockMouse.click(head.x + 2, head.y);
+    await testUI.flush();
+    expect(testUI.captureCharFrame()).toContain(
+      "Inspect machine specifications",
+    );
     await testUI.mockMouse.click(node.x + 2, node.y);
     await testUI.flush();
     const frame = testUI.captureCharFrame();
@@ -1238,8 +1259,9 @@ test("shell rows hide code until expanded and display action timing", async () =
     expect(frame).toContain("console.log('machine-details')");
     expect(frame).toContain("Output");
     expect(frame).toContain("machine-details");
-    // Grouped UI: expanded group log carries the raw input/output.
-    expect(ui["lastTool"]!.entry.detail?.output).toContain(
+    // The individual row keeps its own panels/detail (old UI behavior).
+    expect(frame).toContain("Input · TypeScript");
+    expect(ui["lastTool"]!.entry.detail?.input).toBe(
       "console.log('machine-details')",
     );
     expect(ui["lastTool"]!.entry.detail?.output).toContain("machine-details");
@@ -1276,29 +1298,41 @@ test("long tool input and output have independent bounded scroll panels", async 
     });
     await testUI.renderOnce();
     const tool = ui["lastTool"]!;
+    // Expand group head, then the individual tool row.
+    const head = ui["toolGroup"]!.view.node;
+    await testUI.mockMouse.click(head.x + 2, head.y);
+    await testUI.renderOnce();
+    await testUI.flush();
     await testUI.mockMouse.click(tool.node.x + 2, tool.node.y);
     await testUI.flush();
     expect(testUI.captureCharFrame()).not.toContain("Show more");
     expect(testUI.captureCharFrame()).not.toContain("input-line-11");
     expect(testUI.captureCharFrame()).not.toContain("output-line-11");
-    expect(tool.outputScroll!.height).toBeLessThanOrEqual(12);
+    expect(tool.inputScroll!.height).toBeLessThanOrEqual(6);
+    expect(tool.inputScroll!.verticalScrollBar.visible).toBe(true);
     expect(tool.outputScroll!.verticalScrollBar.visible).toBe(true);
-    expect(tool.entry.detail?.output).toContain("input-line-11");
-    expect(tool.entry.detail?.output).toContain("output-line-11");
     const outer = ui.scroll.scrollTop;
     await testUI.mockMouse.scroll(
-      tool.outputScroll!.x + 2,
-      tool.outputScroll!.y + 1,
+      tool.inputScroll!.x + 2,
+      tool.inputScroll!.y + 1,
       "down",
     );
     await testUI.flush();
-    expect(tool.outputScroll!.scrollTop).toBeGreaterThan(0);
+    expect(tool.inputScroll!.scrollTop).toBeGreaterThan(0);
+    expect(tool.outputScroll!.scrollTop).toBe(0);
     expect(ui.scroll.scrollTop).toBe(outer);
+    tool.inputScroll!.scrollTo(999);
+    await testUI.flush();
+    expect(testUI.captureCharFrame()).toContain("input-line-11");
+    expect(testUI.captureCharFrame()).not.toContain("output-line-11");
     tool.outputScroll!.scrollTo(999);
     await testUI.flush();
     expect(testUI.captureCharFrame()).toContain("output-line-11");
-    tool.outputScroll!.focus();
-    expect(tool.outputScroll!.focused).toBe(true);
+    tool.inputScroll!.focus();
+    expect(tool.inputScroll!.focused).toBe(true);
+    testUI.mockInput.pressKey("END");
+    await testUI.flush();
+    expect(testUI.captureCharFrame()).toContain("input-line-11");
     testUI.mockInput.pressEscape();
     await Bun.sleep(40);
     await testUI.flush();
