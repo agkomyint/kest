@@ -1,0 +1,126 @@
+{
+  "date": "2026-10-29T05:37:09.127Z",
+  "platform": "win32",
+  "bunVersion": "1.4.4",
+  "bashVersion": "GNU bash, version 5.2.37(1)-release (x86_64-pc-msys)",
+  "trials": 20,
+  "warmups": 1,
+  "preparationLeadMs": 100,
+  "results": [
+    {
+      "task": "Print a short result",
+      "Kest cold": {
+        "medianMs": 37.64,
+        "minMs": 33.71,
+        "maxMs": 56.61
+      },
+      "Bash cold": {
+        "medianMs": 31.7,
+        "minMs": 28.92,
+        "maxMs": 52.84
+      },
+      "Kest prepared": {
+        "medianMs": 9.8,
+        "minMs": 9.08,
+        "maxMs": 16.76
+      },
+      "Bash prepared": {
+        "medianMs": 9.65,
+        "minMs": 3.69,
+        "maxMs": 18.29
+      }
+    },
+    {
+      "task": "List 200 files",
+      "Kest cold": {
+        "medianMs": 40.58,
+        "minMs": 36.83,
+        "maxMs": 65.57
+      },
+      "Bash cold": {
+        "medianMs": 33.54,
+        "minMs": 28.91,
+        "maxMs": 57.31
+      },
+      "Kest prepared": {
+        "medianMs": 14.01,
+        "minMs": 12.53,
+        "maxMs": 17.61
+      },
+      "Bash prepared": {
+        "medianMs": 10.91,
+        "minMs": 4.03,
+        "maxMs": 22.19
+      }
+    },
+    {
+      "task": "Read 1 MiB",
+      "Kest cold": {
+        "medianMs": 49.15,
+        "minMs": 42.99,
+        "maxMs": 77.16
+      },
+      "Bash cold": {
+        "medianMs": 105.43,
+        "minMs": 78.05,
+        "maxMs": 158.28
+      },
+      "Kest prepared": {
+        "medianMs": 16.3,
+        "minMs": 13.01,
+        "maxMs": 22.29
+      },
+      "Bash prepared": {
+        "medianMs": 71.48,
+        "minMs": 53.54,
+        "maxMs": 93.85
+      }
+    },
+    {
+      "task": "Search 200 files",
+      "Kest cold": {
+        "medianMs": 52.85,
+        "minMs": 49,
+        "maxMs": 62.61
+      },
+      "Bash cold": {
+        "medianMs": 104.48,
+        "minMs": 94.97,
+        "maxMs": 172.25
+      },
+      "Kest prepared": {
+        "medianMs": 22.95,
+        "minMs": 19.28,
+        "maxMs": 27.58
+      },
+      "Bash prepared": {
+        "medianMs": 80.33,
+        "minMs": 64.36,
+        "maxMs": 103.77
+      }
+    },
+    {
+      "task": "Copy 1 MiB",
+      "Kest cold": {
+        "medianMs": 46.32,
+        "minMs": 41.19,
+        "maxMs": 73.01
+      },
+      "Bash cold": {
+        "medianMs": 103.84,
+        "minMs": 88.95,
+        "maxMs": 129.3
+      },
+      "Kest prepared": {
+        "medianMs": 16.07,
+        "minMs": 14.11,
+        "maxMs": 20.35
+      },
+      "Bash prepared": {
+        "medianMs": 77.07,
+        "minMs": 61.4,
+        "maxMs": 134.59
+      }
+    }
+  ]
+}

@@ -1,0 +1,223 @@
+{
+  "date": "2026-10-29T05:54:50.529Z",
+  "bun": "1.4.4",
+  "playwright": "1.64.1",
+  "headless": true,
+  "trials": 10,
+  "warmups": 1,
+  "viewport": "1280x720",
+  "startup": [
+    {
+      "browser": "chrome",
+      "version": "155.0.8059.85",
+      "medianMs": 412.13,
+      "minMs": 392.76,
+      "maxMs": 489.77
+    },
+    {
+      "browser": "msedge",
+      "version": "156.0.4314.42",
+      "medianMs": 522.46,
+      "minMs": 506.11,
+      "maxMs": 592.47
+    }
+  ],
+  "results": [
+    {
+      "task": "Open Wikipedia",
+      "source": "live Wikipedia",
+      "browser": "chrome",
+      "trials": 10,
+      "medianMs": 159.41,
+      "minMs": 137.98,
+      "maxMs": 182.06
+    },
+    {
+      "task": "Open Wikipedia",
+      "source": "live Wikipedia",
+      "browser": "msedge",
+      "trials": 10,
+      "medianMs": 157.9,
+      "minMs": 149.33,
+      "maxMs": 197.27
+    },
+    {
+      "task": "Search Wikipedia for Black hole",
+      "source": "live Wikipedia",
+      "browser": "chrome",
+      "trials": 10,
+      "medianMs": 918.37,
+      "minMs": 837.32,
+      "maxMs": 1080.01
+    },
+    {
+      "task": "Search Wikipedia for Black hole",
+      "source": "live Wikipedia",
+      "browser": "msedge",
+      "trials": 10,
+      "medianMs": 948.96,
+      "minMs": 865.32,
+      "maxMs": 1132.43
+    },
+    {
+      "task": "Extract article text and links",
+      "source": "live Wikipedia",
+      "browser": "chrome",
+      "trials": 10,
+      "medianMs": 148.75,
+      "minMs": 111.19,
+      "maxMs": 198.61
+    },
+    {
+      "task": "Extract article text and links",
+      "source": "live Wikipedia",
+      "browser": "msedge",
+      "trials": 10,
+      "medianMs": 168.15,
+      "minMs": 133.48,
+      "maxMs": 218.79
+    },
+    {
+      "task": "Fill 3 fields and submit form",
+      "source": "local controlled page",
+      "browser": "chrome",
+      "trials": 10,
+      "medianMs": 81.89,
+      "minMs": 65.27,
+      "maxMs": 115.21
+    },
+    {
+      "task": "Fill 3 fields and submit form",
+      "source": "local controlled page",
+      "browser": "msedge",
+      "trials": 10,
+      "medianMs": 64.09,
+      "minMs": 56.74,
+      "maxMs": 75.43
+    },
+    {
+      "task": "Select dropdown and checkbox",
+      "source": "local controlled page",
+      "browser": "chrome",
+      "trials": 10,
+      "medianMs": 42.16,
+      "minMs": 38.2,
+      "maxMs": 48.58
+    },
+    {
+      "task": "Select dropdown and checkbox",
+      "source": "local controlled page",
+      "browser": "msedge",
+      "trials": 10,
+      "medianMs": 48.16,
+      "minMs": 40.78,
+      "maxMs": 66.55
+    },
+    {
+      "task": "Filter 200 table rows",
+      "source": "local controlled page",
+      "browser": "chrome",
+      "trials": 10,
+      "medianMs": 37.38,
+      "minMs": 34.12,
+      "maxMs": 50.7
+    },
+    {
+      "task": "Filter 200 table rows",
+      "source": "local controlled page",
+      "browser": "msedge",
+      "trials": 10,
+      "medianMs": 39.04,
+      "minMs": 31.82,
+      "maxMs": 49.21
+    },
+    {
+      "task": "Upload and verify a file",
+      "source": "local controlled page",
+      "browser": "chrome",
+      "trials": 10,
+      "medianMs": 63.27,
+      "minMs": 40.07,
+      "maxMs": 68.72
+    },
+    {
+      "task": "Upload and verify a file",
+      "source": "local controlled page",
+      "browser": "msedge",
+      "trials": 10,
+      "medianMs": 58.74,
+      "minMs": 51.02,
+      "maxMs": 72.37
+    },
+    {
+      "task": "Download and verify 512 KiB",
+      "source": "local controlled page",
+      "browser": "chrome",
+      "trials": 10,
+      "medianMs": 124.82,
+      "minMs": 113.87,
+      "maxMs": 140.47
+    },
+    {
+      "task": "Download and verify 512 KiB",
+      "source": "local controlled page",
+      "browser": "msedge",
+      "trials": 10,
+      "medianMs": 166.15,
+      "minMs": 140.69,
+      "maxMs": 223.21
+    },
+    {
+      "task": "Capture 1280x720 screenshot",
+      "source": "local controlled page",
+      "browser": "chrome",
+      "trials": 10,
+      "medianMs": 41.14,
+      "minMs": 30.61,
+      "maxMs": 49.82
+    },
+    {
+      "task": "Capture 1280x720 screenshot",
+      "source": "local controlled page",
+      "browser": "msedge",
+      "trials": 10,
+      "medianMs": 52.83,
+      "minMs": 44.41,
+      "maxMs": 62.01
+    },
+    {
+      "task": "Follow article link",
+      "source": "live Wikipedia",
+      "browser": "chrome",
+      "trials": 10,
+      "medianMs": 897.15,
+      "minMs": 618.81,
+      "maxMs": 1135.12
+    },
+    {
+      "task": "Follow article link",
+      "source": "live Wikipedia",
+      "browser": "msedge",
+      "trials": 10,
+      "medianMs": 1010.62,
+      "minMs": 804.07,
+      "maxMs": 1083.67
+    }
+  ],
+  "initialSelectorFailures": [
+    {
+      "task": "Follow article link",
+      "source": "live Wikipedia",
+      "browser": "chrome",
+      "trials": 0,
+      "error": "TimeoutError: click: Timeout 10000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('#mw-content-text a[href=\"/wiki/General_relativity\"]').first()\u001b[22m\n"
+    },
+    {
+      "task": "Follow article link",
+      "source": "live Wikipedia",
+      "browser": "msedge",
+      "trials": 0,
+      "error": "TimeoutError: click: Timeout 10000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('#mw-content-text a[href=\"/wiki/General_relativity\"]').first()\u001b[22m\n"
+    }
+  ]
+}

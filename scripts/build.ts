@@ -12,8 +12,12 @@ const result = await Bun.build({
   // Avoid embedding provider credentials from the build environment.
   env: "disable",
   ...(standalone
-    ? { compile: { outfile } }
-    : { external: ["@opentui/core"], outdir: "dist", naming: "kest.js" }),
+    ? { compile: { outfile }, external: ["playwright-core"] }
+    : {
+        external: ["@opentui/core", "playwright-core"],
+        outdir: "dist",
+        naming: "kest.js",
+      }),
 });
 if (!result.success) {
   for (const log of result.logs) console.error(log);

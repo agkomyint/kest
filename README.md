@@ -39,11 +39,60 @@ A small loading indicator appears while the agent works; only the completed fina
 | `search`     | Searches literal text, case insensitive                           |
 | `edit_file`  | Replaces one unique exact match; shows diff and requires approval |
 | `write_file` | Creates/replaces files; shows diff and requires approval          |
-| `shell`      | Runs PowerShell on Windows or sh on Unix; requires approval       |
+| `shell`      | Runs TypeScript directly in Bun; follows permission setting       |
+| `set_plan`   | Replaces the agent's task plan; tracked step by step              |
+| `update_task`| Marks a plan task pending, doing, or done                         |
+| `spawn_subagent` | Delegates exploration to a read-only subagent; returns findings as text |
 
 Press **y** to approve or **n** to deny. File tools stay inside the workspace, check symlinks, exclude credential files, and detect changes made while awaiting approval. Existing files must be read before editing. Large diffs require smaller edits. Shell commands run with your permissions and are not sandboxed; inspect the displayed command before approving. Shell output is bounded and commands have a 60-second timeout. Cancellation terminates their process tree. Modal environment credentials are omitted from shell subprocesses.
 
 The agent can run up to 20 model/tool rounds per message. It keeps completed tool actions when cancelled. Older complete turns are removed when context grows large; `/new` starts fresh.
+
+## Goals, plans, and subagents
+
+Set an objective with `/goal <text>` — it is stored in the session, survives `/resume`, and steers every reply. For multi-step work the agent breaks the goal into tasks with `set_plan` and tracks them with `update_task`; `/tasks` shows the checklist and progress. Research delegation supports leads, workers, reviewers, configured model profiles and bounded teams; see the research-company workflow below. Usage from all workers counts in `/usage`, and cancelling the director cancels its descendants.
+
+## Research company
+
+Kest's system instructions now use a director → research lead → worker → review-board workflow for substantial research. The canonical editable prompt is [prompts/research-company.md](prompts/research-company.md), bundled into builds. Small coding and lookup tasks remain direct. This is a research workflow, not a guarantee of scientific discovery or correct claims.
+
+Prepare a run without spending model credits, set its total budget, then launch it:
+
+```text
+/research prepare Discover a dynamic indexing algorithm; compare verified baselines and preserve negative results.
+/research budget 30 100
+/research tokens 1m
+/research resume
+```
+
+`/research <objective>` starts immediately using the defaults. `/research` shows saved usage and status; `/research resume` continues without resetting consumption; `/research off` disables automatic continuation while preserving artifacts. Esc cancels active work. Defaults are 30 active minutes, 100 model requests, 12 delegated agents (one slot reserved for review), three delegation levels, and three simultaneous model calls. Requests include failed dispatched requests, children, and context summaries. Increasing time/request totals is an explicit `/research budget` action; model count is not a currency-cost limit. Approval waits count toward active time.
+
+`spawn_subagent` accepts `profile`, `provider`, `model`, `role` and `toolset`. `research_team` launches up to three assignments concurrently; `research_review` requests a skeptical fresh-context review; `list_models` and `research_status` expose profiles and remaining budget. Leads can delegate within limits. Local read-only scope cannot expand into browser scope. `research` toolsets use agent-owned tabs in the shared Kest browser with the existing approval policy; children never get shell/edit tools. Each worker has its own tab registry and active tab. Browser/context cookies and storage are shared within this Kest instance. Worker completion closes its tabs, including popups, while the director browser stays available. Nested workers reuse the same browser. The director runs experiments through approved Bun scripts, which can directly invoke Rust/C++ compilers and executables. `shell.timeout_ms` can extend an explicitly approved script up to 30 minutes; research deadlines still cancel it.
+
+`/research tokens 500b` sets a total input-plus-output allowance of 500 billion tokens; suffixes `k`, `m`, `b`, and `t` are accepted. `/research tokens 1m` sets one million, and `/research tokens off` removes the token cap. Increasing the total extends the existing allowance without resetting consumption. Usage includes director, worker, reviewer, retry and summary requests. Provider usage replaces conservative preflight reservations; missing/interrupted usage remains labeled as estimated, including reservations recovered after a crash. This is not a model-specific tokenizer or a guaranteed currency cap. Kest stops when it cannot reserve room for another request, possibly below the configured token total. Time, request and agent safeguards still apply: `/research budget 120 500 32` sets totals of 120 active minutes, 500 requests and 32 delegates (optional third argument; maximum 64). Esc cancels active work before changing limits. Extend the totals, then `/research resume`.
+
+Worker rows show their ID, role/model, current tool or status, and completion/failure. Click a worker row to inspect its live activity without mixing concurrent output into the director's tool. `/agents` lists workers and `/agents <id-prefix>` inspects their transcript without replacing the director context. Research workers persist messages and archived context under `research/<run-id>/agents/<worker-id>.json` when they finish or fail. Live previews are bounded; the saved transcript holds the complete retained/archive messages. Non-research delegates have live previews but no research-directory transcript. Interim research checkpoints are displayed while work continues. Persistent studies reserve up to 30% of the request budget (capped at 30 requests) for director implementation/experiments; final reviewers may use the separate last-two-request reconciliation reserve.
+
+Configure worker models without changing the director's selected model:
+
+```text
+/research models
+/research model critic modal YOUR_SUPPORTED_MODEL_ID
+/research model designer baseten YOUR_SUPPORTED_MODEL_ID
+/research endpoint external https://YOUR_PROVIDER/v1 YOUR_MODEL_ID YOUR_API_KEY_ENV_NAME
+```
+
+Built-in profiles resolve the provider keys configured through `/connect`. Custom OpenAI-compatible endpoints store only a reference to an environment variable; set that variable before starting Kest. Never enter its actual secret in a command or chat. Available credentials do not prove a provider supports a particular model. Profiles live in `~/.kest/research-models.json` (honoring `KEST_CONFIG_DIR`). Profiles are user-configured; model tools cannot register new endpoints.
+
+Research mode continues after interim answers and negative findings while budget remains. Near the end it attempts an independent model review and asks the director to reconcile the review into a final checkpoint/paper. If resources fail or expire, it stops rather than inventing completion; a review can itself fail, and is not empirical certification. Live research quality has not been benchmarked by the local fixture tests.
+
+Each run journals request reservations, delegation identities/results/failures, tool observations and checkpoints under `research/<run-id>/events.jsonl` with `state.json`. Session persistence includes the research counters; restart recovery uses the latest journal checkpoint so consumed request budget is not silently renewed. Paused time is excluded, but crash-time accounting is limited to the last durable checkpoint. These local records are not tamper-proof; tool output is still bounded. The research prompt requires scripts to write full raw experiment results, source/dataset checksums, seeds, environment details and paper drafts into the run directory. The logger does not independently validate performance metrics, correctness claims or novelty. Do not confuse synthetic fixture tests with SOSD/YCSB experiments.
+
+Checkpoint replacement retries transient Windows sharing/permission errors while preserving the previous checkpoint. A failed journal operation is reported to its caller without blocking all subsequent writes. Request/time exhaustion ends with an explicit partial checkpoint; user cancellation leaves the study paused. Permanent filesystem failures still require fixing the path or access permissions.
+
+Run `bun test src/research-e2e.test.ts` for the deterministic workflow integration tests: overlapping teams, actual Bun experiment execution, repeated research cycles, artifact reads, review, paper, cancellation, and recovery/resume. `bun run scripts/research-smoke-live.ts --live` explicitly spends configured provider credits (at most 18 requests / 3 minutes), exercises a three-person team and reviewed smoke report, and prints its retained temporary artifact directory. This validates orchestration, not research quality or indexing performance.
+
+Headless research mode is also available with `kest --research --prompt "OBJECTIVE"`. Existing permission settings still apply; headless mode denies actions that would require interactive approval. No actual indexing study, dataset download, or paid model request is launched by installing these changes.
 
 ## Commands and sessions
 
@@ -52,7 +101,11 @@ The agent can run up to 20 model/tool rounds per message. It keeps completed too
 | `/connect [modal\|baseten]` | Save or switch keys; picker shows what's connected |
 | `/provider`              | Show active provider and model                    |
 | `/model`                 | List models from all providers and select one     |
-| `/usage`                 | Token usage by model, persisted on this machine    |
+| `/context`               | Inspect active context, estimates, summaries, and local archives |
+| `/usage`                 | All-time token usage by model across workspaces, with session count |
+| `/stats` or `/stat`       | All-time tool counts and timings across saved sessions |
+| `/goal [<text>\|clear]`  | Set, show, or clear the session objective          |
+| `/tasks`                 | Show the plan checklist and progress               |
 | `/new`                   | Start a new session                               |
 | `/sessions`              | List saved sessions for this workspace            |
 | `/resume <id>`           | Restore a session; an unambiguous ID prefix works |
@@ -64,10 +117,22 @@ The agent can run up to 20 model/tool rounds per message. It keeps completed too
 
 Sessions save automatically after each task in `~/.kest/sessions/`. They contain prompts, replies, and tool results in plaintext. Credentials entered through `/connect` are not added to sessions.
 
+## Context management
+
+`/context` shows the estimated next input size, instructions, tool definitions, conversation and summary sizes, local budget, archived message count, compaction count and last provider-reported input tokens. This is current model input, not the all-time usage shown by `/usage`. Running an inspection command does not call the model or add its output to the model's conversation.
+
+Before model requests, Kest summarizes older conversation when estimated input approaches its local operating budget. Instructions remain pinned; recent user turns and complete tool-call/result groups are retained. For long single-turn tasks, completed older tool groups can also be summarized while retaining the latest user request. The summary asks the connected model to preserve decisions, constraints, corrections, important files, completed checks and unfinished work. Summary requests use that provider and count in `/usage` and research token budgets. Summaries request low reasoning effort and concise output, with at most two attempts (4,096 then 8,192 output tokens) and a 30-second timeout per attempt. `KEST_SUMMARY_TIMEOUT_MS` can configure 50–120,000 ms. Progress shows elapsed time; Esc cancels. A cancelled or failed manual summary preserves active history. If automatic summarization fails, Kest uses explicitly labeled local excerpts, archives the full originals, and continues when the resulting context fits. These excerpts are partial, not a verified synthesis; inspect `/context archive` for omitted detail. If safe reduction is impossible, Kest stops with an explicit error. `bun run scripts/context-smoke-live.ts --live` explicitly spends provider credits to test automatic compaction followed by a real reply.
+
+Summarized originals are stored locally in the session's `context.archive`; the summary and counters are stored alongside active `messages`. They survive `/resume` and goal changes; `/new` starts a fresh context. Archives are not sent automatically. Summaries are fallible and source excerpts are bounded, so inspect the original history when details matter. Previously discarded history from older Kest versions cannot be recovered.
+
+Commands: `/context summary` reads the memory; `/context messages` lists active messages; `/context archive` lists archived originals; `/context show 3` and `/context archived 3` inspect numbered messages (large display output is truncated); `/context compact` requests an immediate summary when completed history is eligible. Local archive/session files contain conversation and tool data in plaintext, just like existing session storage.
+
+The default local budget is 40,000 estimated tokens, with 4,096 reserved for output and automatic compaction triggered at 85% of the remaining input budget. Set `KEST_CONTEXT_BUDGET` before starting Kest to choose a value between 12,000 and 200,000. Counts use UTF-8 bytes divided by four; they are estimates, not a model tokenizer or a guarantee about the provider's actual context limit. Configure conservatively for the chosen model. If input cannot fit after safe compaction, Kest asks for a smaller request or a fresh session rather than silently discarding it.
+
 ## Build
 
 ```sh
-bun run build       # ~0.44 MB JS bundle; requires Bun and installed @opentui/core
+bun run build       # JS bundle; requires Bun and installed @opentui/core
 bun run build:exe   # ~127 MB standalone Windows executable, includes Bun/native assets
 ```
 
@@ -93,3 +158,36 @@ kest --prompt "Read package.json and summarize this project"
 ```
 
 Headless mode denies edits and shell commands, and does not save a session.
+
+Tool rows show elapsed milliseconds. Use `/stats` (or `/stat`) for all-time call counts, errors, and total/average/maximum time per tool across saved sessions in every workspace on this machine. Both `/stats` and `/usage` show session and workspace counts, including the current session without counting a resumed session twice. Timings include approval waits; older calls without saved timings cannot be reconstructed. `/sessions` continues to list the current workspace's conversations.
+
+Sessions are JSON files in `~/.kest/sessions/`; all-time model token usage is in `~/.kest/usage.json`. `KEST_CONFIG_DIR` relocates both, and `KEST_USAGE_FILE` can override the usage file separately. Usage writes are atomic and coordinated across terminals. Headless `kest --prompt` runs also save sessions, tool timings, and reported token usage. These totals are local to this Kest storage directory, not synchronized between computers. Token counts depend on the provider returning usage data.
+
+Run `bun run scripts/bench-tools.ts` for a local 800-file tool benchmark (seven samples per tool; reports median milliseconds). Search uses bounded concurrency of 16 files and preserves result order.
+
+The `shell` tool runs JavaScript/TypeScript directly in Bun. Use Bun APIs or `Bun.spawn` with argument arrays for external programs. Approval, timeout, output limits, and cancellation apply. PowerShell and Bash command syntax is not accepted. Run `bun run scripts/bench-shell.ts` on Windows to compare runtime startup overhead.
+
+Use `/permission all|minimal|strict` in the UI, or `kest [directory] --permission all|minimal|strict`. The choice is saved in your Kest config and restored on restart, including headless runs. `all` auto-approves file edits, writes, and Bun scripts. `minimal` auto-approves file edits/writes and asks before scripts. `strict` asks before each edit, write, or script and is the initial default. Headless mode denies actions requiring a prompt. `/permission` shows the current level. Saved sessions do not override this setting.
+
+Built-in Bun automation guidance applies to new and resumed sessions: batch related work in one script, use native APIs, and avoid launching PowerShell or other interpreters. This is agent guidance, not a subprocess security sandbox.
+
+The agent prestarts one idle Bun interpreter while waiting for a model response. Approved scripts are then sent through stdin to that fresh, one-use process; unused interpreters are stopped at the end of the turn. This overlaps startup with model latency without sharing script globals between calls. A local 15-trial system-info comparison measured a 40.54 ms cold median versus 20.13 ms prepared median (100 ms preparation lead time, excluded from dispatch timing). It reduces dispatch latency rather than eliminating startup work.
+
+Expanded tool calls show independent input/output scroll panels, each capped at six content rows (smaller in short terminals). Use the mouse wheel over a panel or drag its scrollbar. Ctrl+Shift+I focuses input; Ctrl+Shift+O focuses output. Arrow keys, PgUp/PgDn, Home/End scroll the focused panel; Escape returns to the composer. Ctrl+O toggles the whole tool. Code highlighting and distinct background colors remain.
+
+Application-launch guidance avoids fixed sleeps and duplicate attempts: submit one direct native launch request, and distinguish request submission from a verified visible application window.
+
+
+## Browser control
+
+Run `/browser` to open a visible Kest-owned Chrome window (Edge is the fallback), or `/browser https://en.wikipedia.org`. Then ask, for example, "Search Wikipedia for black holes". The `browser` tool can navigate, inspect accessible page snapshots, click, type, press keys, select options, go back/forward, and open/switch/close tabs. It returns a snapshot after each action and reuses the browser across messages, goals, and new conversation sessions. `/browser tabs` lists tabs; `/browser close` closes the Kest browser. Quitting Kest closes it too.
+
+This window uses a separate, temporary browser context; it does not attach to your existing personal browser tabs. Install Chrome or Edge first; no bundled-browser download is required. Browser action approvals follow `/permission`: `all` auto-approves; `minimal` and `strict` ask before browser actions. Reading snapshots and listing tabs are automatic. Direct `/browser` commands are explicit user actions. Page contents are treated as untrusted data, and research output must cite sources.
+
+`playwright-core` is loaded only when browser automation is used, preserving fast CLI startup. Both JS and compiled builds resolve it as an external dependency: keep `node_modules/playwright-core` installed alongside the distribution when using browser control. The compiled executable's browser feature therefore requires this installed package.
+
+Browser actions use compact DOM observations by default; explicit `snapshot` retains the full accessibility view. The `detail` option accepts `compact`, `full`, or `none` (acknowledgment only). Responses include action/observation timing metadata. Use `action: "batch"` with 1–12 known `steps` (`fill`, `click`, `press`, `select`, `navigate`) to run an observed workflow with one final observation and a single tool approval. Steps stay sequential and stop on failure. This avoids model round trips between predictable actions; it does not guarantee a network or model response within 100–300 ms. See `browser-speed-results.md` for the local profile.
+
+For a same-tab link click, provide its observed href as `url`. Kest then waits for navigation and destination DOM readiness rather than all page assets, including when the link redirects. It still checks element visibility and stability.
+
+Final replies render Markdown locally with mint headings/emphasis, blue links, amber inline-code highlights, clearer paragraph/list spacing, and syntax-colored JavaScript/TypeScript/JSON code blocks on tinted backgrounds. Formatting markers are concealed; text remains selectable. This rendering does not download grammars.

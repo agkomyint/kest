@@ -2,7 +2,14 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { formatUsage, loadUsage, recordUsage } from "./usage";
+import { fileURLToPath } from "node:url";
+import {
+  formatUsage,
+  loadUsage,
+  recordUsage,
+  usageFile,
+  flushUsage,
+} from "./usage";
 import { BASETEN_MODEL } from "./config";
 
 async function withTmp(run: (file: string) => Promise<void>) {
@@ -55,4 +62,63 @@ test("formatUsage prefixes known models with their provider", () => {
     [BASETEN_MODEL]: { input: 10, output: 5, requests: 1, updatedAt: "" },
   });
   expect(text).toContain(`baseten · ${BASETEN_MODEL}`);
+});
+
+test("usage writes retain concurrent requests and flush before reads", async () => {
+  await withTmp(async (file) => {
+    const writes = Array.from({ length: 20 }, () =>
+      recordUsage("shared", 2, 3, file),
+    );
+    await flushUsage();
+    await Promise.all(writes);
+    expect((await loadUsage(file)).shared).toMatchObject({
+      input: 40,
+      output: 60,
+      requests: 20,
+    });
+  });
+});
+
+test("independent processes share the all-time usage ledger", async () => {
+  await withTmp(async (file) => {
+    const source = `import { recordUsage } from ${JSON.stringify(fileURLToPath(new URL("./usage.ts", import.meta.url)))}; for (let i = 0; i < 5; i++) await recordUsage("shared", 7, 2, process.env.KEST_USAGE_FILE);`;
+    const worker = join(file, "..", "worker.ts");
+    await Bun.write(worker, source);
+    const children = Array.from({ length: 3 }, () => {
+      const child = Bun.spawn([process.execPath, "run", worker], {
+        stdout: "pipe",
+        stderr: "pipe",
+        env: { ...process.env, KEST_USAGE_FILE: file },
+      });
+      return child;
+    });
+    for (const child of children) {
+      const error = await new Response(child.stderr).text();
+      expect(error).toBe("");
+      expect(await child.exited).toBe(0);
+    }
+    expect((await loadUsage(file)).shared).toMatchObject({
+      input: 105,
+      output: 30,
+      requests: 15,
+    });
+  });
+});
+
+test("usage location follows configured storage and reports universal session counts", () => {
+  const previousConfig = process.env.KEST_CONFIG_DIR;
+  const previousFile = process.env.KEST_USAGE_FILE;
+  try {
+    process.env.KEST_CONFIG_DIR = join(tmpdir(), "kest-config-location");
+    delete process.env.KEST_USAGE_FILE;
+    expect(usageFile()).toBe(join(process.env.KEST_CONFIG_DIR, "usage.json"));
+    expect(formatUsage({}, { sessions: 3, workspaces: 2 })).toContain(
+      "3 sessions · 2 workspaces",
+    );
+  } finally {
+    if (previousConfig === undefined) delete process.env.KEST_CONFIG_DIR;
+    else process.env.KEST_CONFIG_DIR = previousConfig;
+    if (previousFile === undefined) delete process.env.KEST_USAGE_FILE;
+    else process.env.KEST_USAGE_FILE = previousFile;
+  }
 });

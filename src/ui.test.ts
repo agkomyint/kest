@@ -6,6 +6,143 @@ import { createTestRenderer } from "@opentui/core/testing";
 import { KestUI } from "./ui";
 import { MODAL_MODEL } from "./config";
 
+test("research commands configure models and budgets without starting paid work", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "kest-company-ui-"));
+  const previous = process.env.KEST_CONFIG_DIR;
+  process.env.KEST_CONFIG_DIR = directory;
+  const testUI = await createTestRenderer({ width: 130, height: 40 });
+  const ui = new KestUI(testUI.renderer, process.cwd(), null);
+  const command = async (text: string) => {
+    ui.composer.setText(text);
+    ui.composer.submit();
+    await ui.settled;
+    return ui["session"].entries.at(-1)?.text ?? "";
+  };
+  try {
+    expect(await command("/research")).toContain("No research run");
+    expect(
+      await command("/research model critic modal test-review-model"),
+    ).toContain("saved");
+    expect(await command("/research models")).toContain("test-review-model");
+    expect(
+      await command(
+        "/research endpoint local http://localhost:12345/v1 local-model RESEARCH_LOCAL_KEY",
+      ),
+    ).toContain("RESEARCH_LOCAL_KEY");
+    expect(await command("/research test an algorithm")).toContain(
+      "Connect a model provider",
+    );
+    await command("/goal Old unrelated goal");
+    await command("/research prepare New indexing study");
+    expect(ui["session"].goal).toBe("New indexing study");
+    expect(String(ui["agent"].messages[0]!.content)).not.toContain(
+      "User goal:\nOld unrelated goal",
+    );
+    const { newCompany } = await import("./research-company");
+    ui["session"].research = newCompany("Test budget persistence");
+    ui["agent"].research = ui["session"].research!;
+    await command("/research budget 60 200");
+    expect(ui["agent"].research?.maxRequests).toBe(200);
+    expect(ui["agent"].research?.maxMs).toBe(3600000);
+    await command("/research budget 120 500 32");
+    expect(ui["agent"].research?.maxAgents).toBe(32);
+    await command("/research tokens 500b");
+    expect(ui["agent"].research?.maxTokens).toBe(500_000_000_000);
+    expect(await command("/research")).toContain("500,000,000,000");
+    ui["agent"].research!.inputTokens = 100;
+    expect(await command("/research tokens 99")).toContain("cannot be below");
+    expect(ui["agent"].research?.inputTokens).toBe(100);
+    await command("/research tokens off");
+    expect(ui["agent"].research?.maxTokens).toBeNull();
+    await command("/new");
+    expect(ui["agent"].research).toBeNull();
+  } finally {
+    ui.close();
+    await testUI.dispose();
+    if (previous === undefined) delete process.env.KEST_CONFIG_DIR;
+    else process.env.KEST_CONFIG_DIR = previous;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("/context inspects active messages without a provider and does not add model context", async () => {
+  const testUI = await createTestRenderer({ width: 125, height: 40 });
+  const ui = new KestUI(testUI.renderer, process.cwd(), null);
+  const messages = JSON.stringify(ui["agent"].messages);
+  async function command(value: string) {
+    ui.composer.setText(value);
+    ui.composer.submit();
+    await ui.settled;
+    return ui["session"].entries.at(-1)?.text ?? "";
+  }
+  try {
+    const report = await command("/context");
+    expect(report).toContain("Estimated next input");
+    expect(report).toContain("local budget");
+    expect(report).toContain("Archived locally: 0");
+    expect(report).toContain("counts in /usage");
+    expect(await command("/context summary")).toContain("No summary yet");
+    expect(await command("/context messages")).toContain("1. system");
+    expect(await command("/context show 1")).toContain("You are Kest");
+    expect(await command("/context archive")).toBe("No messages.");
+    expect(await command("/context compact")).toContain(
+      "Connect a provider first",
+    );
+    expect(JSON.stringify(ui["agent"].messages)).toBe(messages);
+  } finally {
+    ui.close();
+    await testUI.dispose();
+  }
+});
+
+test("/context compact saves memory, /goal preserves it and /new resets it", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "kest-context-ui-"));
+  const previous = process.env.KEST_CONFIG_DIR;
+  process.env.KEST_CONFIG_DIR = dir;
+  const testUI = await createTestRenderer({ width: 125, height: 40 });
+  const ui = new KestUI(testUI.renderer, process.cwd(), {
+    provider: "baseten",
+    apiKey: "not-used",
+  });
+  async function command(value: string) {
+    ui.composer.setText(value);
+    ui.composer.submit();
+    await ui.settled;
+  }
+  try {
+    ui["agent"].messages.push(
+      { role: "user", content: "Use Bun and keep existing changes" },
+      { role: "assistant", content: "Old investigation ".repeat(3000) },
+      { role: "user", content: "Next task" },
+    );
+    ui["agent"].summarizeContext = async () =>
+      "Use Bun. Keep user changes. Investigation complete. Next task is unfinished.";
+    await command("/context compact");
+    expect(ui["agent"].context.compactions).toBe(1);
+    const id = ui["session"].id;
+    const { listSessions } = await import("./sessions");
+    expect(
+      (await listSessions(process.cwd()))[0]?.context?.archive.length,
+    ).toBeGreaterThan(0);
+    await command("/context archived 1");
+    expect(ui["session"].entries.at(-1)?.text).toContain("Use Bun");
+    ui["credentials"] = null;
+    await command("/goal clear");
+    expect(ui["agent"].context.compactions).toBe(1);
+    await command("/new");
+    expect(ui["agent"].context.compactions).toBe(0);
+    await command(`/resume ${id}`);
+    expect(ui["agent"].context.compactions).toBe(1);
+    expect(ui["agent"].context.summary).toContain("Next task");
+  } finally {
+    ui.close();
+    await testUI.dispose();
+    if (previous === undefined) delete process.env.KEST_CONFIG_DIR;
+    else process.env.KEST_CONFIG_DIR = previous;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("bare /connect opens a provider picker with keyboard selection", async () => {
   const testUI = await createTestRenderer({ width: 90, height: 28 });
   const ui = new KestUI(testUI.renderer, process.cwd(), null);
@@ -216,7 +353,11 @@ test("/model switches providers when both are connected", async () => {
   const dir = await mkdtemp(join(tmpdir(), "kest-config-"));
   const prev = process.env.KEST_CONFIG_DIR;
   process.env.KEST_CONFIG_DIR = dir;
-  const modalCredential = { provider: "modal", tokenId: "id", tokenSecret: "s" } as const;
+  const modalCredential = {
+    provider: "modal",
+    tokenId: "id",
+    tokenSecret: "s",
+  } as const;
   try {
     const testUI = await createTestRenderer({ width: 100, height: 30 });
     const ui = new KestUI(
@@ -226,10 +367,15 @@ test("/model switches providers when both are connected", async () => {
       null,
       {
         baseten: {
-          keys: [{ name: "a", credential: { provider: "baseten", apiKey: "bk" } }],
+          keys: [
+            { name: "a", credential: { provider: "baseten", apiKey: "bk" } },
+          ],
           active: "a",
         },
-        modal: { keys: [{ name: "a", credential: modalCredential }], active: "a" },
+        modal: {
+          keys: [{ name: "a", credential: modalCredential }],
+          active: "a",
+        },
       },
     );
     try {
@@ -240,6 +386,7 @@ test("/model switches providers when both are connected", async () => {
       testUI.mockInput.pressArrow("down"); // highlight modal, second entry
       await testUI.flush();
       testUI.mockInput.pressEnter();
+      await ui.settled;
       await testUI.flush();
       await testUI.renderOnce();
       const frame = testUI.captureCharFrame();
@@ -342,9 +489,318 @@ test("input shows the active provider and model tag", async () => {
     const frame = testUI.captureCharFrame();
     expect(frame).toContain("baseten:a");
     expect(frame).toContain("muse-spark-open-1026");
+    expect(frame).toContain("● baseten:a");
+    expect(frame).not.toContain("Baseten ready");
+    expect(ui["status"].content.chunks.map((c) => c.text).join("")).toBe("");
   } finally {
     ui.close();
     await testUI.dispose();
+  }
+});
+
+test("provider status uses a small configured indicator instead of a ready banner", async () => {
+  const testUI = await createTestRenderer({ width: 100, height: 30 });
+  const ui = new KestUI(testUI.renderer, process.cwd(), {
+    provider: "modal",
+    tokenId: "id",
+    tokenSecret: "secret",
+  });
+  try {
+    await testUI.renderOnce();
+    expect(testUI.captureCharFrame()).toContain("● modal:a");
+    expect(testUI.captureCharFrame()).not.toContain("Modal ready");
+    ui["credentials"] = null;
+    ui["ready"]();
+    await testUI.renderOnce();
+    expect(testUI.captureCharFrame()).toContain("○ /connect");
+    expect(ui["status"].content.chunks.map((c) => c.text).join("")).toBe("");
+  } finally {
+    ui.close();
+    await testUI.dispose();
+  }
+});
+
+test("/goal sets, persists, injects, and clears the objective", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "kest-config-"));
+  const prev = process.env.KEST_CONFIG_DIR;
+  process.env.KEST_CONFIG_DIR = dir;
+  try {
+    const testUI = await createTestRenderer({ width: 100, height: 30 });
+    const ui = new KestUI(testUI.renderer, process.cwd(), null);
+    try {
+      ui.composer.setText("/goal Ship the login flow");
+      ui.composer.submit();
+      await ui.settled;
+      await testUI.flush();
+      await testUI.renderOnce();
+      let frame = testUI.captureCharFrame();
+      expect(frame).toContain("Goal set: Ship the login flow");
+      expect(frame).toContain("Connect first");
+      expect(ui["session"].goal).toBe("Ship the login flow");
+      expect(ui["agent"].messages[0]?.content).toContain("Ship the login flow");
+      expect(frame).toContain("Goal:");
+      const { listSessions } = await import("./sessions");
+      const saved = await listSessions(process.cwd());
+      expect(saved[0]?.goal).toBe("Ship the login flow");
+      ui.composer.setText("/goal clear");
+      ui.composer.submit();
+      await ui.settled;
+      await testUI.flush();
+      await testUI.renderOnce();
+      frame = testUI.captureCharFrame();
+      expect(frame).toContain("Goal cleared");
+      expect(ui["session"].goal).toBeNull();
+      expect(ui["agent"].messages[0]?.content).not.toContain(
+        "Ship the login flow",
+      );
+    } finally {
+      ui.close();
+      await testUI.dispose();
+    }
+  } finally {
+    if (prev === undefined) delete process.env.KEST_CONFIG_DIR;
+    else process.env.KEST_CONFIG_DIR = prev;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("/tasks shows the plan checklist and status progress", async () => {
+  const testUI = await createTestRenderer({ width: 100, height: 30 });
+  const ui = new KestUI(testUI.renderer, process.cwd(), null);
+  try {
+    ui["session"].tasks = [
+      { id: "t1", title: "Read the code", status: "done" },
+      { id: "t2", title: "Write the fix", status: "doing" },
+    ];
+    ui.composer.setText("/tasks");
+    ui.composer.submit();
+    await ui.settled;
+    await testUI.flush();
+    await testUI.renderOnce();
+    const frame = testUI.captureCharFrame();
+    expect(frame).toContain("Tasks 1/2");
+    expect(frame).toContain("Read the code");
+    expect(frame).toContain("Write the fix");
+    ui["ready"]();
+    await testUI.renderOnce();
+    expect(testUI.captureCharFrame()).toContain("Tasks 1/2");
+  } finally {
+    ui.close();
+    await testUI.dispose();
+  }
+});
+
+test("long pastes collapse while preserving the full submitted text", async () => {
+  const testUI = await createTestRenderer({ width: 60, height: 22 });
+  const ui = new KestUI(testUI.renderer, process.cwd(), null);
+  try {
+    const pasted = "Research evidence and details. ".repeat(100);
+    await testUI.mockInput.pasteBracketedText(pasted);
+    expect(ui.composer.plainText).toContain("[Pasted text #1");
+    expect(ui.composer.plainText.length).toBeLessThan(100);
+    expect(ui.composer.wrapMode).toBe("word");
+    ui.composer.insertText(" Please review.");
+    ui.composer.submit();
+    await ui.settled;
+    expect(ui["inputHistory"].at(-1)).toBe(pasted + " Please review.");
+    expect(ui["pastedTexts"].size).toBe(0);
+  } finally {
+    ui.close();
+    await testUI.dispose();
+  }
+});
+
+test("many expanded tool panels support legitimate selection listeners and release them on collapse and clear", async () => {
+  const testUI = await createTestRenderer({ width: 90, height: 30 });
+  const warnings: Error[] = [];
+  const onWarning = (warning: Error) => {
+    if (warning.name === "MaxListenersExceededWarning") warnings.push(warning);
+  };
+  process.on("warning", onWarning);
+  const ui = new KestUI(testUI.renderer, process.cwd(), null);
+  const baseline = testUI.renderer.listenerCount("selection");
+  try {
+    for (let cycle = 0; cycle < 3; cycle++) {
+      const tools = Array.from({ length: 12 }, (_, i) => {
+        ui["add"]("tool", `✓ Inspect evidence ${i}`, {
+          input: "{}",
+          output: "Evidence read",
+          language: "JSON",
+        });
+        const tool = ui["lastTool"]!;
+        tool.expanded = true;
+        ui["renderTool"](tool);
+        return tool;
+      });
+      expect(testUI.renderer.listenerCount("selection")).toBe(baseline + 24);
+      for (const tool of tools) {
+        tool.expanded = false;
+        ui["renderTool"](tool);
+      }
+      expect(testUI.renderer.listenerCount("selection")).toBe(baseline);
+      const reopened = tools[0]!;
+      reopened.expanded = true;
+      ui["renderTool"](reopened);
+      expect(reopened.outputText!.plainText).toContain("Evidence read");
+      ui["clearView"]();
+      expect(testUI.renderer.listenerCount("selection")).toBe(baseline);
+    }
+    await testUI.flush();
+    expect(warnings).toEqual([]);
+  } finally {
+    ui.close();
+    expect(testUI.renderer.listenerCount("selection")).toBe(0);
+    process.off("warning", onWarning);
+    await testUI.dispose();
+  }
+});
+
+test("parallel worker rows stream separate activity without overwriting the director tool", async () => {
+  const testUI = await createTestRenderer({ width: 120, height: 40 });
+  const ui = new KestUI(testUI.renderer, process.cwd(), null);
+  const worker = (workerId: string, model: string) => ({
+    type: "worker" as const,
+    workerId,
+    parentId: "director",
+    task: "Inspect research evidence",
+    role: "researcher",
+    model,
+    depth: 1,
+    state: "running" as const,
+  });
+  try {
+    ui["event"]({
+      type: "tool",
+      name: "research_team",
+      args: '{"tasks":[]}',
+      state: "running",
+    });
+    const director = ui["toolEntry"];
+    ui["event"](worker("aaaaaaaa-1111", "model-a"));
+    ui["event"](worker("bbbbbbbb-2222", "model-b"));
+    ui["event"]({
+      ...worker("aaaaaaaa-1111", "model-a"),
+      event: {
+        type: "tool",
+        name: "read_file",
+        args: '{"path":"raw.json"}',
+        state: "running",
+      },
+    });
+    ui["event"]({
+      ...worker("bbbbbbbb-2222", "model-b"),
+      event: { type: "status", text: "Inspecting references" },
+    });
+    const first = ui["workerViews"].get("aaaaaaaa-1111")!;
+    const second = ui["workerViews"].get("bbbbbbbb-2222")!;
+    first.view.expanded = true;
+    ui["renderTool"](first.view);
+    ui["event"]({
+      ...worker("aaaaaaaa-1111", "model-a"),
+      event: {
+        type: "tool",
+        name: "read_file",
+        args: "{}",
+        state: "done",
+        output: "Measured evidence",
+        durationMs: 12,
+      },
+    });
+    expect(first.entry.detail!.output).toContain("Measured evidence");
+    expect(second.entry.detail!.output).not.toContain("Measured evidence");
+    expect(ui["toolEntry"]).toBe(director);
+    expect(director!.text).toContain("research_team");
+    ui["event"]({
+      ...worker("bbbbbbbb-2222", "model-b"),
+      state: "error",
+      output: "Provider unavailable",
+    });
+    expect(second.entry.text).toContain("Failed");
+    ui["event"]({
+      ...worker("aaaaaaaa-1111", "model-a"),
+      state: "done",
+      output: "Evidence checked",
+    });
+    expect(first.entry.text).toContain("Completed");
+    ui["event"]({
+      type: "tool",
+      name: "research_team",
+      args: "{}",
+      state: "done",
+      output: "One returned; one failed",
+      durationMs: 50,
+    });
+    expect(director!.detail!.output).toContain("One returned");
+    await ui["command"]("/agents aaaaaaaa");
+    expect(ui["session"].entries.at(-1)!.text).toContain("Measured evidence");
+    ui["event"]({
+      type: "checkpoint",
+      cycle: 1,
+      text: "Hypothesis rejected; trying the next experiment.",
+    });
+    expect(ui["session"].entries.at(-1)!.text).toContain("continuing");
+    await testUI.renderOnce();
+    expect(testUI.captureCharFrame()).toContain("continuing");
+  } finally {
+    ui.close();
+    await testUI.dispose();
+  }
+});
+
+test("saved worker transcripts can be inspected without replacing the director context", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "kest-worker-inspector-"));
+  const { newCompany } = await import("./research-company");
+  const { saveWorkerRecord } = await import("./research-workers");
+  const study = newCompany("Inspect saved researchers");
+  const id = crypto.randomUUID();
+  await saveWorkerRecord(join(cwd, "research", study.id), {
+    id,
+    parentId: "director",
+    role: "researcher",
+    model: "worker-model",
+    depth: 1,
+    state: "done",
+    task: "Check actual evidence",
+    messages: [
+      { role: "system", content: "Worker-only system instructions" },
+      { role: "user", content: "Inspect raw.json" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "read",
+            type: "function",
+            function: { name: "read_file", arguments: '{"path":"raw.json"}' },
+          },
+        ],
+      },
+      { role: "tool", tool_call_id: "read", content: "Observed raw result" },
+      { role: "assistant", content: "Supported finding only" },
+    ],
+  });
+  const testUI = await createTestRenderer({ width: 100, height: 30 });
+  const ui = new KestUI(testUI.renderer, cwd, null);
+  ui["session"].research = study;
+  const parent = JSON.stringify(ui["agent"].messages);
+  try {
+    await ui["command"]("/agents");
+    expect(ui["session"].entries.at(-1)!.text).toContain(id.slice(0, 8));
+    await ui["command"](`/agents ${id.slice(0, 8)}`);
+    const transcript = ui["session"].entries.at(-1)!.text;
+    expect(transcript).toContain("read_file");
+    expect(transcript).toContain("Observed raw result");
+    expect(transcript).not.toContain("Worker-only system instructions");
+    expect(JSON.stringify(ui["agent"].messages)).toBe(parent);
+  } finally {
+    ui.close();
+    await testUI.dispose();
+    await rm(cwd, {
+      recursive: true,
+      force: true,
+      maxRetries: 10,
+      retryDelay: 25,
+    });
   }
 });
 
@@ -559,6 +1015,236 @@ test("new activity preserves reading position and clicking its indicator jumps t
       "Another result while following",
     );
     expect(testUI.captureCharFrame()).not.toContain("New activity");
+  } finally {
+    ui.close();
+    await testUI.dispose();
+  }
+});
+
+test("tool timing appears on rows and /stats aggregates all saved sessions", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "kest-global-stats-ui-"));
+  const previousConfig = process.env.KEST_CONFIG_DIR;
+  process.env.KEST_CONFIG_DIR = dir;
+  const { newSession, saveSession } = await import("./sessions");
+  const other = newSession(join(dir, "other-workspace"), []);
+  other.toolStats = [{ name: "read_file", durationMs: 10, error: false }];
+  await saveSession(other);
+  const testUI = await createTestRenderer({ width: 140, height: 35 });
+  const ui = new KestUI(testUI.renderer, process.cwd(), null);
+  try {
+    for (const [durationMs, state] of [
+      [12, "done"],
+      [28, "error"],
+    ] as const) {
+      ui["event"]({
+        type: "tool",
+        name: "read_file",
+        args: "{}",
+        state: "running",
+      });
+      ui["event"]({
+        type: "tool",
+        name: "read_file",
+        args: "{}",
+        state,
+        durationMs,
+      });
+    }
+    await testUI.renderOnce();
+    expect(testUI.captureCharFrame()).toContain("28.00 ms");
+    ui.composer.setText("/stats");
+    ui.composer.submit();
+    await ui.settled;
+    await testUI.flush();
+    await testUI.renderOnce();
+    const frame = testUI.captureCharFrame();
+    expect(frame).toContain(`${ui["agent"].toolDefs().length} tools available`);
+    expect(frame).toContain("3 calls across saved sessions");
+    expect(frame).toContain("2 sessions · 2 workspaces");
+    expect(frame).toContain(
+      "3 calls · 1 errors · total 50.00 ms · avg 16.67 ms · max 28.00 ms",
+    );
+    expect(ui["session"].toolStats).toHaveLength(2);
+    ui.composer.setText("/stat");
+    ui.composer.submit();
+    await ui.settled;
+    expect(ui["session"].entries.at(-1)?.text).toContain(
+      "3 calls across saved sessions",
+    );
+    ui.composer.setText("/usage");
+    ui.composer.submit();
+    await ui.settled;
+    expect(ui["session"].entries.at(-1)?.text).toContain(
+      "2 sessions · 2 workspaces",
+    );
+  } finally {
+    ui.close();
+    await testUI.dispose();
+    if (previousConfig === undefined) delete process.env.KEST_CONFIG_DIR;
+    else process.env.KEST_CONFIG_DIR = previousConfig;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("/permission saves the selected level and controls approvals", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "kest-permission-"));
+  const previous = process.env.KEST_CONFIG_DIR;
+  process.env.KEST_CONFIG_DIR = dir;
+  const testUI = await createTestRenderer({ width: 100, height: 30 });
+  const ui = new KestUI(testUI.renderer, process.cwd(), null);
+  try {
+    ui.composer.setText("/permission minimal");
+    ui.composer.submit();
+    await ui.settled;
+    const { loadStore } = await import("./config");
+    expect((await loadStore()).permission).toBe("minimal");
+    const signal = new AbortController().signal;
+    expect(
+      await ui["ask"]({ kind: "file", title: "Edit", preview: "" }, signal),
+    ).toBe(true);
+    const controller = new AbortController();
+    const pending = ui["ask"](
+      { kind: "script", title: "Script", preview: "" },
+      controller.signal,
+    );
+    expect(ui["approval"]).not.toBeNull();
+    controller.abort();
+    expect(await pending).toBe(false);
+    ui.composer.setText("/permission all");
+    ui.composer.submit();
+    await ui.settled;
+    expect((await loadStore()).permission).toBe("all");
+    expect(
+      await ui["ask"]({ kind: "script", title: "Script", preview: "" }, signal),
+    ).toBe(true);
+  } finally {
+    ui.close();
+    await testUI.dispose();
+    if (previous === undefined) delete process.env.KEST_CONFIG_DIR;
+    else process.env.KEST_CONFIG_DIR = previous;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("shell rows hide code until expanded and display action timing", async () => {
+  const testUI = await createTestRenderer({ width: 100, height: 30 });
+  const ui = new KestUI(testUI.renderer, process.cwd(), null);
+  try {
+    const args = JSON.stringify({
+      title: "Inspect machine specifications",
+      command: "console.log('machine-details')",
+    });
+    ui["event"]({ type: "tool", name: "shell", args, state: "running" });
+    await testUI.renderOnce();
+    expect(testUI.captureCharFrame()).toContain(
+      "Inspect machine specifications",
+    );
+    expect(testUI.captureCharFrame()).not.toContain("console.log");
+    ui["event"]({
+      type: "tool",
+      name: "shell",
+      args,
+      state: "done",
+      durationMs: 37.5,
+      output: "machine-details",
+    });
+    await testUI.renderOnce();
+    expect(testUI.captureCharFrame()).toContain("37.50 ms");
+    expect(testUI.captureCharFrame()).not.toContain("machine-details");
+    const node = ui["lastTool"]!.node;
+    await testUI.mockMouse.click(node.x + 2, node.y);
+    await testUI.flush();
+    const frame = testUI.captureCharFrame();
+    expect(frame).toContain("Input");
+    expect(frame).toContain("console.log('machine-details')");
+    expect(frame).toContain("Output");
+    expect(frame).toContain("machine-details");
+    expect(frame).toContain("Input · TypeScript");
+    const view = ui["lastTool"]!;
+    expect(
+      view.inputScroll!.backgroundColor.equals(
+        view.outputScroll!.backgroundColor,
+      ),
+    ).toBe(false);
+    const codeString = view.inputText!.chunks.find(
+      (chunk) => chunk.text === "'machine-details'",
+    );
+    expect(codeString?.fg).toBeDefined();
+    expect(ui["lastTool"]!.entry.detail?.input).toBe(
+      "console.log('machine-details')",
+    );
+    await testUI.mockMouse.click(node.x + 2, node.y);
+    await testUI.flush();
+    expect(testUI.captureCharFrame()).not.toContain("console.log");
+  } finally {
+    ui.close();
+    await testUI.dispose();
+  }
+});
+
+test("long tool input and output have independent bounded scroll panels", async () => {
+  const testUI = await createTestRenderer({ width: 100, height: 65 });
+  const ui = new KestUI(testUI.renderer, process.cwd(), null);
+  try {
+    const input = Array.from(
+      { length: 12 },
+      (_, i) => `// input-line-${i}`,
+    ).join("\n");
+    const output = Array.from(
+      { length: 12 },
+      (_, i) => `output-line-${i}`,
+    ).join("\n");
+    const args = JSON.stringify({ title: "Inspect details", command: input });
+    ui["event"]({ type: "tool", name: "shell", args, state: "running" });
+    ui["event"]({
+      type: "tool",
+      name: "shell",
+      args,
+      state: "done",
+      output,
+      durationMs: 10,
+    });
+    await testUI.renderOnce();
+    const tool = ui["lastTool"]!;
+    await testUI.mockMouse.click(tool.node.x + 2, tool.node.y);
+    await testUI.flush();
+    expect(testUI.captureCharFrame()).not.toContain("Show more");
+    expect(testUI.captureCharFrame()).not.toContain("input-line-11");
+    expect(testUI.captureCharFrame()).not.toContain("output-line-11");
+    expect(tool.inputScroll!.height).toBeLessThanOrEqual(6);
+    expect(tool.inputScroll!.verticalScrollBar.visible).toBe(true);
+    expect(tool.outputScroll!.verticalScrollBar.visible).toBe(true);
+    const outer = ui.scroll.scrollTop;
+    await testUI.mockMouse.scroll(
+      tool.inputScroll!.x + 2,
+      tool.inputScroll!.y + 1,
+      "down",
+    );
+    await testUI.flush();
+    expect(tool.inputScroll!.scrollTop).toBeGreaterThan(0);
+    expect(tool.outputScroll!.scrollTop).toBe(0);
+    expect(ui.scroll.scrollTop).toBe(outer);
+    tool.inputScroll!.scrollTo(999);
+    await testUI.flush();
+    expect(testUI.captureCharFrame()).toContain("input-line-11");
+    expect(testUI.captureCharFrame()).not.toContain("output-line-11");
+    tool.outputScroll!.scrollTo(999);
+    await testUI.flush();
+    expect(testUI.captureCharFrame()).toContain("output-line-11");
+    expect(testUI.captureCharFrame()).toContain("input-line-11");
+    tool.inputScroll!.scrollTo(0);
+    await testUI.flush();
+    expect(testUI.captureCharFrame()).not.toContain("input-line-11");
+    expect(testUI.captureCharFrame()).toContain("output-line-11");
+    tool.inputScroll!.focus();
+    expect(tool.inputScroll!.focused).toBe(true);
+    testUI.mockInput.pressKey("END");
+    await testUI.flush();
+    expect(testUI.captureCharFrame()).toContain("input-line-11");
+    testUI.mockInput.pressEscape();
+    await Bun.sleep(40);
+    await testUI.flush();
+    expect(ui.composer.focused).toBe(true);
   } finally {
     ui.close();
     await testUI.dispose();

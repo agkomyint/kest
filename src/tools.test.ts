@@ -22,6 +22,19 @@ afterEach(async () => {
 const call = (name: string, args: object) =>
   tools.execute(name, JSON.stringify(args), signal());
 
+test("experiment timeouts are validated and visible in the approval preview", async () => {
+  await expect(
+    call("shell", { command: "console.log('must not run')", timeout_ms: 1 }),
+  ).rejects.toThrow("timeout_ms");
+  expect(requests).toHaveLength(0);
+  const output = await call("shell", {
+    command: "console.log('experiment fixture')",
+    timeout_ms: 120000,
+  });
+  expect(output).toContain("experiment fixture");
+  expect(requests[0]?.preview).toContain("Timeout: 120000 ms");
+});
+
 test("read/list/search return real workspace contents and exclude secrets", async () => {
   await Bun.write(join(root, "hello.ts"), "const answer = 42;\nhello world\n");
   await Bun.write(join(root, ".env"), "SECRET=hidden");
@@ -103,9 +116,7 @@ test("does not overwrite a file changed during approval", async () => {
 
 test("approved shell executes in workspace and returns stdout, stderr, and exit code", async () => {
   const command =
-    process.platform === "win32"
-      ? "Write-Output 'kest-shell-ok'; [Console]::Error.WriteLine('error-line'); exit 3"
-      : "printf kest-shell-ok; printf error-line >&2; exit 3";
+    "console.log('kest-shell-ok'); console.error('error-line'); process.exitCode = 3";
   const result = await call("shell", { command });
   expect(result).toContain("Exit 3");
   expect(result).toContain("kest-shell-ok");
@@ -127,8 +138,7 @@ test("cancelled tools cannot write", async () => {
 
 test("cancelling a running shell terminates it promptly", async () => {
   const controller = new AbortController();
-  const command =
-    process.platform === "win32" ? "Start-Sleep -Seconds 30" : "sleep 30";
+  const command = "await Bun.sleep(30000)";
   const running = tools.execute(
     "shell",
     JSON.stringify({ command }),
@@ -141,3 +151,89 @@ test("cancelling a running shell terminates it promptly", async () => {
     clearTimeout(timer);
   }
 }, 5000);
+
+test("batched search preserves results across batches and caps matching lines", async () => {
+  await Promise.all(
+    Array.from({ length: 35 }, (_, i) =>
+      Bun.write(
+        join(root, `${String(i).padStart(2, "0")}.txt`),
+        "first\nneedle\n",
+      ),
+    ),
+  );
+  const result = await call("search", { path: ".", query: "NEEDLE" });
+  expect(result.split("\n")).toHaveLength(35);
+  for (let i = 0; i < 35; i++)
+    expect(result).toContain(`${String(i).padStart(2, "0")}.txt:2: needle`);
+  await Bun.write(join(root, "many.txt"), "needle\n".repeat(150));
+  const capped = await call("search", { path: ".", query: "needle" });
+  expect(
+    capped.split("\n").filter((line) => line.includes(": needle")),
+  ).toHaveLength(100);
+  expect(capped).toContain("[result limit reached]");
+});
+
+test("search skips excluded folders and binary files while traversing nested files", async () => {
+  await Bun.write(join(root, "nested", "a.txt"), "needle");
+  await Bun.write(join(root, "node_modules", "hidden.txt"), "needle");
+  await Bun.write(join(root, "binary.dat"), "needle\0");
+  const result = await call("search", { path: ".", query: "needle" });
+  expect(result).toContain("a.txt:1: needle");
+  expect(result).not.toContain("hidden.txt");
+  expect(result).not.toContain("binary.dat");
+  const controller = new AbortController();
+  controller.abort();
+  await expect(
+    tools.execute("search", '{"path":".","query":"needle"}', controller.signal),
+  ).rejects.toThrow();
+});
+
+test("direct Bun scripts run in workspace with approval and preserve exit status", async () => {
+  const result = await call("shell", {
+    command:
+      "console.log(process.cwd()); console.error('script-error'); process.exitCode = 3",
+  });
+  expect(result).toContain(root);
+  expect(result).toContain("script-error");
+  expect(result).toContain("Exit 3");
+  expect(requests[0]?.preview).toContain("Runtime: Bun");
+  tools = new WorkspaceTools(root, async () => false);
+  expect(
+    await call("shell", {
+      command: "throw new Error('must not run')",
+    }),
+  ).toContain("Denied");
+});
+
+test("prestarted Bun runs TypeScript once without leaking state to the next call", async () => {
+  tools.prepareShell();
+  await Bun.sleep(80);
+  const first = await call("shell", {
+    command:
+      "import os from 'node:os'; const n: number = 42; globalThis.kestMarker = n; console.log(os.hostname(), n)",
+  });
+  expect(first).toContain("Exit 0");
+  expect(first).toContain("42");
+  tools.prepareShell();
+  await Bun.sleep(80);
+  const second = await call("shell", {
+    command:
+      "console.log(globalThis.kestMarker === undefined ? 'isolated' : 'leaked')",
+  });
+  expect(second).toContain("isolated");
+  tools.disposeShell();
+});
+
+test("unused prestarted Bun is stopped and denied scripts never execute", async () => {
+  tools = new WorkspaceTools(root, async () => false);
+  tools.prepareShell();
+  const proc = tools["preparedShell"]!;
+  const result = await call("shell", {
+    command: "await Bun.write('must-not-exist.txt', 'bad')",
+  });
+  expect(result).toContain("Denied");
+  expect(await Bun.file(join(root, "must-not-exist.txt")).exists()).toBe(false);
+  tools.disposeShell();
+  await proc.exited;
+  expect(tools["preparedShell"]).toBeNull();
+});

@@ -1,0 +1,147 @@
+{
+  "date": "2026-10-29T05:29:34.808Z",
+  "warmups": 1,
+  "trials": 7,
+  "results": [
+    {
+      "case": "System information",
+      "bun": {
+        "medianMs": 41.06,
+        "minMs": 38.5,
+        "maxMs": 43.35
+      },
+      "powershell": {
+        "medianMs": 305.87,
+        "minMs": 291.18,
+        "maxMs": 337.34
+      },
+      "speedup": 7.45
+    },
+    {
+      "case": "List 200 files",
+      "bun": {
+        "medianMs": 39.44,
+        "minMs": 34.68,
+        "maxMs": 54.02
+      },
+      "powershell": {
+        "medianMs": 268.31,
+        "minMs": 255.97,
+        "maxMs": 272.62
+      },
+      "speedup": 6.8
+    },
+    {
+      "case": "Read 1 MiB file",
+      "bun": {
+        "medianMs": 47.57,
+        "minMs": 36.61,
+        "maxMs": 68.45
+      },
+      "powershell": {
+        "medianMs": 304.79,
+        "minMs": 260.73,
+        "maxMs": 328.33
+      },
+      "speedup": 6.41
+    },
+    {
+      "case": "Search 200 files",
+      "bun": {
+        "medianMs": 45.25,
+        "minMs": 41.39,
+        "maxMs": 52.27
+      },
+      "powershell": {
+        "medianMs": 318.9,
+        "minMs": 300.87,
+        "maxMs": 357.03
+      },
+      "speedup": 7.05
+    },
+    {
+      "case": "Write and verify 1 MiB",
+      "bun": {
+        "medianMs": 41.14,
+        "minMs": 39.37,
+        "maxMs": 45.35
+      },
+      "powershell": {
+        "medianMs": 262.22,
+        "minMs": 252.19,
+        "maxMs": 302.26
+      },
+      "speedup": 6.37
+    },
+    {
+      "case": "Copy and verify file",
+      "bun": {
+        "medianMs": 37.33,
+        "minMs": 35.71,
+        "maxMs": 40.04
+      },
+      "powershell": {
+        "medianMs": 259.74,
+        "minMs": 234.68,
+        "maxMs": 281.12
+      },
+      "speedup": 6.96
+    },
+    {
+      "case": "Create, rename, delete",
+      "bun": {
+        "medianMs": 38.67,
+        "minMs": 36.74,
+        "maxMs": 41.76
+      },
+      "powershell": {
+        "medianMs": 256.89,
+        "minMs": 246.44,
+        "maxMs": 266.37
+      },
+      "speedup": 6.64
+    },
+    {
+      "case": "Filter 1000 JSON records",
+      "bun": {
+        "medianMs": 39.29,
+        "minMs": 37.23,
+        "maxMs": 47.49
+      },
+      "powershell": {
+        "medianMs": 336.08,
+        "minMs": 326.83,
+        "maxMs": 370.5
+      },
+      "speedup": 8.55
+    },
+    {
+      "case": "Local HTTP request",
+      "bun": {
+        "medianMs": 39.47,
+        "minMs": 35.57,
+        "maxMs": 39.98
+      },
+      "powershell": {
+        "medianMs": 301.56,
+        "minMs": 292.46,
+        "maxMs": 316.57
+      },
+      "speedup": 7.64
+    },
+    {
+      "case": "Launch isolated GUI app and wait",
+      "bun": {
+        "medianMs": 147.67,
+        "minMs": 132.24,
+        "maxMs": 161.16
+      },
+      "powershell": {
+        "medianMs": 1318.16,
+        "minMs": 1303.13,
+        "maxMs": 1325.48
+      },
+      "speedup": 8.93
+    }
+  ]
+}

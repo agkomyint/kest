@@ -1,0 +1,1 @@
+Benchmarked Kest’s Bun runner vs Git Bash on Windows: 400 runs, 5 tasks. Prestarted Kest: read 1 MiB 16ms vs 71ms; search 200 files 23ms vs 80ms; copy 1 MiB 16ms vs 77ms. Both prestarted. Bash won print/list. Local medians, not a universal Bash claim.

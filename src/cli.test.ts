@@ -57,7 +57,9 @@ test("legacy modal credentials default to the modal provider", () => {
 });
 
 test("baseten credentials use the baseten endpoint and model", () => {
-  expect(() => parseCredentials({ provider: "baseten", apiKey: " " })).toThrow();
+  expect(() =>
+    parseCredentials({ provider: "baseten", apiKey: " " }),
+  ).toThrow();
   const credentials = parseCredentials({
     provider: "baseten",
     apiKey: " key ",
@@ -179,4 +181,27 @@ test("model catalog covers both providers and resolves owners", () => {
   expect(modelProvider(BASETEN_MODEL)).toBe("baseten");
   expect(modelProvider(MODAL_MODEL)).toBe("modal");
   expect(modelProvider("no-such-model")).toBeNull();
+});
+
+test("permission levels persist and survive credential/model updates", async () => {
+  const { savePermission } = await import("./config");
+  const { autoApprove, parsePermission } = await import("./permissions");
+  await withIsolatedConfig(async (dir) => {
+    expect((await loadStore()).permission).toBe("strict");
+    for (const level of ["all", "minimal", "strict"] as const) {
+      await savePermission(level);
+      await saveSelectedModel(BASETEN_MODEL);
+      await saveCredentials({ provider: "baseten", apiKey: "test" });
+      expect((await loadStore()).permission).toBe(level);
+      expect(
+        autoApprove(level, { kind: "file", title: "edit", preview: "" }),
+      ).toBe(level !== "strict");
+      expect(
+        autoApprove(level, { kind: "script", title: "script", preview: "" }),
+      ).toBe(level === "all");
+    }
+    await Bun.write(join(dir, "config.json"), '{"permission":"unknown"}');
+    expect((await loadStore()).permission).toBe("strict");
+    expect(() => parsePermission("unknown")).toThrow();
+  });
 });

@@ -1,3 +1,14 @@
+import { responseText } from "./response-text";
+import { BrowserSession, browserRequest } from "./browser";
+import { toolPanel, toolColors } from "./tool-display";
+import { savePermission } from "./config";
+import {
+  autoApprove,
+  parsePermission,
+  permissionHelp,
+  type Permission,
+} from "./permissions";
+import { formatToolStats } from "./stats";
 import {
   BoxRenderable,
   TextRenderable,
@@ -17,7 +28,7 @@ import {
 } from "@opentui/core";
 import OpenAI from "openai";
 import { version } from "../package.json";
-import { Agent, systemPrompt, type AgentEvent } from "./agent";
+import { Agent, formatTasks, systemPrompt, type AgentEvent } from "./agent";
 import {
   activeKey,
   loadStore,
@@ -40,20 +51,29 @@ import {
 } from "./config";
 import {
   listSessions,
+  allSessions,
   newSession,
   saveSession,
   type Entry,
   type Session,
 } from "./sessions";
-import { formatUsage, loadUsage, recordUsage } from "./usage";
+import { formatUsage, loadUsage, recordUsage, flushUsage } from "./usage";
 import type { Approval } from "./tools";
+import { theme } from "./theme";
+import {
+  newCompany,
+  formatCompany,
+  parseTokenBudget,
+  recoverCompany,
+} from "./research-company";
+import { listWorkerRecords, workerTranscript } from "./research-workers";
+import {
+  listResearchModels,
+  saveResearchModel,
+  saveResearchEndpoint,
+} from "./research-models";
+import { formatContext, describeMessages, type ContextState } from "./context";
 
-const theme = {
-  bg: "#101214",
-  fg: "#e3e5e8",
-  muted: "#a0a6b0",
-  accent: "#a5d6c5",
-};
 const clean = (s: string) => s.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
 // Kestrel vocabulary for ambient states, Claude-style.
 // Confirmations and errors stay plain; only the background chatter plays.
@@ -77,6 +97,7 @@ const toolVerbs: Record<string, string> = {
   edit_file: "Preening",
   write_file: "Weaving",
   shell: "Unleashing",
+  browser: "Browsing",
 };
 const nestLines = [
   "The nest is warm.",
@@ -95,7 +116,16 @@ const commands = [
   "/connect",
   "/provider",
   "/model",
+  "/context",
+  "/research",
+  "/agents",
   "/usage",
+  "/stats",
+  "/stat",
+  "/permission",
+  "/browser",
+  "/goal",
+  "/tasks",
   "/new",
   "/sessions",
   "/resume",
@@ -105,6 +135,19 @@ const commands = [
   "/help",
   "/exit",
 ];
+
+type ToolView = {
+  entry: Entry;
+  node: TextRenderable;
+  expanded: boolean;
+  panels: BoxRenderable;
+  inputScroll?: ScrollBoxRenderable;
+  outputScroll?: ScrollBoxRenderable;
+  inputText?: TextRenderable;
+  outputText?: TextRenderable;
+  lastInput?: string;
+  lastOutput?: string;
+};
 
 export class KestUI {
   readonly composer: TextareaRenderable;
@@ -116,6 +159,8 @@ export class KestUI {
   private activity: TextRenderable;
   private unseenActivity = false;
   private promptBox: BoxRenderable;
+  private pastedTexts = new Map<string, string>();
+  private pasteSequence = 0;
   private promptMark: TextRenderable;
   private modelTag: TextRenderable;
   private style: SyntaxStyle;
@@ -125,18 +170,23 @@ export class KestUI {
   private selectedModel: string | null = null;
   private session: Session;
   private agent: Agent;
+  private browser = new BrowserSession();
   private active: AbortController | null = null;
   private pendingText = "";
   private toolNode: TextRenderable | null = null;
   private toolEntry: Entry | null = null;
-  private lastTool: {
-    entry: Entry;
-    node: TextRenderable;
-    expanded: boolean;
-  } | null = null;
-  private toolViews = new WeakMap<
-    TextRenderable,
-    { entry: Entry; node: TextRenderable; expanded: boolean }
+  private lastTool: ToolView | null = null;
+  private toolViews = new WeakMap<TextRenderable, ToolView>();
+  private workerViews = new Map<
+    string,
+    {
+      meta: Extract<AgentEvent, { type: "worker" }>;
+      entry: Entry;
+      view: ToolView;
+      log: string;
+      latest: string;
+      renderedAt: number;
+    }
   >();
   private loadingTimer: ReturnType<typeof setInterval> | null = null;
   private loadingLabel = "Kesting…";
@@ -166,7 +216,13 @@ export class KestUI {
     credentials: Credentials | null,
     selectedModel: string | null = null,
     keychain: Partial<Record<Provider, ProviderKeys>> = {},
+    private permission: Permission = "strict",
   ) {
+    // OpenTUI installs one selection listener per scroll box. Transcript rows
+    // can each have two independent detail panes (up to 180 retained rows).
+    // Keep a finite diagnostic limit appropriate for that legitimate fan-out.
+    if (renderer.getMaxListeners() > 0)
+      renderer.setMaxListeners(Math.max(renderer.getMaxListeners(), 512));
     this.credentials = credentials;
     this.selectedModel = selectedModel;
     this.keychain = keychain;
@@ -178,13 +234,19 @@ export class KestUI {
     }
     this.agent = this.makeAgent();
     this.session = newSession(cwd, this.agent.messages);
+    this.session.context = this.agent.context;
     this.style = SyntaxStyle.fromStyles(
       {
         default: { fg: theme.fg },
         "markup.heading": { fg: theme.accent, bold: true },
-        "markup.strong": { bold: true },
-        "markup.raw": { fg: theme.accent },
-        "markup.link": { fg: theme.accent, underline: true },
+        "markup.strong": { fg: theme.model, bold: true },
+        "markup.raw": { fg: theme.tool, bg: theme.inlineBg },
+        "markup.link": { fg: toolColors.input, underline: true },
+        "markup.link.label": { fg: toolColors.input, underline: true },
+        "markup.link.url": { fg: toolColors.input, underline: true },
+        "markup.list": { fg: theme.accent },
+        "markup.italic": { fg: theme.muted, italic: true },
+        "markup.quote": { fg: theme.muted, italic: true },
       },
       renderer.nativeScene,
     );
@@ -238,8 +300,9 @@ export class KestUI {
       placeholderColor: theme.muted,
       backgroundColor: theme.bg,
       focusedBackgroundColor: theme.bg,
-      textColor: theme.fg,
+      textColor: theme.user,
       cursorColor: theme.accent,
+      wrapMode: "word",
       keyBindings: [
         { name: "return", action: "submit" },
         { name: "return", shift: true, action: "newline" },
@@ -261,7 +324,7 @@ export class KestUI {
       width: 2,
       height: 1,
       flexShrink: 0,
-      fg: theme.accent,
+      fg: theme.user,
       selectable: false,
     });
     this.modelTag = new TextRenderable(renderer, {
@@ -269,10 +332,9 @@ export class KestUI {
       visible: false,
       height: 1,
       flexShrink: 0,
-      fg: theme.muted,
+      fg: theme.model,
       selectable: false,
     });
-    this.promptBox.add(this.modelTag);
     this.promptBox.add(this.promptMark);
     this.promptBox.add(this.composer);
     this.promptBox.add(this.secretText);
@@ -302,12 +364,23 @@ export class KestUI {
     root.add(this.activity);
     root.add(this.status);
     root.add(this.hints);
+    root.add(this.modelTag);
     root.add(this.promptBox);
     root.add(this.footer);
     renderer.root.add(root);
     renderer.keyInput.on("keypress", (key) => this.key(key));
     renderer.keyInput.on("paste", (event) => {
-      if (!this.connectStep) return;
+      if (!this.connectStep) {
+        const text = new TextDecoder().decode(event.bytes);
+        if (text.length < 1000 && text.split("\n").length < 10) return;
+        if (!this.composer.focused) return;
+        event.preventDefault();
+        event.stopPropagation();
+        const label = `[Pasted text #${++this.pasteSequence} · ${text.length} chars · ${text.split("\n").length} lines]`;
+        this.pastedTexts.set(label, text);
+        this.composer.insertText(label);
+        return;
+      }
       event.preventDefault();
       event.stopPropagation();
       this.secretValue += new TextDecoder()
@@ -315,7 +388,18 @@ export class KestUI {
         .replace(/[\r\n\x00-\x1f\x7f]/g, "");
       this.drawSecret();
     });
-    renderer.on("resize", () => this.inputChanged());
+    renderer.on("resize", () => {
+      this.inputChanged();
+      for (const block of this.scroll.getChildren()) {
+        for (const child of block.getChildren()) {
+          const nodes = [child, ...child.getChildren()];
+          for (const node of nodes) {
+            const tool = this.toolViews.get(node as TextRenderable);
+            if (tool?.expanded) this.renderTool(tool);
+          }
+        }
+      }
+    });
     renderer.on("destroy", () => {
       this.closed = true;
       this.active?.abort();
@@ -328,13 +412,21 @@ export class KestUI {
     this.composer.focus();
   }
 
-  private makeAgent(messages?: Session["messages"]) {
+  private makeAgent(
+    messages?: Session["messages"],
+    goal: string | null = null,
+    context?: ContextState,
+  ) {
     const agent = new Agent(
       this.cwd,
       (request, signal) => this.ask(request, signal),
       messages,
+      goal,
+      this.browser,
+      context,
     );
     agent.modelOverride = this.effectiveModel();
+    agent.research = this.session?.research ?? null;
     return agent;
   }
   private activeKeyCredential(provider: Provider): Credentials | null {
@@ -356,9 +448,7 @@ export class KestUI {
     return this.selectedModel;
   }
   private async selectModel(id: string) {
-    const option = MODELS.find(
-      (m) => m.id.toLowerCase() === id.toLowerCase(),
-    );
+    const option = MODELS.find((m) => m.id.toLowerCase() === id.toLowerCase());
     if (!option) {
       this.info(
         `Unknown model. Available:\n${MODELS.map((m) => m.id).join("\n")}`,
@@ -412,7 +502,7 @@ export class KestUI {
       ),
       usable.map((m) => m.id),
       (id) => {
-        void this.selectModel(id);
+        this.settled = this.selectModel(id);
       },
     );
   }
@@ -421,24 +511,26 @@ export class KestUI {
     this.display({ role: "info", text: `[k] kest  v${version}\n${line}` });
   }
   private ready() {
-    this.status.content = !this.credentials
-      ? "/connect to begin"
-      : this.credentials.provider === "baseten"
-        ? "Baseten ready"
-        : "Modal ready";
+    this.status.fg = theme.muted;
+    const goal = this.session.goal
+      ? `Goal: ${this.session.goal.length > 40 ? this.session.goal.slice(0, 40) + "…" : this.session.goal}`
+      : "";
+    const total = this.session.tasks.length;
+    const done = this.session.tasks.filter((t) => t.status === "done").length;
+    const tasks = total ? `Tasks ${done}/${total}` : "";
+    this.status.content = [goal, tasks].filter(Boolean).join(" · ");
     if (!this.credentials) {
-      this.modelTag.visible = false;
-      this.modelTag.content = "";
+      this.modelTag.visible = true;
+      this.modelTag.content = "○ /connect";
       return;
     }
-    const model =
-      this.effectiveModel() ??
-      endpointFor(this.credentials).model;
+    const model = this.effectiveModel() ?? endpointFor(this.credentials).model;
     const short = model.split("/").pop() ?? model;
     const key = this.keyNameFor(this.credentials.provider);
+    // This marks configured credentials, not a successful network health check.
     this.modelTag.content = key
-      ? `${this.credentials.provider}:${key} · ${short}  `
-      : `${this.credentials.provider} · ${short}  `;
+      ? `● ${this.credentials.provider}:${key} · ${short}  `
+      : `● ${this.credentials.provider} · ${short}  `;
     this.modelTag.visible = true;
   }
   private display(entry: Entry) {
@@ -452,7 +544,12 @@ export class KestUI {
         new TextRenderable(this.renderer, {
           content:
             entry.role === "you" ? ">" : entry.role === "kest" ? "•" : "TOOL",
-          fg: entry.role === "you" ? theme.accent : theme.muted,
+          fg:
+            entry.role === "you"
+              ? theme.user
+              : entry.role === "kest"
+                ? theme.accent
+                : theme.tool,
           width: entry.role === "tool" ? 5 : 2,
           height: 1,
           flexShrink: 0,
@@ -466,31 +563,27 @@ export class KestUI {
             syntaxStyle: this.style,
             fg: theme.fg,
             streaming: false,
+            conceal: true,
             internalBlockMode: "top-level",
             width: "100%",
             flexGrow: 1,
             flexShrink: 1,
             minWidth: 0,
-            // Plain code blocks avoid loading language parsers or downloading grammars.
-            renderNode: (token, context) =>
-              token.type === "code"
-                ? new TextRenderable(this.renderer, {
-                    content: clean(token.text),
-                    fg: theme.accent,
-                    wrapMode: "word",
-                    width: "100%",
-                    selectable: true,
-                    selectionBg: theme.accent,
-                    selectionFg: theme.bg,
-                  })
-                : (() => {
-                    const block = context.defaultRender();
-                    return block ? revealText(block) : undefined;
-                  })(),
+            renderNode: (token, context) => {
+              const styled = responseText(this.renderer, token);
+              if (styled) return styled;
+              const block = context.defaultRender();
+              return block ? revealText(block) : undefined;
+            },
           })
         : new TextRenderable(this.renderer, {
             content: clean(entry.text),
-            fg: entry.role === "tool" ? theme.muted : theme.fg,
+            fg:
+              entry.role === "you"
+                ? theme.user
+                : entry.role === "tool"
+                  ? theme.tool
+                  : theme.info,
             width: "100%",
             flexGrow: 1,
             flexShrink: 1,
@@ -500,9 +593,35 @@ export class KestUI {
             selectionBg: theme.accent,
             selectionFg: theme.bg,
           });
-    block.add(node);
+    const column =
+      entry.role === "tool"
+        ? new BoxRenderable(this.renderer, {
+            width: "100%",
+            flexGrow: 1,
+            flexShrink: 1,
+            minWidth: 0,
+            flexDirection: "column",
+          })
+        : null;
+    if (column) {
+      column.add(node);
+      block.add(column);
+    } else block.add(node);
     if (entry.role === "tool") {
-      const tool = { entry, node: node as TextRenderable, expanded: false };
+      const panels = new BoxRenderable(this.renderer, {
+        width: "100%",
+        flexDirection: "column",
+        gap: 1,
+        marginTop: 1,
+        visible: false,
+      });
+      column!.add(panels);
+      const tool: ToolView = {
+        entry,
+        node: node as TextRenderable,
+        expanded: false,
+        panels,
+      };
       this.toolViews.set(tool.node, tool);
       this.lastTool = tool;
       this.renderTool(tool);
@@ -532,18 +651,122 @@ export class KestUI {
       children[0]!.destroyRecursively();
     return node;
   }
-  private add(role: Entry["role"], text: string) {
+  private add(role: Entry["role"], text: string, detail?: Entry["detail"]) {
     this.markActivity();
-    const entry = { role, text };
+    const entry: Entry = { role, text, ...(detail ? { detail } : {}) };
     this.session.entries.push(entry);
     return { entry, node: this.display(entry) };
   }
-  private renderTool(tool: NonNullable<KestUI["lastTool"]>) {
-    tool.node.content = clean(
-      tool.expanded
-        ? `▾ ${tool.entry.text}`
-        : `▸ ${tool.entry.text.split("\n")[0] ?? ""}`,
-    );
+  private renderTool(tool: ToolView) {
+    const heading = clean(tool.entry.text.split("\n")[0] ?? "");
+    tool.node.fg = heading.startsWith("✕")
+      ? theme.error
+      : heading.startsWith("✓")
+        ? theme.accent
+        : theme.tool;
+    tool.node.content = `${tool.expanded ? "▾" : "▸"} ${heading}`;
+    tool.panels.visible = tool.expanded && !!tool.entry.detail;
+    if (!tool.expanded) {
+      if (tool.inputScroll?.focused || tool.outputScroll?.focused)
+        this.composer.focus();
+      // Hidden panes otherwise keep native buffers and selection subscriptions.
+      for (const child of tool.panels.getChildren()) child.destroyRecursively();
+      tool.inputScroll = tool.outputScroll = undefined;
+      tool.inputText = tool.outputText = undefined;
+      tool.lastInput = tool.lastOutput = undefined;
+      return;
+    }
+    const detail = tool.entry.detail;
+    if (!detail) {
+      tool.node.content = `▾ ${clean(tool.entry.text)}`;
+      return;
+    }
+    if (!tool.inputScroll) {
+      const addSection = (
+        label: string,
+        color: string,
+        backgroundColor: string,
+      ) => {
+        const box = new BoxRenderable(this.renderer, {
+          width: "100%",
+          flexDirection: "column",
+          backgroundColor,
+        });
+        box.add(
+          new TextRenderable(this.renderer, {
+            content: label,
+            fg: color,
+            height: 1,
+            paddingLeft: 1,
+            selectable: false,
+          }),
+        );
+        const scroll = new ScrollBoxRenderable(this.renderer, {
+          width: "100%",
+          height: 6,
+          flexShrink: 0,
+          backgroundColor,
+          scrollY: true,
+          scrollX: false,
+          contentOptions: { paddingLeft: 1, paddingRight: 1 },
+          scrollbarOptions: {
+            trackOptions: { backgroundColor, foregroundColor: color },
+          },
+        });
+        const text = new TextRenderable(this.renderer, {
+          content: "",
+          width: "100%",
+          wrapMode: "word",
+          selectable: true,
+          fg: toolColors.text,
+          selectionBg: theme.accent,
+          selectionFg: theme.bg,
+        });
+        scroll.add(text);
+        box.add(scroll);
+        tool.panels.add(box);
+        return { scroll, text };
+      };
+      const input = addSection(
+        `↓ Input · ${detail.language}  · scroll to inspect`,
+        toolColors.input,
+        toolColors.inputBg,
+      );
+      const output = addSection(
+        "↑ Output  · scroll to inspect",
+        toolColors.output,
+        toolColors.outputBg,
+      );
+      tool.inputScroll = input.scroll;
+      tool.inputText = input.text;
+      tool.outputScroll = output.scroll;
+      tool.outputText = output.text;
+    }
+    if (tool.lastInput !== detail.input) {
+      tool.inputText!.content = toolPanel(detail.input, detail.language);
+      tool.lastInput = detail.input;
+    }
+    if (tool.lastOutput !== detail.output) {
+      tool.outputText!.content = toolPanel(detail.output, "text");
+      tool.lastOutput = detail.output;
+    }
+    const columns = Math.max(8, this.renderer.width - 12);
+    const height = (text: string) =>
+      Math.min(
+        Math.max(2, Math.min(6, Math.floor(this.renderer.height / 5))),
+        Math.max(
+          1,
+          text
+            .split("\n")
+            .reduce(
+              (n, line) =>
+                n + Math.max(1, Math.ceil(Bun.stringWidth(line) / columns)),
+              0,
+            ),
+        ),
+      );
+    tool.inputScroll!.height = height(detail.input);
+    tool.outputScroll!.height = height(detail.output);
   }
   private info(text: string) {
     this.add("info", text);
@@ -635,6 +858,33 @@ export class KestUI {
       else this.close();
       return;
     }
+    const panel = this.lastTool?.inputScroll?.focused
+      ? this.lastTool.inputScroll
+      : this.lastTool?.outputScroll?.focused
+        ? this.lastTool.outputScroll
+        : null;
+    if (panel && !this.approval && !this.connectStep && !this.listPicker) {
+      if (key.name === "escape") {
+        key.preventDefault();
+        key.stopPropagation();
+        this.composer.focus();
+        return;
+      }
+      if (
+        ["up", "down", "pageup", "pagedown", "home", "end"].includes(key.name)
+      ) {
+        key.preventDefault();
+        key.stopPropagation();
+        if (key.name === "home") panel.scrollTo(0);
+        else if (key.name === "end") panel.scrollTo(panel.scrollHeight);
+        else
+          panel.scrollBy(
+            (key.name === "up" || key.name === "pageup" ? -1 : 1) *
+              (key.name.startsWith("page") ? Math.max(1, panel.height - 1) : 1),
+          );
+        return;
+      }
+    }
     if (key.name === "escape") {
       key.preventDefault();
       if (this.listPicker) {
@@ -702,6 +952,20 @@ export class KestUI {
       )
         this.secretValue += key.sequence;
       this.drawSecret();
+      return;
+    }
+    if (
+      key.ctrl &&
+      key.shift &&
+      (key.name === "i" || key.name === "o") &&
+      this.lastTool
+    ) {
+      key.preventDefault();
+      const tool = this.lastTool;
+      tool.expanded = true;
+      this.renderTool(tool);
+      if (key.name === "i") tool.inputScroll?.focus();
+      else tool.outputScroll?.focus();
       return;
     }
     if (key.ctrl && key.name === "o" && this.lastTool) {
@@ -774,7 +1038,9 @@ export class KestUI {
   }
 
   private drawSecret() {
-    const keySuffix = this.connectKeyName ? ` · key ${this.connectKeyName}` : "";
+    const keySuffix = this.connectKeyName
+      ? ` · key ${this.connectKeyName}`
+      : "";
     const label =
       this.connectStep === "id"
         ? `Modal token ID${keySuffix}`
@@ -832,11 +1098,19 @@ export class KestUI {
         height: 1,
       }),
     );
-    const rows = labels.map((label) => {
+    const rows = labels.map((label, index) => {
       const row = new TextRenderable(this.renderer, {
         content: label,
         fg: theme.fg,
         height: 1,
+        selectable: false,
+        onMouseDown: (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          if (this.listPicker?.box !== box) return;
+          this.listPicker.selected = index;
+          this.confirmListPicker();
+        },
       });
       box.add(row);
       return row;
@@ -851,6 +1125,7 @@ export class KestUI {
     if (!picker) return;
     picker.rows.forEach((row, i) => {
       row.content = `${i === picker.selected ? "> " : "  "}${picker.labels[i]!}`;
+      row.fg = i === picker.selected ? theme.user : theme.fg;
     });
   }
   private confirmListPicker() {
@@ -872,9 +1147,7 @@ export class KestUI {
     const labels = (["baseten", "modal"] as Provider[]).map((provider) => {
       const count = this.keychain[provider]?.keys.length ?? 0;
       const state =
-        count > 0
-          ? `  (${count} key${count === 1 ? "" : "s"}, connected)`
-          : "";
+        count > 0 ? `  (${count} key${count === 1 ? "" : "s"}, connected)` : "";
       return `${this.describeProvider(provider)}${state}`;
     });
     this.openListPicker(
@@ -885,6 +1158,7 @@ export class KestUI {
     );
   }
   private storeForNames(): {
+    permission: Permission;
     version: 1;
     activeProvider: null;
     providers: Partial<Record<Provider, ProviderKeys>>;
@@ -892,6 +1166,7 @@ export class KestUI {
   } {
     return {
       version: 1,
+      permission: this.permission,
       activeProvider: null,
       providers: this.keychain,
       model: null,
@@ -916,7 +1191,10 @@ export class KestUI {
       values,
       (value) => {
         if (value === "__add__") {
-          this.startKeyEntry(provider, nextKeyName(this.storeForNames(), provider));
+          this.startKeyEntry(
+            provider,
+            nextKeyName(this.storeForNames(), provider),
+          );
           return;
         }
         const name = value.slice("key:".length);
@@ -974,7 +1252,9 @@ export class KestUI {
     this.promptMark.visible = false;
     this.promptBox.paddingY = 0;
     this.promptBox.height = 4;
-    const replacing = this.keychain[provider]?.keys.some((k) => k.name === name);
+    const replacing = this.keychain[provider]?.keys.some(
+      (k) => k.name === name,
+    );
     this.status.content = replacing
       ? `Replacing ${provider} key ${name}. Enter to save, Esc to keep the old one.`
       : `New ${provider} key ${name}. Saved locally in plaintext. Enter to save.`;
@@ -995,7 +1275,10 @@ export class KestUI {
     }
     const name =
       this.connectKeyName ??
-      nextKeyName(this.storeForNames(), this.connectStep === "key" ? "baseten" : "modal");
+      nextKeyName(
+        this.storeForNames(),
+        this.connectStep === "key" ? "baseten" : "modal",
+      );
     const next: Credentials =
       this.connectStep === "key"
         ? { provider: "baseten", apiKey: value }
@@ -1012,7 +1295,8 @@ export class KestUI {
       const savedName = await saveKeyCredential(next.provider, name, next);
       const slot = this.keychain[next.provider] ?? { keys: [], active: null };
       const existing = slot.keys.findIndex((k) => k.name === savedName);
-      if (existing >= 0) slot.keys[existing] = { name: savedName, credential: next };
+      if (existing >= 0)
+        slot.keys[existing] = { name: savedName, credential: next };
       else {
         slot.keys.push({ name: savedName, credential: next });
         slot.active = savedName;
@@ -1043,6 +1327,7 @@ export class KestUI {
   }
   private ask(request: Approval, signal: AbortSignal): Promise<boolean> {
     if (signal.aborted || this.closed) return Promise.resolve(false);
+    if (autoApprove(this.permission, request)) return Promise.resolve(true);
     this.stopLoading();
     this.info(`${request.title}\n${brief(request.preview, 32_000)}`);
     this.composer.blur();
@@ -1073,15 +1358,93 @@ export class KestUI {
     });
   }
 
+  private workerEvent(event: Extract<AgentEvent, { type: "worker" }>) {
+    let worker = this.workerViews.get(event.workerId);
+    if (!worker) {
+      const added = this.add(
+        "tool",
+        `→ ${event.role} ${event.workerId.slice(0, 8)} · ${event.model}`,
+        {
+          input: `Task: ${event.task}\nRole: ${event.role}\nModel: ${event.model}\nParent: ${event.parentId}\nDepth: ${event.depth}\n\nClick this row for live activity. /agents ${event.workerId.slice(0, 8)} inspects its transcript.`,
+          output: "Starting…",
+          language: "text",
+        },
+      );
+      worker = {
+        meta: event,
+        entry: added.entry,
+        view: this.toolViews.get(added.node as TextRenderable)!,
+        log: "",
+        latest: "Starting",
+        renderedAt: 0,
+      };
+      this.workerViews.set(event.workerId, worker);
+    }
+    worker.meta = event;
+    const activity = event.event;
+    if (activity?.type === "tool") {
+      worker.latest = `${activity.name} · ${activity.state}`;
+      worker.log += `\n[${activity.state}] ${activity.name}${activity.durationMs === undefined ? "" : ` · ${activity.durationMs.toFixed(1)} ms`}\n${activity.state === "running" ? activity.args : (activity.output ?? "")}\n`;
+      if (activity.state !== "running" && activity.durationMs !== undefined)
+        (this.session.toolStats ??= []).push({
+          name: activity.name,
+          durationMs: activity.durationMs,
+          error: activity.state === "error",
+        });
+    } else if (activity?.type === "status") {
+      worker.latest = activity.text;
+      worker.log += `\n[status] ${activity.text}\n`;
+    } else if (activity?.type === "text") worker.log += activity.delta;
+    else if (activity?.type === "response") worker.log += "\n[assistant]\n";
+    if (event.state !== "running") {
+      worker.latest = event.state === "done" ? "Completed" : "Failed";
+      worker.log += `\n[${worker.latest}]\n${event.output ?? ""}\n`;
+    }
+    // Bound the live preview; complete messages are saved with the worker.
+    if (worker.log.length > 24000)
+      worker.log =
+        "[Earlier activity omitted from live preview; see saved transcript]\n" +
+        worker.log.slice(-23000);
+    worker.entry.text = `${event.state === "done" ? "✓" : event.state === "error" ? "✕" : "→"} ${"  ".repeat(Math.max(0, event.depth - 1))}${event.role} ${event.workerId.slice(0, 8)} · ${event.model} · ${brief(worker.latest, 70)}`;
+    worker.entry.detail!.output = worker.log || "Starting…";
+    if (
+      activity?.type === "text" &&
+      performance.now() - worker.renderedAt < 100
+    )
+      return;
+    worker.renderedAt = performance.now();
+    if (!worker.view.node.isDestroyed) this.renderTool(worker.view);
+  }
+
   private event(event: AgentEvent) {
     if (this.closed) return;
+    if (event.type === "worker") {
+      this.workerEvent(event);
+      return;
+    }
+    if (event.type === "checkpoint") {
+      this.add(
+        "info",
+        `Research checkpoint ${event.cycle} · continuing\n${brief(event.text, 6000)}`,
+      );
+      this.pendingText = "";
+      return;
+    }
     if (event.type === "usage") {
       // Best-effort: a failed usage write must never interrupt a reply.
-      void recordUsage(event.model, event.input, event.output).catch(() => {});
+      void recordUsage(event.model, event.input, event.output).catch(() => {
+        if (!this.closed) this.info("Could not save token usage to disk.");
+      });
       return;
     }
     if (event.type === "status") {
-      this.showLoading(event.text === "Working" ? `${workVerb}…` : this.idleVerb);
+      this.showLoading(
+        event.text === "Working"
+          ? `${workVerb}…`
+          : event.text === "Thinking"
+            ? this.idleVerb
+            : event.text,
+      );
       return;
     }
     if (event.type === "response") {
@@ -1098,19 +1461,71 @@ export class KestUI {
       let summary = "";
       try {
         const args = JSON.parse(event.args);
-        summary = args.path ?? args.command ?? args.query ?? "";
+        summary =
+          event.name === "shell" || event.name === "browser"
+            ? typeof args.title === "string" && args.title.trim()
+              ? args.title.trim().split(/[\r\n]/)[0]
+              : event.name === "browser"
+                ? `Browser: ${args.action ?? "open"}`
+                : "Run Bun script"
+            : (args.path ?? args.command ?? args.query ?? args.task ?? "");
       } catch {
         /* Show name only. */
       }
-      const tool = this.add("tool", `→ ${event.name}  ${brief(summary, 180)}`);
+      const heading =
+        event.name === "shell" || event.name === "browser"
+          ? `→ ${brief(summary, 100)}`
+          : `→ ${event.name}  ${brief(summary, 180)}`;
+      let input = event.args;
+      if (event.name === "shell") {
+        try {
+          input = JSON.parse(event.args).command ?? event.args;
+        } catch {
+          /* Keep raw input. */
+        }
+      }
+      const tool = this.add(
+        "tool",
+        event.name === "shell"
+          ? `${heading}\n\nInput\n${brief(input, 12_000)}\n\nOutput\nRunning…`
+          : heading,
+        {
+          input,
+          output: "Running…",
+          language: event.name === "shell" ? "TypeScript" : "JSON",
+        },
+      );
       this.toolNode = tool.node as TextRenderable;
       this.toolEntry = tool.entry;
       const verb = toolVerbs[event.name];
       this.showLoading(verb ? `${event.name} · ${verb}…` : event.name);
     } else {
+      if (event.durationMs !== undefined) {
+        (this.session.toolStats ??= []).push({
+          name: event.name,
+          durationMs: event.durationMs,
+          error: event.state === "error",
+        });
+      }
       if (this.toolNode && this.toolEntry) {
-        const title = `${event.state === "error" ? "✕" : "✓"} ${this.toolEntry.text.slice(2)}`;
-        this.toolEntry.text = `${title}\n\n${brief(event.output ?? "", 12_000)}`;
+        const title = `${event.state === "error" ? "✕" : "✓"} ${this.toolEntry.text.split("\n")[0]!.slice(2)}${event.durationMs === undefined ? "" : ` · ${event.durationMs.toFixed(2)} ms`}`;
+        let input = event.args;
+        if (event.name === "shell") {
+          try {
+            input = JSON.parse(event.args).command ?? event.args;
+          } catch {
+            /* Keep raw input. */
+          }
+        }
+        this.toolEntry.text =
+          event.name === "shell"
+            ? `${title}\n\nInput\n${brief(input, 12_000)}\n\nOutput\n${brief(event.output ?? "", 12_000)}`
+            : `${title}\n\n${brief(event.output ?? "", 12_000)}`;
+        this.toolEntry.detail = {
+          input,
+          output: event.output ?? "",
+          language: event.name === "shell" ? "TypeScript" : "JSON",
+        };
         const tool = this.toolViews.get(this.toolNode);
         if (tool) this.renderTool(tool);
       }
@@ -1123,6 +1538,7 @@ export class KestUI {
     this.pendingText = "";
   }
   private showLoading(label: string) {
+    this.status.fg = theme.tool;
     this.loadingLabel = label;
     if (this.loadingTimer) return;
     const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -1143,8 +1559,15 @@ export class KestUI {
   private async submit() {
     if (this.active || this.connectStep || this.listPicker || this.closed)
       return;
-    const text = this.composer.plainText.trim();
+    const draft = this.composer.plainText;
+    const text = draft
+      .replace(
+        /\[Pasted text #\d+ · \d+ chars · \d+ lines\]/g,
+        (label) => this.pastedTexts.get(label) ?? label,
+      )
+      .trim();
     if (!text) return;
+    this.pastedTexts.clear();
     this.composer.setText("");
     this.hints.visible = false;
     this.inputHistory.push(text);
@@ -1191,6 +1614,9 @@ export class KestUI {
       if (this.active) {
         this.active = null;
         this.session.messages = this.agent.messages;
+        this.session.context = this.agent.context;
+        this.session.research = this.agent.research ?? undefined;
+        this.session.tasks = this.agent.tasks;
         try {
           await saveSession(this.session);
         } catch {
@@ -1205,8 +1631,263 @@ export class KestUI {
   private async command(text: string) {
     const [command, ...rest] = text.split(" ");
     const value = rest.join(" ").trim();
+    if (command === "/agents") {
+      const records = this.session.research
+        ? await listWorkerRecords(this.cwd, this.session.research.id)
+        : [];
+      if (!value) {
+        const workers = new Map(
+          records.map((record) => [
+            record.id,
+            `${record.id.slice(0, 8)} · ${record.role} · ${record.model} · ${record.state}\n  ${brief(record.task, 140)}`,
+          ]),
+        );
+        for (const [id, worker] of this.workerViews)
+          workers.set(
+            id,
+            `${id.slice(0, 8)} · ${worker.meta.role} · ${worker.meta.model} · ${worker.latest}\n  ${brief(worker.meta.task, 140)}`,
+          );
+        this.info(
+          workers.size
+            ? [...workers.values()].join("\n") +
+                "\n\n/agents <id> · inspect a worker without leaving the director session. Click its tool row for live output."
+            : "No researcher activity in this session yet.",
+        );
+      } else {
+        const ids = [
+          ...new Set([
+            ...records.map((record) => record.id),
+            ...this.workerViews.keys(),
+          ]),
+        ].filter((id) => id.startsWith(value));
+        if (ids.length !== 1) {
+          this.info("Worker not found or ID is ambiguous. Use /agents.");
+          return;
+        }
+        const record = records.find((record) => record.id === ids[0]);
+        const live = this.workerViews.get(ids[0]!);
+        this.info(
+          record
+            ? brief(workerTranscript(record), 60000)
+            : `${live!.entry.detail!.input}\n\n${live!.log}`,
+        );
+      }
+      return;
+    }
     if (command === "/exit" || command === "/quit") {
       this.close();
+      return;
+    }
+    if (command === "/research") {
+      const [action, ...parts] = value.split(/\s+/);
+      if (!value) {
+        this.info(formatCompany(this.session.research));
+        return;
+      }
+      if (action === "models") {
+        this.info(JSON.stringify(await listResearchModels(), null, 2));
+        return;
+      }
+      if (action === "prepare") {
+        const objective = parts.join(" ").trim();
+        if (!objective) {
+          this.info("/research prepare <objective>");
+          return;
+        }
+        this.session.research = newCompany(objective);
+        this.session.goal = objective;
+        this.agent = this.makeAgent(
+          this.agent.messages,
+          objective,
+          this.agent.context,
+        );
+        this.session.messages = this.agent.messages;
+        this.session.tasks = [];
+        this.agent.research = this.session.research;
+        await saveSession(this.session);
+        this.info(
+          formatCompany(this.session.research) +
+            "\nPrepared without model calls. Set /research budget if needed, then /research resume.",
+        );
+        return;
+      }
+      if (action === "model") {
+        const [alias, provider, model] = parts;
+        if (!alias || !provider || !model || parts.length !== 3)
+          throw new Error("/research model <alias> <modal|baseten> <model-id>");
+        await saveResearchModel(alias, provider, model);
+        this.info(
+          `Research model ${alias} saved. Workers can select this profile.`,
+        );
+        return;
+      }
+      if (action === "endpoint") {
+        const [alias, url, model, envName] = parts;
+        if (!alias || !url || !model || !envName || parts.length !== 4)
+          throw new Error(
+            "/research endpoint <alias> <https-base-url> <model-id> <API_KEY_ENV_NAME>",
+          );
+        await saveResearchEndpoint(alias, url, model, envName);
+        this.info(
+          `Research endpoint ${alias} saved. Set ${envName} in the environment before starting Kest; do not enter the API key in chat.`,
+        );
+        return;
+      }
+      if (action === "off") {
+        this.agent.research = null;
+        this.session.research = undefined;
+        await saveSession(this.session);
+        this.info(
+          "Research continuation is off. Existing artifacts are preserved.",
+        );
+        return;
+      }
+      if (
+        action === "tokens" ||
+        (action === "budget" && parts[0] === "tokens")
+      ) {
+        const tokenArgs = action === "budget" ? parts.slice(1) : parts;
+        const study = this.session.research;
+        if (!study || tokenArgs.length !== 1)
+          throw new Error(
+            "Prepare a research objective first, then /research tokens <total, e.g. 500k, 10m, 500b|off>.",
+          );
+        await recoverCompany(this.cwd, study);
+        const limit =
+          tokenArgs[0] === "off" ? null : parseTokenBudget(tokenArgs[0]!);
+        const consumed =
+          study.inputTokens + study.outputTokens + study.estimatedTokens;
+        if (limit !== null && limit < consumed)
+          throw new Error(
+            `Token total cannot be below ${consumed.toLocaleString("en-US")} already consumed or estimated.`,
+          );
+        study.maxTokens = limit;
+        study.status = "paused";
+        this.agent.research = study;
+        await saveSession(this.session);
+        this.info(formatCompany(study));
+        return;
+      }
+      if (action === "budget") {
+        const minutes = Number(parts[0]),
+          requests = Number(parts[1]);
+        const agents =
+          parts[2] === undefined
+            ? this.session.research?.maxAgents
+            : Number(parts[2]);
+        if (
+          !this.session.research ||
+          (parts.length !== 2 && parts.length !== 3) ||
+          !Number.isInteger(minutes) ||
+          minutes < 1 ||
+          minutes > 1440 ||
+          !Number.isInteger(requests) ||
+          requests < 1 ||
+          requests > 10000 ||
+          requests < this.session.research.requests ||
+          !Number.isInteger(agents) ||
+          agents! < 1 ||
+          agents! > 64 ||
+          agents! < this.session.research.agents ||
+          minutes * 60000 < this.session.research.elapsedMs
+        )
+          throw new Error(
+            "Start a research objective first, then /research budget <total-minutes 1–1440> <total-requests 1–10000> [total-agents 1–64]. Totals cannot be below usage already consumed.",
+          );
+        this.session.research.maxMs = minutes * 60000;
+        this.session.research.maxRequests = requests;
+        this.session.research.maxAgents = agents!;
+        this.session.research.status = "paused";
+        await saveSession(this.session);
+        this.info(formatCompany(this.session.research));
+        return;
+      }
+      if (!this.credentials) {
+        this.info("Connect a model provider first with /connect.");
+        return;
+      }
+      if (action === "resume") {
+        if (!this.session.research) {
+          this.info("No research objective yet. /research <objective>");
+          return;
+        }
+      } else {
+        const objective = action === "start" ? parts.join(" ") : value;
+        if (!objective.trim()) {
+          this.info("/research <objective>");
+          return;
+        }
+        this.session.research = newCompany(objective);
+        this.session.tasks = [];
+      }
+      const study = this.session.research!;
+      this.session.goal = study.objective;
+      this.agent = this.makeAgent(
+        this.agent.messages,
+        this.session.goal,
+        this.agent.context,
+      );
+      this.session.messages = this.agent.messages;
+      this.agent.research = study;
+      this.agent.tasks = this.session.tasks.map((t) => ({ ...t }));
+      await saveSession(this.session);
+      this.info(
+        `Research company started with ${study.maxRequests - study.requests} requests remaining. Experiments still follow /permission; Esc cancels. Logs: research/${study.id}/`,
+      );
+      this.composer.setText(
+        `Research objective: ${study.objective}\nUse the company workflow, preserve reproducible evidence and negative findings, and reserve time for independent review. Persist source, raw logs, results and the paper in research/${study.id}/. Continue within the shared request/time budget; never fabricate results or claim unsupported novelty.`,
+      );
+      await this.submit();
+      return;
+    }
+    if (command === "/browser") {
+      try {
+        const request = browserRequest(
+          value === "tabs"
+            ? { action: "tabs" }
+            : value === "close"
+              ? { action: "close" }
+              : {
+                  action: "open",
+                  ...(value && value !== "open" ? { url: value } : {}),
+                },
+        );
+        const start = performance.now();
+        const output = await this.browser.execute(
+          request,
+          new AbortController().signal,
+        );
+        this.add(
+          "tool",
+          `✓ Browser: ${request.action} · ${(performance.now() - start).toFixed(2)} ms`,
+          { input: JSON.stringify(request, null, 2), output, language: "JSON" },
+        );
+        this.info(
+          request.action === "open"
+            ? "Browser opened. Kest can control it across messages. /browser tabs · /browser close"
+            : output,
+        );
+      } catch (error) {
+        this.info(
+          error instanceof Error ? error.message : "Browser action failed.",
+        );
+      }
+      return;
+    }
+    if (command === "/permission") {
+      if (value) {
+        try {
+          const next = parsePermission(value.toLowerCase());
+          await savePermission(next);
+          this.permission = next;
+        } catch {
+          this.info(
+            `Could not save permission. Use /permission all|minimal|strict; check config directory access.\n${permissionHelp}`,
+          );
+          return;
+        }
+      }
+      this.info(`Permission: ${this.permission}\n${permissionHelp}`);
       return;
     }
     if (command === "/connect") {
@@ -1224,6 +1905,69 @@ export class KestUI {
       );
       return;
     }
+    if (command === "/goal") {
+      if (!value) {
+        this.info(
+          this.session.goal
+            ? `Goal: ${this.session.goal}`
+            : "No goal set. Usage: /goal <objective> · /goal clear",
+        );
+        return;
+      }
+      if (value.toLowerCase() === "clear") {
+        this.session.goal = null;
+        const priorTasks = this.agent.tasks;
+        this.agent = this.makeAgent(
+          this.agent.messages,
+          null,
+          this.agent.context,
+        );
+        this.agent.tasks = priorTasks;
+        this.session.messages = this.agent.messages;
+        try {
+          await saveSession(this.session);
+        } catch {
+          this.info("Could not save session to disk.");
+        }
+        this.info("Goal cleared.");
+        this.ready();
+        return;
+      }
+      this.session.goal = value;
+      const priorTasks = this.agent.tasks;
+      this.agent = this.makeAgent(
+        this.agent.messages,
+        value,
+        this.agent.context,
+      );
+      this.agent.tasks = priorTasks;
+      this.session.messages = this.agent.messages;
+      try {
+        await saveSession(this.session);
+      } catch {
+        this.info("Goal set, but the session could not be saved to disk.");
+        this.ready();
+        return;
+      }
+      this.info(`Goal set: ${value}`);
+      this.ready();
+      if (!this.credentials) {
+        this.info(
+          "Connect first: /connect baseten or /connect modal, then send any message to begin.",
+        );
+        return;
+      }
+      if (this.session.title === "New session") {
+        this.session.title = value.replace(/\s+/g, " ").slice(0, 70);
+      }
+      // A goal alone does nothing until the agent gets a turn: kick off the
+      // first one so planning starts immediately.
+      this.composer.setText(
+        "Begin. Start with set_plan, then work through the plan.",
+      );
+      await this.submit();
+      return;
+    }
     if (command === "/model") {
       if (!value) {
         this.openModelPicker();
@@ -1233,7 +1977,109 @@ export class KestUI {
       return;
     }
     if (command === "/usage" || command === "/tokens") {
-      this.info(formatUsage(await loadUsage()));
+      await flushUsage();
+      const sessions = await allSessions(this.session);
+      this.info(
+        formatUsage(await loadUsage(), {
+          sessions: sessions.length,
+          workspaces: new Set(sessions.map((s) => s.cwd)).size,
+        }),
+      );
+      return;
+    }
+    if (command === "/stats" || command === "/stat") {
+      const sessions = await allSessions(this.session);
+      this.info(
+        formatToolStats(
+          this.agent.toolDefs(),
+          sessions.flatMap((s) =>
+            (s.toolStats ?? []).filter(
+              (t) =>
+                t &&
+                typeof t.name === "string" &&
+                Number.isFinite(t.durationMs) &&
+                t.durationMs >= 0,
+            ),
+          ),
+          {
+            sessions: sessions.length,
+            workspaces: new Set(sessions.map((s) => s.cwd)).size,
+          },
+        ),
+      );
+      return;
+    }
+    if (command === "/context") {
+      if (!value)
+        this.info(
+          formatContext(
+            this.agent.messages,
+            this.agent.toolDefs(),
+            this.agent.context,
+          ),
+        );
+      else if (value === "summary")
+        this.info(
+          this.agent.context.summary ||
+            "No summary yet. Recent conversation is still in active context.",
+        );
+      else if (value === "messages")
+        this.info(describeMessages(this.agent.messages));
+      else if (value === "archive")
+        this.info(describeMessages(this.agent.context.archive));
+      else if (/^(show|archived) [1-9]\d*$/.test(value)) {
+        const [kind, index] = value.split(" ");
+        const messages =
+          kind === "show" ? this.agent.messages : this.agent.context.archive;
+        const message = messages[Number(index) - 1];
+        this.info(
+          message
+            ? brief(JSON.stringify(message, null, 2), 16000)
+            : "Message not found. Use /context messages or /context archive.",
+        );
+      } else if (value === "compact") {
+        if (!this.credentials) {
+          this.info(
+            "Connect a provider first. Summarizing uses that model and counts in /usage.",
+          );
+          return;
+        }
+        this.active = new AbortController();
+        try {
+          const changed = await this.agent.compactContext(
+            this.credentials,
+            this.active.signal,
+            (event) => this.event(event),
+            true,
+          );
+          this.session.messages = this.agent.messages;
+          this.session.context = this.agent.context;
+          await saveSession(this.session);
+          this.info(
+            changed
+              ? "Context summarized; original messages archived locally. /context summary"
+              : "No completed history is eligible for compaction yet.",
+          );
+        } catch (error) {
+          if (!this.closed)
+            this.info(
+              error instanceof Error
+                ? error.message
+                : "Context summary failed; original history retained.",
+            );
+        } finally {
+          this.active = null;
+          this.stopLoading();
+          if (!this.closed) this.ready();
+        }
+      } else
+        this.info(
+          "/context · /context summary · /context messages · /context archive · /context show <number> · /context archived <number> · /context compact",
+        );
+      return;
+    }
+    if (command === "/tasks") {
+      this.info(formatTasks(this.session.tasks));
       return;
     }
     if (command === "/provider") {
@@ -1252,20 +2098,22 @@ export class KestUI {
     }
     if (command === "/help") {
       this.info(
-        "/connect [modal|baseten]  credentials (provider switcher)\n/provider  current provider and model\n/model  list models and select one\n/usage  token usage by model (this machine)\n/new  fresh session\n/sessions  saved workspace sessions\n/resume <id>  reopen a session\n/tools  available tools\n/status  model and connection\n/system <instructions>  customize agent (new session)\n/exit  quit\n\nEnter send · Shift+Enter or Ctrl+Enter newline · Tab completes commands\nUp/Down prompt history · Mouse wheel or PgUp/PgDn scroll\nEdits and shell commands require y/n approval.",
+        "Research: /agents [id] inspects live/saved workers · /research tokens <total|off> · /research budget <total-minutes> <total-requests> [total-agents] · /research resume",
+      );
+      this.info(
+        "/connect [modal|baseten]  credentials (provider switcher)\n/provider  current provider and model\n/model  list models and select one\n/research  research company, model profiles and budgets\n/context  context size, memory, archives and compaction\n/usage  all-time token usage and session count (this machine)\n/stats or /stat  all-time tool counts and timings across sessions (ms)\n/permission [all|minimal|strict]  approval level\n/browser [url|tabs|close]  control the visible browser\n/goal <text>|clear  session objective\n/tasks  plan checklist and progress\n/new  fresh session\n/sessions  saved workspace sessions\n/resume <id>  reopen a session\n/tools  available tools\n/status  model and connection\n/system <instructions>  customize agent (new session)\n/exit  quit\n\nEnter send · Shift+Enter or Ctrl+Enter newline · Tab completes commands\nUp/Down prompt history · Mouse wheel or PgUp/PgDn scroll\nEdits and shell commands require y/n approval.",
       );
       return;
     }
     if (command === "/tools") {
       this.info(
-        "read_file · list_files · search  → automatic\nedit_file · write_file · shell  → approval required\n\nFiles stay inside this workspace. Credential files are excluded.\nApproved shell commands can access your system; they are not sandboxed.",
+        `${this.agent.toolDefs().length} tools available\n` +
+          "read_file · list_files · search  → automatic\nedit_file · write_file · shell  → approval required\nset_plan · update_task  → agent plans and tracks its own tasks\nspawn_subagent · research_team  → bounded hierarchical researchers\nlist_models · research_status · research_review  → profiles, budgets and independent review\nbrowser  → visible browser with page and tab control\n\nFiles stay inside this workspace. Credential files are excluded.\nApproved shell commands can access your system; they are not sandboxed.",
       );
       return;
     }
     if (command === "/status") {
-      const endpoint = this.credentials
-        ? endpointFor(this.credentials)
-        : null;
+      const endpoint = this.credentials ? endpointFor(this.credentials) : null;
       const selected = this.effectiveModel();
       const model = selected ?? endpoint?.model;
       const log = await loadUsage();
@@ -1277,7 +2125,7 @@ export class KestUI {
         { input: 0, output: 0 },
       );
       this.info(
-        `${this.credentials ? `${this.credentials.provider === "baseten" ? "Baseten" : "Modal"} credentials loaded; access checked on request` : "Not connected"}\n${model ? `Model: ${model}${selected ? " (selected)" : " (default)"}` : `baseten  ${BASETEN_MODEL}\nmodal  ${MODAL_MODEL}`}\n${endpoint ? `${endpoint.baseURL}\n` : ""}${this.credentials ? `${this.describeKeys(this.credentials.provider)}\n` : ""}Usage (this machine): in ${totals.input.toLocaleString("en-US")} · out ${totals.output.toLocaleString("en-US")} · /usage for details\nWorkspace: ${this.cwd}\nCredentials: ${configPath}\nSession: ${this.session.id}`,
+        `${this.credentials ? `${this.credentials.provider === "baseten" ? "Baseten" : "Modal"} credentials loaded; access checked on request` : "Not connected"}\n${model ? `Model: ${model}${selected ? " (selected)" : " (default)"}` : `baseten  ${BASETEN_MODEL}\nmodal  ${MODAL_MODEL}`}\n${endpoint ? `${endpoint.baseURL}\n` : ""}${this.credentials ? `${this.describeKeys(this.credentials.provider)}\n` : ""}Usage (this machine): in ${totals.input.toLocaleString("en-US")} · out ${totals.output.toLocaleString("en-US")} · /usage for details\nGoal: ${this.session.goal ?? "none — /goal <objective>"}\nWorkspace: ${this.cwd}\nCredentials: ${configPath}\nSession: ${this.session.id}`,
       );
       return;
     }
@@ -1304,7 +2152,13 @@ export class KestUI {
         return;
       }
       this.session = matches[0]!;
-      this.agent = this.makeAgent(this.session.messages);
+      this.agent = this.makeAgent(
+        this.session.messages,
+        this.session.goal,
+        this.session.context,
+      );
+      this.session.context = this.agent.context;
+      this.agent.tasks = this.session.tasks.map((t) => ({ ...t }));
       this.clearView();
       for (const entry of this.session.entries.slice(-180)) this.display(entry);
       this.ready();
@@ -1327,6 +2181,8 @@ export class KestUI {
           : undefined,
       );
       this.session = newSession(this.cwd, this.agent.messages);
+      this.agent.research = null;
+      this.session.context = this.agent.context;
       this.clearView();
       this.welcome();
       this.ready();
@@ -1335,6 +2191,7 @@ export class KestUI {
     this.info("Unknown command. /help");
   }
   private clearView() {
+    this.workerViews.clear();
     this.unseenActivity = false;
     this.activity.visible = false;
     this.scroll.stickyScroll = true;
@@ -1347,20 +2204,23 @@ export class KestUI {
     this.approval?.finish(false);
     this.secretValue = this.tokenId = "";
     this.stopLoading();
+    void this.browser.close();
     this.renderer.destroy();
   }
 }
 
-export async function start(cwd: string) {
+export async function start(cwd: string, permission: Permission = "strict") {
   let credentials: Credentials | null = null;
   let selectedModel: string | null = null;
   let keychain: Partial<Record<Provider, ProviderKeys>> = {};
   try {
     const store = await loadStore();
+    permission ??= store.permission;
     selectedModel = store.model;
     keychain = store.providers;
     credentials =
-      (store.activeProvider && activeKey(store, store.activeProvider)?.credential) ||
+      (store.activeProvider &&
+        activeKey(store, store.activeProvider)?.credential) ||
       null;
   } catch {
     /* /connect replaces corrupt config. */
@@ -1378,6 +2238,7 @@ export async function start(cwd: string) {
     credentials,
     selectedModel,
     keychain,
+    permission ?? "strict",
   );
   const exit = () => ui.close();
   process.once("SIGTERM", exit);
@@ -1387,5 +2248,6 @@ export async function start(cwd: string) {
   } finally {
     process.off("SIGTERM", exit);
     ui.close();
+    await ui["browser"].close();
   }
 }

@@ -1,3 +1,4 @@
+import { parsePermission, type Permission } from "./permissions";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { mkdir, chmod } from "node:fs/promises";
@@ -91,6 +92,7 @@ export function endpointFor(credentials: Credentials): {
 export type NamedKey = { name: string; credential: Credentials };
 export type ProviderKeys = { keys: NamedKey[]; active: string | null };
 export type ConnectionStore = {
+  permission: Permission;
   version: 1;
   activeProvider: Provider | null;
   providers: Partial<Record<Provider, ProviderKeys>>;
@@ -98,7 +100,13 @@ export type ConnectionStore = {
 };
 
 function emptyStore(): ConnectionStore {
-  return { version: 1, activeProvider: null, providers: {}, model: null };
+  return {
+    version: 1,
+    activeProvider: null,
+    providers: {},
+    model: null,
+    permission: "strict",
+  };
 }
 
 function tryCredentials(value: unknown): Credentials | null {
@@ -116,11 +124,20 @@ function normalizeStore(raw: unknown): ConnectionStore {
   const store = emptyStore();
   if (!raw || typeof raw !== "object") return store;
   const config = raw as Record<string, unknown>;
+  try {
+    store.permission = parsePermission(String(config.permission));
+  } catch {
+    /* Default to strict for legacy/invalid settings. */
+  }
   if (config.providers && typeof config.providers === "object") {
     const providers = config.providers as Record<string, unknown>;
     for (const provider of ["modal", "baseten"] as Provider[]) {
       const entry = providers[provider];
-      if (entry && typeof entry === "object" && Array.isArray((entry as { keys?: unknown }).keys)) {
+      if (
+        entry &&
+        typeof entry === "object" &&
+        Array.isArray((entry as { keys?: unknown }).keys)
+      ) {
         const slot = entry as { keys: unknown[]; active?: unknown };
         const keys: NamedKey[] = [];
         for (const key of slot.keys) {
@@ -136,7 +153,9 @@ function normalizeStore(raw: unknown): ConnectionStore {
           const active = typeof slot.active === "string" ? slot.active : null;
           store.providers[provider] = {
             keys,
-            active: keys.some((k) => k.name === active) ? active : keys[0]!.name,
+            active: keys.some((k) => k.name === active)
+              ? active
+              : keys[0]!.name,
           };
         }
         continue;
@@ -158,14 +177,15 @@ function normalizeStore(raw: unknown): ConnectionStore {
     };
   }
   const model = config.model;
-  if (typeof model === "string" && model.trim() && modelProvider(model.trim())) {
+  if (
+    typeof model === "string" &&
+    model.trim() &&
+    modelProvider(model.trim())
+  ) {
     store.model = model.trim();
   }
   const active = config.activeProvider;
-  if (
-    (active === "modal" || active === "baseten") &&
-    store.providers[active]
-  ) {
+  if ((active === "modal" || active === "baseten") && store.providers[active]) {
     store.activeProvider = active;
   }
   return store;
@@ -175,6 +195,7 @@ function serializeStore(store: ConnectionStore): Record<string, unknown> {
   const value: Record<string, unknown> = {
     version: 1,
     providers: store.providers,
+    permission: store.permission,
   };
   if (store.activeProvider) value.activeProvider = store.activeProvider;
   if (store.model) value.model = store.model;
@@ -224,10 +245,7 @@ export function activeKey(
   return slot.keys.find((k) => k.name === slot.active) ?? slot.keys[0]!;
 }
 
-export function keyNames(
-  store: ConnectionStore,
-  provider: Provider,
-): string[] {
+export function keyNames(store: ConnectionStore, provider: Provider): string[] {
   return store.providers[provider]?.keys.map((k) => k.name) ?? [];
 }
 
@@ -277,7 +295,8 @@ async function readConfigFile(): Promise<Record<string, unknown>> {
     const file = Bun.file(activeConfigPath());
     if (await file.exists()) {
       const value: unknown = await file.json();
-      if (value && typeof value === "object") return value as Record<string, unknown>;
+      if (value && typeof value === "object")
+        return value as Record<string, unknown>;
     }
   } catch {
     /* Missing or corrupt config starts fresh. */
@@ -314,7 +333,8 @@ export async function saveKeyCredential(
   const slot = store.providers[provider] ?? { keys: [], active: null };
   const keyName = name ?? nextKeyName(store, provider);
   const existing = slot.keys.findIndex((k) => k.name === keyName);
-  if (existing >= 0) slot.keys[existing] = { name: keyName, credential: checked };
+  if (existing >= 0)
+    slot.keys[existing] = { name: keyName, credential: checked };
   else {
     slot.keys.push({ name: keyName, credential: checked });
     // A brand-new key becomes the active one.
@@ -329,7 +349,9 @@ export async function saveKeyCredential(
 export async function saveActiveProvider(provider: Provider) {
   const store = normalizeStore(await readConfigFile());
   if (!activeKey(store, provider)) {
-    throw new Error(`No saved ${provider} credentials. Run /connect ${provider} first.`);
+    throw new Error(
+      `No saved ${provider} credentials. Run /connect ${provider} first.`,
+    );
   }
   store.activeProvider = provider;
   await writeConfigFile(serializeStore(store));
@@ -356,5 +378,11 @@ export async function saveSelectedModel(model: string | null) {
   }
   const store = normalizeStore(await readConfigFile());
   store.model = model;
+  await writeConfigFile(serializeStore(store));
+}
+
+export async function savePermission(permission: Permission) {
+  const store = normalizeStore(await readConfigFile());
+  store.permission = parsePermission(permission);
   await writeConfigFile(serializeStore(store));
 }
