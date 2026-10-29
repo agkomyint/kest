@@ -195,7 +195,12 @@ export class KestUI {
   private approval: { finish: (value: boolean) => void } | null = null;
   private pauseDecisionPending = false;
   private budgetSyncedAt = 0;
-  private teamGroup: { entry: Entry; node: TextRenderable } | null = null;
+  private teamGroup: {
+    entry: Entry;
+    node: TextRenderable;
+    view: ToolView;
+    children: ToolView[];
+  } | null = null;
   private toolGroup: {
     entry: Entry;
     node: TextRenderable;
@@ -780,7 +785,10 @@ export class KestUI {
           this.lastTool = tool;
           this.renderTool(tool);
           // Group heads also show/hide their individual tool rows.
-          if (this.groupHeads.has(tool)) this.applyGroupVisibility();
+          if (this.groupHeads.has(tool)) {
+            this.applyGroupVisibility();
+            this.applyTeamVisibility();
+          }
         }
         pressed = false;
       };
@@ -1540,22 +1548,42 @@ export class KestUI {
   private workerEvent(event: Extract<AgentEvent, { type: "worker" }>) {
     let worker = this.workerViews.get(event.workerId);
     if (!worker) {
-      // All workers share ONE team row — never a row per researcher.
+      // Hybrid team UI: one head per team; each worker keeps its OWN row
+      // (old UI) hidden under the head until the head is expanded.
+      // Every worker row individually expands to its own live activity log.
       if (!this.teamGroup) {
-        const added = this.add("tool", "→ Research team", {
-          input: "Research team — expand for per-worker activity. /agents <id> inspects a transcript.",
+        const head = this.add("tool", "→ Research team", {
+          input:
+            "Research team — expand the head for per-worker rows, then expand a worker for its live tool activity. /agents <id> inspects a saved transcript.",
           output: "Starting…",
           language: "text",
         });
+        const view = this.toolViews.get(head.node as TextRenderable)!;
+        this.groupHeads.add(view);
         this.teamGroup = {
-          entry: added.entry,
-          node: added.node as TextRenderable,
+          entry: head.entry,
+          node: head.node as TextRenderable,
+          view,
+          children: [],
         };
       }
+      const team = this.teamGroup;
+      const added = this.add(
+        "tool",
+        `→ ${event.role} ${event.workerId.slice(0, 8)} · ${event.model}`,
+        {
+          input: `Task: ${event.task}\nRole: ${event.role}\nModel: ${event.model}\nParent: ${event.parentId}\nDepth: ${event.depth}\n\nClick this row for live activity. /agents ${event.workerId.slice(0, 8)} inspects its transcript.`,
+          output: "Starting…",
+          language: "text",
+        },
+      );
+      const childView = this.toolViews.get(added.node as TextRenderable)!;
+      team.children.push(childView);
+      if (childView.block) childView.block.visible = team.view.expanded;
       worker = {
         meta: event,
-        entry: this.teamGroup.entry,
-        view: this.toolViews.get(this.teamGroup.node)!,
+        entry: added.entry,
+        view: childView,
         log: "",
         latest: "Starting",
         renderedAt: 0,
@@ -1587,13 +1615,25 @@ export class KestUI {
       worker.log =
         "[Earlier activity omitted from live preview; see saved transcript]\n" +
         worker.log.slice(-23000);
+    // Own row, old style: status + role/id/model + latest tool, expandable
+    // to this worker's live log (with per-tool timings).
+    worker.entry.text = `${event.state === "done" ? "✓" : event.state === "error" ? "✕" : "→"} ${event.role} ${event.workerId.slice(0, 8)} · ${truncateMiddle(event.model, 36)} · ${brief(worker.latest, 70)}`;
+    worker.entry.detail!.output = worker.log || "Starting…";
     if (
       activity?.type === "text" &&
       performance.now() - worker.renderedAt < 100
     )
       return;
     worker.renderedAt = performance.now();
+    if (!worker.view.node.isDestroyed) this.renderTool(worker.view);
     this.renderTeamGroup();
+  }
+
+  private applyTeamVisibility() {
+    const team = this.teamGroup;
+    if (!team) return;
+    for (const child of team.children)
+      if (child.block) child.block.visible = team.view.expanded;
   }
 
   private renderTeamGroup() {
@@ -1608,18 +1648,16 @@ export class KestUI {
       running > 0
         ? `→ Research team · ${workers.length} ${roles} · ${running} running${done ? ` · ${done} done` : ""}${failed ? ` · ${failed} failed` : ""}`
         : `${failed ? "✕" : "✓"} Research team · ${done}/${workers.length} done${failed ? ` · ${failed} failed` : ""}`;
-    team.entry.detail!.output = brief(
-      workers
-        .map(
-          (w) =>
-            `— ${w.meta.state === "done" ? "✓" : w.meta.state === "error" ? "✕" : "→"} ${w.meta.role} ${w.meta.workerId.slice(0, 8)} · ${truncateMiddle(w.meta.model, 36)} · ${w.latest}\n${w.log || "Starting…"}`,
-        )
-        .join("\n"),
-      24_000,
-    );
-    const view = this.toolViews.get(team.node);
-    if (view && failed > 0 && running === 0) view.expanded = true;
-    if (view && !view.node.isDestroyed) this.renderTool(view);
+    // Head detail stays a thin index; per-tool logs live on worker rows.
+    team.entry.detail!.output = workers
+      .map(
+        (w) =>
+          `${w.meta.state === "done" ? "✓" : w.meta.state === "error" ? "✕" : "→"} ${w.meta.role} ${w.meta.workerId.slice(0, 8)} · ${truncateMiddle(w.meta.model, 36)} · ${w.latest}`,
+      )
+      .join("\n");
+    if (failed > 0 && running === 0) team.view.expanded = true;
+    if (!team.view.node.isDestroyed) this.renderTool(team.view);
+    this.applyTeamVisibility();
   }
 
   private event(event: AgentEvent) {
@@ -2486,6 +2524,10 @@ export class KestUI {
   }
   private clearView() {
     this.workerViews.clear();
+    this.teamGroup = null;
+    this.toolGroup = null;
+    this.groupHeads.clear();
+    this.pendingTools = [];
     this.unseenActivity = false;
     this.activity.visible = false;
     this.scroll.stickyScroll = true;

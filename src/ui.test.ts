@@ -749,10 +749,20 @@ test("parallel worker rows stream separate activity without overwriting the dire
         durationMs: 12,
       },
     });
-    // One shared team row: both workers live in the same expanded log.
-    expect(first.entry).toBe(second.entry);
+    // Hybrid team UI: head row + one row per worker, like normal tools.
+    expect(first.entry).not.toBe(second.entry);
     expect(first.entry.detail!.output).toContain("Measured evidence");
-    expect(first.entry.text).toContain("Research team");
+    expect(second.entry.detail!.output).not.toContain("Measured evidence");
+    const head = ui["teamGroup"]!.view;
+    expect(head.entry.text).toContain("Research team");
+    await testUI.renderOnce();
+    // Collapsed by default: head visible, worker rows hidden.
+    expect(testUI.captureCharFrame()).toContain("Research team");
+    expect(testUI.captureCharFrame()).not.toContain("aaaaaaaa");
+    await testUI.mockMouse.click(head.node.x + 2, head.node.y);
+    await testUI.flush();
+    // Expanded head: worker rows appear, each with its own activity.
+    expect(testUI.captureCharFrame()).toContain("aaaaaaaa");
     expect(ui["toolEntry"]).toBe(director);
     expect(director!.text).toContain("research_team");
     ui["event"]({
@@ -760,15 +770,17 @@ test("parallel worker rows stream separate activity without overwriting the dire
       state: "error",
       output: "Provider unavailable",
     });
-    expect(second.entry.text).toContain("1 failed");
+    expect(second.entry.text).toContain("✕");
     expect(second.entry.detail!.output).toContain("Failed");
+    expect(head.entry.text).toContain("1 failed");
     ui["event"]({
       ...worker("aaaaaaaa-1111", "model-a"),
       state: "done",
       output: "Evidence checked",
     });
-    expect(first.entry.text).toContain("1/2 done");
+    expect(first.entry.text).toContain("✓");
     expect(first.entry.detail!.output).toContain("Completed");
+    expect(head.entry.text).toContain("1/2 done");
     ui["event"]({
       type: "tool",
       name: "research_team",
