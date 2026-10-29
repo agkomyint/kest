@@ -1071,6 +1071,35 @@ test("new activity preserves reading position and clicking its indicator jumps t
   }
 });
 
+test("sequential tools across model rounds collapse into one group row", async () => {
+  const testUI = await createTestRenderer({ width: 120, height: 30 });
+  const ui = new KestUI(testUI.renderer, process.cwd(), null);
+  try {
+    for (const name of ["set_plan", "update_task", "shell"]) {
+      ui["event"]({ type: "response" });
+      ui["event"]({ type: "tool", name, args: "{}", state: "running" });
+      ui["event"]({
+        type: "tool",
+        name,
+        args: "{}",
+        state: "done",
+        durationMs: 5,
+        output: "ok",
+      });
+    }
+    const toolEntries = ui["session"].entries.filter(
+      (e) => e.role === "tool",
+    );
+    expect(toolEntries).toHaveLength(1);
+    expect(toolEntries[0]!.text).toContain("Tools (3)");
+    await testUI.renderOnce();
+    expect(testUI.captureCharFrame()).toContain("Tools (3)");
+  } finally {
+    ui.close();
+    await testUI.dispose();
+  }
+});
+
 test("tool timing appears on rows and /stats aggregates all saved sessions", async () => {
   const dir = await mkdtemp(join(tmpdir(), "kest-global-stats-ui-"));
   const previousConfig = process.env.KEST_CONFIG_DIR;

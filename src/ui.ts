@@ -1644,7 +1644,9 @@ export class KestUI {
       return;
     }
     if (event.type === "response") {
-      this.toolGroup = null;
+      // Emitted every model round — do NOT close the tool group here,
+      // or sequential tools each become their own row again. The group
+      // closes on flushResponse/checkpoint/turn end instead.
       this.pendingText = "";
       return;
     }
