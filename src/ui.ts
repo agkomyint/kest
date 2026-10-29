@@ -1619,8 +1619,9 @@ export class KestUI {
       return;
     }
     if (event.type === "budget") {
-      // Live runtime sync: timer/tokens/requests tick from here, plus the
-      // local clock in liveHud() between model calls.
+      // Live runtime sync for real research runs only. A budget event
+      // must never create research state in a plain session.
+      if (!this.agent.research && !this.session.research) return;
       this.session.research = event.state;
       this.agent.research = event.state;
       this.budgetSyncedAt = performance.now();

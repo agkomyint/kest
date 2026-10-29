@@ -86,6 +86,22 @@ async function fixture(
   }
 }
 
+test("a plain turn emits no budget event and does not become research", async () => {
+  await fixture(
+    [{ delta: { content: "Hello!" }, finish: "stop" }],
+    async (agent, events) => {
+      await agent.run(
+        "hi",
+        credentials,
+        AbortSignal.timeout(5000),
+        (event) => events.push(event),
+      );
+      expect(events.some((e) => e.type === "budget")).toBe(false);
+      expect(agent.research).toBeNull();
+    },
+  );
+});
+
 const credentials = { provider: "baseten" as const, apiKey: "unused" };
 const empty = { delta: {}, finish: "stop" };
 

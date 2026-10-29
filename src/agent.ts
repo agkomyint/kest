@@ -385,6 +385,8 @@ export class Agent {
   depth = 0;
   researchRole = "director";
   private company: CompanyRuntime | null = null;
+  companyWorker = false;
+  private activeCompanyRun = false;
   private toolDurations = new Map<string, number[]>();
   allowBackground = true;
   onBackground: ((event: AgentEvent) => void) | null = null;
@@ -577,7 +579,7 @@ export class Agent {
       .replace(/\s*<kest-research-company>[\s\S]*?<\/kest-research-company>/g, "")
       .replace(/\s*<kest-bun-automation>[\s\S]*?<\/kest-bun-automation>/g, "");
     const content =
-      this.research || this.company
+      this.research || this.companyWorker || this.activeCompanyRun
         ? `${base}\n${researchCompanyPrompt}\n${bunContext}${goal}`
         : `${base}\n${bunContext}${goal}`;
     if (content !== first.content)
@@ -616,8 +618,11 @@ export class Agent {
       ...planToolDefinitions,
       spawnToolDefinition,
       ...(this.allowBackground ? backgroundToolDefinitions : []),
-      // Research-company tools only in research mode (or inside a company run).
-      ...(this.research || this.company ? companyToolDefinitions : []),
+      // Research-company tools only in opted-in research mode. this.company
+      // also exists for transient plain-turn runtimes — that must not count.
+      ...(this.research || this.activeCompanyRun
+        ? companyToolDefinitions
+        : []),
     ];
   }
 
@@ -681,6 +686,7 @@ export class Agent {
 
   useCompany(company: CompanyRuntime, depth: number) {
     this.company = company;
+    this.companyWorker = true;
     this.depth = depth;
   }
   async executeCompanyTool(
@@ -949,6 +955,9 @@ export class Agent {
     emit: (event: AgentEvent) => void,
     maxRounds?: number,
   ) {
+    // Captured before run() installs its transient runtime: only a real
+    // research session or an explicit company assignment counts.
+    this.activeCompanyRun = Boolean(this.research || this.companyWorker);
     this.refreshResearchPrompt();
     if (!this.company && this.research)
       await recoverCompany(this.cwd, this.research);
@@ -1149,7 +1158,10 @@ export class Agent {
             input: Math.max(0, usage.prompt_tokens),
             output: Math.max(0, usage.completion_tokens),
           });
-          if (this.company)
+          // Only real research runs report budget. A transient runtime
+          // created for a plain turn must never flip the UI into
+          // research mode via a budget event.
+          if (this.company && this.research)
             emit({ type: "budget", state: this.company.snapshot() });
         }
         if (finish === "length" && toolCalls.length)
