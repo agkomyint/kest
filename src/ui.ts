@@ -74,6 +74,12 @@ import {
 } from "./research-models";
 import { formatContext, describeMessages, type ContextState } from "./context";
 import {
+  slashCommands as commands,
+  completeCandidates,
+  completionHasChildren,
+  longestCommonPrefix,
+} from "./complete";
+import {
   budgetHud,
   formatDuration,
   shouldOpenBudgetDecision,
@@ -118,29 +124,6 @@ function revealText(node: Renderable): Renderable {
   for (const child of node.getChildren()) revealText(child);
   return node;
 }
-const commands = [
-  "/connect",
-  "/provider",
-  "/model",
-  "/context",
-  "/research",
-  "/agents",
-  "/usage",
-  "/stats",
-  "/stat",
-  "/permission",
-  "/browser",
-  "/goal",
-  "/tasks",
-  "/new",
-  "/sessions",
-  "/resume",
-  "/tools",
-  "/status",
-  "/system",
-  "/help",
-  "/exit",
-];
 
 type ToolView = {
   entry: Entry;
@@ -226,6 +209,11 @@ export class KestUI {
   } | null = null;
   private groupHeads = new Set<ToolView>();
   private pendingTools: ToolView[] = [];
+  private tabCycle: {
+    prefix: string;
+    candidates: string[];
+    index: number;
+  } | null = null;
   private closed = false;
   settled: Promise<void> = Promise.resolve();
   private inputHistory: string[] = [];
@@ -978,16 +966,14 @@ export class KestUI {
         0,
       );
     this.promptBox.height = Math.min(9, Math.max(5, rows + 2));
-    const matches =
-      value.startsWith("/") && !value.includes(" ")
-        ? commands.filter((c) => c.startsWith(value))
-        : [];
+    const matches = completeCandidates(value);
     this.hints.visible =
       (matches.length > 0 || value.length > 80) &&
       !this.connectStep &&
       !this.active;
     this.hints.content = matches.length
-      ? matches.slice(0, 6).join("   ")
+      ? matches.slice(0, 6).join("   ") +
+        (matches.length > 6 ? `   +${matches.length - 6} more` : "")
       : `${value.length} chars · ${value.split("\n").length} lines`;
   }
 
@@ -1137,12 +1123,48 @@ export class KestUI {
       return;
     }
     if (key.name === "tab" && this.composer.plainText.startsWith("/")) {
-      const match = commands.find((c) => c.startsWith(this.composer.plainText));
-      if (match) {
-        key.preventDefault();
-        this.composer.setText(match);
-        this.composer.cursorOffset = match.length;
+      key.preventDefault();
+      const current = this.composer.plainText.split("\n")[0]!;
+      let candidates: string[];
+      let index: number;
+      let prefix: string;
+      if (
+        this.tabCycle &&
+        this.tabCycle.candidates.includes(current) &&
+        completeCandidates(this.tabCycle.prefix).join("\n") ===
+          this.tabCycle.candidates.join("\n")
+      ) {
+        candidates = this.tabCycle.candidates;
+        index = this.tabCycle.index + 1;
+        prefix = this.tabCycle.prefix;
+      } else {
+        candidates = completeCandidates(current);
+        if (!candidates.length) {
+          this.tabCycle = null;
+          return;
+        }
+        if (candidates.length > 1) {
+          const common = longestCommonPrefix(candidates);
+          if (common.length > current.length) {
+            this.composer.setText(common);
+            this.composer.cursorOffset = common.length;
+            this.tabCycle = null;
+            this.inputChanged();
+            return;
+          }
+        }
+        index = 0;
+        prefix = current;
       }
+      const next = candidates[index % candidates.length]!;
+      const completed =
+        candidates.length === 1 && completionHasChildren(next)
+          ? `${next} `
+          : next;
+      this.composer.setText(completed);
+      this.composer.cursorOffset = completed.length;
+      this.tabCycle = { prefix, candidates, index: index % candidates.length };
+      this.inputChanged();
     }
     if (
       (key.name === "up" || key.name === "down") &&
@@ -1831,6 +1853,7 @@ export class KestUI {
   private async submit() {
     if (this.active || this.connectStep || this.listPicker || this.closed)
       return;
+    this.tabCycle = null;
     const draft = this.composer.plainText;
     const text = draft
       .replace(
@@ -2372,7 +2395,7 @@ export class KestUI {
         "Research: /agents [id] inspects live/saved workers · /research tokens <total|off> · /research budget <total-minutes> <total-requests> [total-agents] · /research resume",
       );
       this.info(
-        "/connect [modal|baseten]  credentials (provider switcher)\n/provider  current provider and model\n/model  list models and select one\n/research  research company, model profiles and budgets\n/context  context size, memory, archives and compaction\n/usage  all-time token usage and session count (this machine)\n/stats or /stat  all-time tool counts and timings across sessions (ms)\n/permission [all|minimal|strict]  approval level\n/browser [url|tabs|close]  control the visible browser\n/goal <text>|clear  session objective\n/tasks  plan checklist and progress\n/new  fresh session\n/sessions  saved workspace sessions\n/resume <id>  reopen a session\n/tools  available tools\n/status  model and connection\n/system <instructions>  customize agent (new session)\n/exit  quit\n\nEnter send · Shift+Enter or Ctrl+Enter newline · Tab completes commands\nUp/Down prompt history · Mouse wheel or PgUp/PgDn scroll\nEdits and shell commands require y/n approval.",
+        "/connect [modal|baseten]  credentials (provider switcher)\n/provider  current provider and model\n/model  list models and select one\n/research  research company, model profiles and budgets\n/context  context size, memory, archives and compaction\n/usage  all-time token usage and session count (this machine)\n/stats or /stat  all-time tool counts and timings across sessions (ms)\n/permission [all|minimal|strict]  approval level\n/browser [url|tabs|close]  control the visible browser\n/goal <text>|clear  session objective\n/tasks  plan checklist and progress\n/new  fresh session\n/sessions  saved workspace sessions\n/resume <id>  reopen a session\n/tools  available tools\n/status  model and connection\n/system <instructions>  customize agent (new session)\n/exit  quit\n\nEnter send · Shift+Enter or Ctrl+Enter newline · Tab completes commands + subcommands (/res → /research, /research b → /research budget)\nUp/Down prompt history · Mouse wheel or PgUp/PgDn scroll\nEdits and shell commands require y/n approval.",
       );
       return;
     }

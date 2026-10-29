@@ -6,6 +6,48 @@ import { createTestRenderer } from "@opentui/core/testing";
 import { KestUI } from "./ui";
 import { MODAL_MODEL } from "./config";
 
+test("tab completes slash commands and child subcommands with cycling", async () => {
+  const testUI = await createTestRenderer({ width: 130, height: 40 });
+  const ui = new KestUI(testUI.renderer, process.cwd(), null);
+  const tab = () =>
+    ui["key"]({
+      name: "tab",
+      preventDefault: () => {},
+      stopPropagation: () => {},
+    } as never);
+  try {
+    ui.composer.setText("/res");
+    tab();
+    expect(ui.composer.plainText).toBe("/research");
+    tab();
+    expect(ui.composer.plainText).toBe("/resume");
+    tab();
+    expect(ui.composer.plainText).toBe("/research");
+
+    ui.composer.setText("/research ");
+    ui["inputChanged"]();
+    await testUI.renderOnce();
+    const hintFrame = testUI.captureCharFrame();
+    expect(hintFrame).toContain("/research budget");
+    expect(hintFrame).toContain("/research tokens");
+
+    ui.composer.setText("/research b");
+    tab();
+    expect(ui.composer.plainText).toBe("/research budget ");
+
+    ui.composer.setText("/research m");
+    tab();
+    expect(ui.composer.plainText).toBe("/research model");
+    tab();
+    expect(ui.composer.plainText).toBe("/research models");
+    tab();
+    expect(ui.composer.plainText).toBe("/research model");
+  } finally {
+    ui.close();
+    await testUI.dispose();
+  }
+});
+
 test("research commands configure models and budgets without starting paid work", async () => {
   const directory = await mkdtemp(join(tmpdir(), "kest-company-ui-"));
   const previous = process.env.KEST_CONFIG_DIR;
