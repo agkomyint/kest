@@ -21,23 +21,87 @@ function activeConfigDir() {
 function activeConfigPath() {
   return join(activeConfigDir(), "config.json");
 }
-export type Provider = "modal" | "baseten";
+export const NEBIUS_BASE_URL =
+  "https://api.tokenfactory.us-north1.nebius.com/v1/";
+export const NEBIUS_MODEL = "nvidia/Nemotron-3.5-Super-VL";
+export type Provider = "modal" | "baseten" | "nebius";
 export type Credentials =
   | { provider: "modal"; tokenId: string; tokenSecret: string }
-  | { provider: "baseten"; apiKey: string };
-export type ModelOption = { provider: Provider; id: string; label: string };
+  | { provider: "baseten"; apiKey: string }
+  | { provider: "nebius"; apiKey: string };
+export type ModelPricing = {
+  currency: "USD";
+  inputUsdPerMillionTokens: number;
+  outputUsdPerMillionTokens: number;
+  source: string;
+  checkedAt: string;
+  note: string;
+};
+export type ModelOption = {
+  provider: Provider;
+  id: string;
+  label: string;
+  pricing: ModelPricing;
+};
 export const MODELS: ModelOption[] = [
+  {
+    provider: "nebius",
+    id: NEBIUS_MODEL,
+    label: "Nemotron 3.5 Super VL (Token Factory)",
+    pricing: {
+      currency: "USD",
+      inputUsdPerMillionTokens: 0.3,
+      outputUsdPerMillionTokens: 0.9,
+      source:
+        "https://nebius.com/blog/posts/three-new-open-weight-models-from-us-companies-give-builders-more-choice",
+      checkedAt: "2026-10-30",
+      note: "Published Token Factory rates; account-specific terms may differ.",
+    },
+  },
   {
     provider: "baseten",
     id: BASETEN_MODEL,
     label: "Muse Spark Open (hackathon)",
+    pricing: {
+      currency: "USD",
+      inputUsdPerMillionTokens: 1.25,
+      outputUsdPerMillionTokens: 4.25,
+      source: "https://www.baseten.co/pricing/",
+      checkedAt: "2026-10-30",
+      note: "Public Muse Spark Open reference rates; billing for the hackathon model ID is unverified.",
+    },
   },
   {
     provider: "modal",
     id: MODAL_MODEL,
     label: "Muse Spark Open (proxy)",
+    pricing: {
+      currency: "USD",
+      inputUsdPerMillionTokens: 1.25,
+      outputUsdPerMillionTokens: 4.25,
+      source: "https://modal.com/library/meta/muse-spark-open",
+      checkedAt: "2026-10-30",
+      note: "Public Shared Endpoint reference rates; billing for this custom Modal proxy is unverified.",
+    },
   },
 ];
+
+// Match both provider and exact model ID. Custom research models must never
+// inherit the price of their provider's default model.
+export function modelPricing(
+  provider: string,
+  model: string,
+): ModelPricing | null {
+  return (
+    MODELS.find((m) => m.provider === provider && m.id === model)?.pricing ??
+    null
+  );
+}
+
+export function formatModelPricing(pricing: ModelPricing | null): string {
+  if (!pricing) return "Input/output pricing unknown";
+  return `Input $${pricing.inputUsdPerMillionTokens.toFixed(2)} · output $${pricing.outputUsdPerMillionTokens.toFixed(2)} / 1M tokens (USD)`;
+}
 
 export function modelProvider(id: string): Provider | null {
   return MODELS.find((m) => m.id === id)?.provider ?? null;
@@ -49,11 +113,13 @@ export function parseCredentials(value: unknown): Credentials {
   const c = value as Record<string, unknown>;
   const provider =
     c.provider ?? (typeof c.apiKey === "string" ? "baseten" : "modal");
-  if (provider === "baseten") {
+  if (provider === "baseten" || provider === "nebius") {
     if (typeof c.apiKey !== "string" || !c.apiKey.trim()) {
-      throw new Error("A Baseten API key is required.");
+      throw new Error(
+        `A ${provider === "nebius" ? "Nebius" : "Baseten"} API key is required.`,
+      );
     }
-    return { provider: "baseten", apiKey: c.apiKey.trim() };
+    return { provider, apiKey: c.apiKey.trim() };
   }
   if (
     typeof c.tokenId !== "string" ||
@@ -75,6 +141,13 @@ export function endpointFor(credentials: Credentials): {
   apiKey: string;
   model: string;
 } {
+  if (credentials.provider === "nebius") {
+    return {
+      baseURL: NEBIUS_BASE_URL,
+      apiKey: credentials.apiKey,
+      model: NEBIUS_MODEL,
+    };
+  }
   if (credentials.provider === "baseten") {
     return {
       baseURL: BASETEN_BASE_URL,
@@ -131,7 +204,7 @@ function normalizeStore(raw: unknown): ConnectionStore {
   }
   if (config.providers && typeof config.providers === "object") {
     const providers = config.providers as Record<string, unknown>;
-    for (const provider of ["modal", "baseten"] as Provider[]) {
+    for (const provider of ["modal", "baseten", "nebius"] as Provider[]) {
       const entry = providers[provider];
       if (
         entry &&
@@ -185,7 +258,10 @@ function normalizeStore(raw: unknown): ConnectionStore {
     store.model = model.trim();
   }
   const active = config.activeProvider;
-  if ((active === "modal" || active === "baseten") && store.providers[active]) {
+  if (
+    (active === "modal" || active === "baseten" || active === "nebius") &&
+    store.providers[active]
+  ) {
     store.activeProvider = active;
   }
   return store;
@@ -222,6 +298,11 @@ function credentialsFromEnv(): Partial<Record<Provider, Credentials>> {
     });
     if (baseten) seeds.baseten = baseten;
   }
+  const nebius = tryCredentials({
+    provider: "nebius",
+    apiKey: process.env.NEBIUS_API_KEY,
+  });
+  if (nebius) seeds.nebius = nebius;
   return seeds;
 }
 
@@ -233,6 +314,7 @@ function resolveActive(store: ConnectionStore): Provider | null {
   if (preferred && store.providers[preferred]) return preferred;
   if (store.providers.baseten) return "baseten";
   if (store.providers.modal) return "modal";
+  if (store.providers.nebius) return "nebius";
   return null;
 }
 
@@ -276,6 +358,9 @@ export async function loadStore(): Promise<ConnectionStore> {
   }
   if (!store.providers.baseten && seeds.baseten) {
     store.providers.baseten = seedKey("env", seeds.baseten);
+  }
+  if (!store.providers.nebius && seeds.nebius) {
+    store.providers.nebius = seedKey("env", seeds.nebius);
   }
   store.activeProvider = resolveActive(store);
   return store;

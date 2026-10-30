@@ -5,12 +5,53 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   formatUsage,
+  formatModelCosts,
   loadUsage,
   recordUsage,
   usageFile,
   flushUsage,
 } from "./usage";
-import { BASETEN_MODEL } from "./config";
+import { BASETEN_MODEL, NEBIUS_MODEL } from "./config";
+
+test("model costs combine input and output tokens across priced models", () => {
+  const text = formatModelCosts({
+    [BASETEN_MODEL]: {
+      input: 1_000_000,
+      output: 2_000_000,
+      requests: 2,
+      updatedAt: "",
+    },
+    [NEBIUS_MODEL]: {
+      input: 500_000,
+      output: 250_000,
+      requests: 1,
+      updatedAt: "",
+    },
+  });
+  expect(text).toContain("Input $0.30 · output $0.90 / 1M tokens (USD)");
+  expect(text).toContain("total $9.7500 USD");
+  expect(text).toContain("total $0.3750 USD");
+  expect(text).toContain(
+    "ESTIMATED TOTAL $10.1250 USD · input $1.4000 · output $8.7250",
+  );
+  expect(text).toContain("hackathon model ID is unverified");
+});
+
+test("unknown pricing produces a partial subtotal, never a free cost", () => {
+  const text = formatModelCosts({
+    [NEBIUS_MODEL]: { input: 1_000_000, output: 0, requests: 1, updatedAt: "" },
+    custom: { input: 100, output: 200, requests: 1, updatedAt: "" },
+  });
+  expect(text).toContain("PRICED SUBTOTAL $0.3000 USD");
+  expect(text).toContain("Total cost unknown: 1 model(s), 300 tokens");
+  expect(text).not.toContain("ESTIMATED TOTAL");
+  expect(formatModelCosts({})).toContain("No token usage recorded");
+  expect(
+    formatModelCosts({
+      [NEBIUS_MODEL]: { input: 1, output: 0, requests: 1, updatedAt: "" },
+    }),
+  ).toContain("<$0.0001");
+});
 
 async function withTmp(run: (file: string) => Promise<void>) {
   const dir = await mkdtemp(join(tmpdir(), "kest-usage-"));

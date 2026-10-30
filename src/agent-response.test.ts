@@ -19,9 +19,7 @@ test("plain chat does not load research mode; research opt-in does", () => {
   expect(names).not.toContain("research_status");
   agent.research = newCompany("opted in");
   agent.refreshResearchPrompt();
-  expect(String(agent.messages[0]!.content)).toContain(
-    "kest-research-company",
-  );
+  expect(String(agent.messages[0]!.content)).toContain("kest-research-company");
   const researchNames = agent
     .toolDefs()
     .map((t) => (t.type === "function" ? t.function.name : ""));
@@ -90,11 +88,8 @@ test("a plain turn emits no budget event and does not become research", async ()
   await fixture(
     [{ delta: { content: "Hello!" }, finish: "stop" }],
     async (agent, events) => {
-      await agent.run(
-        "hi",
-        credentials,
-        AbortSignal.timeout(5000),
-        (event) => events.push(event),
+      await agent.run("hi", credentials, AbortSignal.timeout(5000), (event) =>
+        events.push(event),
       );
       expect(events.some((e) => e.type === "budget")).toBe(false);
       expect(agent.research).toBeNull();
@@ -259,9 +254,14 @@ test("provider filtering is reported without automatic retries", async () => {
   );
 });
 
-test("empty-response retries cannot overrun a research time budget", async () => {
+test("empty-response retries cannot overrun a shared research cost budget", async () => {
   await fixture([empty], async (agent, events, runtime) => {
-    runtime.state.elapsedMs = runtime.state.maxMs;
+    runtime.state.maxCostUsd = 1;
+    runtime.state.spentCostMicros = 1_000_000;
+    runtime.state.costRates[JSON.stringify(["fixture", "fixture"])] = {
+      input: 1,
+      output: 1,
+    };
     agent.research = runtime.state;
     await agent.run(
       "Fixture task",
@@ -270,6 +270,8 @@ test("empty-response retries cannot overrun a research time budget", async () =>
       (event) => events.push(event),
     );
     expect(runtime.state.requests).toBe(0);
-    expect(agent.messages.at(-1)?.content).toContain("Research budget reached");
+    expect(agent.messages.at(-1)?.content).toContain(
+      "Research cost budget reached",
+    );
   });
 });

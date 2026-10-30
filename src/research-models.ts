@@ -14,6 +14,9 @@ import {
   loadStore,
   BASETEN_MODEL,
   MODAL_MODEL,
+  NEBIUS_MODEL,
+  modelPricing,
+  type ModelPricing,
   type Provider,
 } from "./config";
 
@@ -34,6 +37,7 @@ type EndpointProfile = {
 type Profile = BuiltinProfile | EndpointProfile;
 
 const defaults: BuiltinProfile[] = [
+  { name: "nebius", provider: "nebius", model: NEBIUS_MODEL },
   { name: "modal", provider: "modal", model: MODAL_MODEL },
   { name: "baseten", provider: "baseten", model: BASETEN_MODEL },
 ];
@@ -100,12 +104,19 @@ function checkedProfile(value: unknown): Profile {
   const entry = value as Record<string, unknown>;
   const name = checkedName(entry.name);
   const model = checkedModel(entry.model);
-  if (entry.provider === "modal" || entry.provider === "baseten") {
+  if (
+    entry.provider === "modal" ||
+    entry.provider === "baseten" ||
+    entry.provider === "nebius"
+  ) {
     if (
       Object.keys(entry).some((k) => !["name", "provider", "model"].includes(k))
     )
       throw new Error("Unexpected fields in built-in research model profile.");
-    if ((name === "modal" || name === "baseten") && name !== entry.provider)
+    if (
+      (name === "modal" || name === "baseten" || name === "nebius") &&
+      name !== entry.provider
+    )
       throw new Error(
         "Default research model aliases must use their matching provider.",
       );
@@ -113,7 +124,7 @@ function checkedProfile(value: unknown): Profile {
   }
   if (entry.provider !== "custom")
     throw new Error("Unknown research model provider.");
-  if (name === "modal" || name === "baseten")
+  if (name === "modal" || name === "baseten" || name === "nebius")
     throw new Error(
       "Default provider names cannot be used for custom endpoints.",
     );
@@ -170,7 +181,13 @@ async function effectiveProfiles() {
   return [...profiles.values()];
 }
 export async function listResearchModels(): Promise<
-  Array<{ name: string; provider: string; model: string; available: boolean }>
+  Array<{
+    name: string;
+    provider: string;
+    model: string;
+    available: boolean;
+    pricing: ModelPricing | null;
+  }>
 > {
   const [profiles, store] = await Promise.all([
     effectiveProfiles(),
@@ -180,6 +197,7 @@ export async function listResearchModels(): Promise<
     name: profile.name,
     provider: profile.provider,
     model: profile.model,
+    pricing: modelPricing(profile.provider, profile.model),
     available:
       profile.provider === "custom"
         ? Boolean(process.env[profile.apiKeyEnv]?.trim())
@@ -261,9 +279,9 @@ export async function saveResearchModel(
   provider: string,
   model: string,
 ): Promise<void> {
-  if (provider !== "modal" && provider !== "baseten")
+  if (provider !== "modal" && provider !== "baseten" && provider !== "nebius")
     throw new Error(
-      "Built-in research providers are modal and baseten. Configure a custom endpoint separately.",
+      "Built-in research providers are modal, baseten and nebius. Configure a custom endpoint separately.",
     );
   await saveProfile(checkedProfile({ name, provider, model }));
 }

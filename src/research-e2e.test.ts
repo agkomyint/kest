@@ -7,6 +7,7 @@ import { listWorkerRecords, workerTranscript } from "./research-workers";
 import {
   CompanyRuntime,
   newCompany,
+  costKey,
   recoverCompany,
   replaceCheckpoint,
 } from "./research-company";
@@ -65,6 +66,8 @@ test("a failed journal write does not poison later checkpoints", async () => {
 test("cancelling a parallel research team stops requests and leaves a resumable checkpoint", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "kest-research-cancel-"));
   const state = newCompany("Cancel a live team");
+  state.maxCostUsd = 10;
+  state.costRates[costKey("fixture", "fixture")] = { input: 1, output: 1 };
   const controller = new AbortController();
   let workers = 0;
   const server = Bun.serve({
@@ -145,10 +148,11 @@ test("cancelling a parallel research team stops requests and leaves a resumable 
   }
 });
 
-test("the research deadline interrupts a pending provider request and saves its budget", async () => {
+test("an unaffordable research request is blocked before dispatch and a proposal is saved", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "kest-research-deadline-"));
-  const state = newCompany("Stop when time expires");
-  state.maxMs = 1000;
+  const state = newCompany("Stop when the call does not fit");
+  state.maxCostUsd = 0.01;
+  state.costRates[costKey("fixture", "fixture")] = { input: 100, output: 100 };
   let calls = 0;
   const server = Bun.serve({
     hostname: "127.0.0.1",
@@ -176,16 +180,16 @@ test("the research deadline interrupts a pending provider request and saves its 
       AbortSignal.timeout(5000),
       () => {},
     );
-    expect(calls).toBe(1);
+    expect(calls).toBe(0);
     expect(state.status).toBe("budget_exhausted");
     expect(String(agent.messages.at(-1)?.content)).toContain(
-      "Research budget reached",
+      "Research cost budget reached",
     );
     expect(
       JSON.parse(
         await readFile(join(cwd, "research", state.id, "state.json"), "utf8"),
       ).requests,
-    ).toBe(1);
+    ).toBe(0);
   } finally {
     server.stop(true);
     await agent.browser.close();
@@ -198,11 +202,11 @@ test("the research deadline interrupts a pending provider request and saves its 
   }
 }, 10000);
 
-test("time exhaustion checkpoints gracefully after the last tool without claiming completion", async () => {
+test("cost exhaustion preserves executed tools and requests more funding without claiming completion", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "kest-research-budget-"));
   const state = newCompany("Preserve partial findings");
-  // 300ms of time left: first call + its tool run, next call is blocked.
-  state.elapsedMs = state.maxMs - 300;
+  state.maxCostUsd = 0.08;
+  state.costRates[costKey("fixture", "fixture")] = { input: 1, output: 1 };
   let calls = 0;
   const server = Bun.serve({
     hostname: "127.0.0.1",
@@ -263,7 +267,9 @@ test("time exhaustion checkpoints gracefully after the last tool without claimin
     expect(await readFile(join(cwd, "partial.md"), "utf8")).toBe(
       "Partial finding only.",
     );
-    expect(String(agent.messages.at(-1)?.content)).toContain("not a claim");
+    expect(String(agent.messages.at(-1)?.content)).toContain(
+      "This study is incomplete",
+    );
     expect(
       JSON.parse(
         await readFile(join(cwd, "research", state.id, "state.json"), "utf8"),
@@ -286,7 +292,9 @@ test("persistent research executes parallel teams, real experiments, review, pap
   const state = newCompany(
     "Test the research workflow using a deterministic arithmetic experiment; make no indexing claims.",
   );
-  state.maxRequests = 50;
+  state.maxCostUsd = 0.05;
+  for (const model of ["director", "a", "b", "c"])
+    state.costRates[costKey("fixture", model)] = { input: 0.001, output: 1 };
   const directory = `research/${state.id}`;
   const raw = `${directory}/raw.json`;
   const paper = `${directory}/paper.md`;
@@ -411,6 +419,7 @@ test("persistent research executes parallel teams, real experiments, review, pap
         object: "chat.completion.chunk",
         created: 1,
         model: body.model,
+        usage: { prompt_tokens: 2000, completion_tokens: 1000 },
         choices: [
           {
             index: 0,
@@ -451,7 +460,9 @@ test("persistent research executes parallel teams, real experiments, review, pap
     expect(experimentRuns).toBeGreaterThan(5);
     expect(state.cycles).toBeGreaterThan(5);
     expect(state.requests).toBeGreaterThan(35);
-    expect(state.requests).toBeLessThanOrEqual(50);
+    expect(
+      state.spentCostMicros + state.estimatedCostMicros,
+    ).toBeLessThanOrEqual(Math.round(state.maxCostUsd! * 1_000_000));
     expect(state.reviews).toBe(1);
     expect(
       events.filter((e) => e.type === "tool" && e.state === "error"),
@@ -504,7 +515,7 @@ test("persistent research executes parallel teams, real experiments, review, pap
       undefined,
       structuredClone(agent.context),
     );
-    stale.maxRequests += 16;
+    stale.maxCostUsd! += 0.02;
     resumed.research = stale;
     resumed.connectionOverride = connection;
     try {
@@ -515,7 +526,9 @@ test("persistent research executes parallel teams, real experiments, review, pap
         () => {},
       );
       expect(stale.requests).toBeGreaterThan(consumed);
-      expect(stale.requests).toBeLessThanOrEqual(stale.maxRequests);
+      expect(
+        stale.spentCostMicros + stale.estimatedCostMicros,
+      ).toBeLessThanOrEqual(Math.round(stale.maxCostUsd! * 1_000_000));
       expect(stale.reviews).toBe(2);
     } finally {
       await resumed.browser.close();

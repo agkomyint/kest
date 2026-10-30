@@ -19,7 +19,7 @@ if (!args.includes("--help") && !args.includes("-h")) {
 }
 if (args.includes("--help") || args.includes("-h")) {
   console.log(
-    "kest [directory] [--permission all|minimal|strict]\nkest --prompt <message> [--permission all|minimal|strict]\n\nBun coding agent · /connect · /help inside the TUI\nStrict is the default. Headless mode denies actions that require approval.",
+    "kest [directory] [--permission all|minimal|strict]\nkest --prompt <message> [--research --budget 10$] [--permission all|minimal|strict]\n\nBun coding agent · /connect · /help inside the TUI\nStrict is the default. Headless mode denies actions that require approval.",
   );
 } else if (args.includes("--prompt")) {
   const { Agent } = await import("./agent");
@@ -38,8 +38,17 @@ if (args.includes("--help") || args.includes("-h")) {
         !signal.aborted && autoApprove(permission, request),
     );
     if (args.includes("--research")) {
-      const { newCompany } = await import("./research-company");
+      const { newCompany, parseCostBudget } =
+        await import("./research-company");
+      const budget = args[args.indexOf("--budget") + 1];
+      if (!args.includes("--budget") || !budget) {
+        console.error(
+          "Headless research requires --budget 10$ (a total USD allowance).",
+        );
+        process.exit(1);
+      }
       agent.research = newCompany(prompt);
+      agent.research.maxCostUsd = parseCostBudget(budget);
     }
     const { newSession, saveSession } = await import("./sessions");
     const { recordUsage, flushUsage } = await import("./usage");

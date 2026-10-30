@@ -10,6 +10,9 @@ import {
   BASETEN_MODEL,
   MODAL_BASE_URL,
   MODAL_MODEL,
+  NEBIUS_MODEL,
+  NEBIUS_BASE_URL,
+  modelPricing,
 } from "./config";
 import {
   listResearchModels,
@@ -23,6 +26,7 @@ async function isolated(run: (directory: string) => Promise<void>) {
   const variables = [
     "KEST_CONFIG_DIR",
     "BASETEN_API_KEY",
+    "NEBIUS_API_KEY",
     "MODAL_PROXY_TOKEN_ID",
     "MODAL_PROXY_TOKEN_SECRET",
     "RESEARCH_TEST_KEY",
@@ -45,15 +49,24 @@ test("default research aliases list availability without requiring credentials o
   await isolated(async () => {
     expect(await listResearchModels()).toEqual([
       {
+        name: "nebius",
+        provider: "nebius",
+        model: NEBIUS_MODEL,
+        pricing: modelPricing("nebius", NEBIUS_MODEL),
+        available: false,
+      },
+      {
         name: "modal",
         provider: "modal",
         model: MODAL_MODEL,
+        pricing: modelPricing("modal", MODAL_MODEL),
         available: false,
       },
       {
         name: "baseten",
         provider: "baseten",
         model: BASETEN_MODEL,
+        pricing: modelPricing("baseten", BASETEN_MODEL),
         available: false,
       },
     ]);
@@ -262,5 +275,22 @@ test("corrupt or secret-bearing configuration fails closed and is never overwrit
       );
       expect(await readFile(path, "utf8")).toBe(raw);
     }
+  });
+});
+
+test("nebius research profiles use current provider credentials", async () => {
+  await isolated(async () => {
+    await saveCredentials({ provider: "nebius", apiKey: "research-nebius" });
+    expect(await resolveResearchModel("nebius")).toEqual({
+      provider: "nebius",
+      baseURL: NEBIUS_BASE_URL,
+      model: NEBIUS_MODEL,
+      apiKey: "research-nebius",
+    });
+    await saveResearchModel("critic", "nebius", "another-model");
+    expect((await resolveResearchModel("critic")).model).toBe("another-model");
+    await expect(
+      saveResearchEndpoint("nebius", "https://example.com/v1", "m", "KEY"),
+    ).rejects.toThrow();
   });
 });

@@ -12,6 +12,7 @@
     "test": "bun test",
     "build": "bun run scripts/build.ts",
     "build:exe": "bun run scripts/build.ts --standalone",
+    "release:pack": "bun run scripts/package-release.ts",
     "test:live": "bun run scripts/smoke-live.ts"
   },
   "dependencies": {

@@ -1,6 +1,11 @@
 import { dirname, join } from "node:path";
 import { mkdir, open, rename, unlink } from "node:fs/promises";
-import { configDir, modelProvider } from "./config";
+import {
+  configDir,
+  modelProvider,
+  modelPricing,
+  formatModelPricing,
+} from "./config";
 
 export type UsageTotals = {
   input: number;
@@ -124,6 +129,55 @@ async function updateUsage(
 }
 
 const fmt = (n: number) => n.toLocaleString("en-US");
+
+const money = (value: number) =>
+  value > 0 && value < 0.0001 ? "<$0.0001" : `$${value.toFixed(4)}`;
+
+export function formatModelCosts(log: UsageLog): string {
+  const models = Object.keys(log).sort();
+  if (!models.length)
+    return "Estimated model cost · all time · this machine\nNo token usage recorded yet; estimated total $0.0000 USD.";
+  const lines = ["Estimated model cost · all time · this machine"];
+  let inputCost = 0;
+  let outputCost = 0;
+  let unknownTokens = 0;
+  let unknownModels = 0;
+  for (const model of models) {
+    const usage = log[model]!;
+    const provider = modelProvider(model);
+    const pricing = provider ? modelPricing(provider, model) : null;
+    lines.push(`\n${provider ? `${provider} · ` : ""}${model}`);
+    lines.push(`  ${formatModelPricing(pricing)}`);
+    lines.push(`  Tokens: in ${fmt(usage.input)} · out ${fmt(usage.output)}`);
+    if (!pricing) {
+      unknownModels++;
+      unknownTokens += usage.input + usage.output;
+      lines.push("  Cost unknown · excluded from priced subtotal");
+      continue;
+    }
+    const input = (usage.input * pricing.inputUsdPerMillionTokens) / 1_000_000;
+    const output =
+      (usage.output * pricing.outputUsdPerMillionTokens) / 1_000_000;
+    inputCost += input;
+    outputCost += output;
+    lines.push(
+      `  Estimated: input ${money(input)} · output ${money(output)} · total ${money(input + output)} USD`,
+    );
+    lines.push(`  ${pricing.note}`);
+  }
+  lines.push(
+    "",
+    `${unknownModels ? "PRICED SUBTOTAL" : "ESTIMATED TOTAL"} ${money(inputCost + outputCost)} USD · input ${money(inputCost)} · output ${money(outputCost)}`,
+  );
+  if (unknownModels)
+    lines.push(
+      `Total cost unknown: ${unknownModels} model(s), ${fmt(unknownTokens)} tokens have no verified catalog rate.`,
+    );
+  lines.push(
+    "Uses current catalog rates for historical recorded tokens. Cache discounts, historical rate changes, account credits and unreported tokens are not included. Usage is stored by model ID; provider attribution is inferred from the catalog. This is an estimate, not an invoice.",
+  );
+  return lines.join("\n");
+}
 
 export function formatUsage(
   log: UsageLog,

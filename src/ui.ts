@@ -39,11 +39,13 @@ import {
   saveSelectedModel,
   endpointFor,
   modelProvider,
+  formatModelPricing,
   MODELS,
   MODAL_BASE_URL,
   MODAL_MODEL,
   BASETEN_BASE_URL,
   BASETEN_MODEL,
+  NEBIUS_MODEL,
   configPath,
   type Credentials,
   type Provider,
@@ -57,13 +59,19 @@ import {
   type Entry,
   type Session,
 } from "./sessions";
-import { formatUsage, loadUsage, recordUsage, flushUsage } from "./usage";
+import {
+  formatUsage,
+  formatModelCosts,
+  loadUsage,
+  recordUsage,
+  flushUsage,
+} from "./usage";
 import type { Approval } from "./tools";
 import { theme } from "./theme";
 import {
   newCompany,
   formatCompany,
-  parseTokenBudget,
+  parseCostBudget,
   recoverCompany,
 } from "./research-company";
 import { listWorkerRecords, workerTranscript } from "./research-workers";
@@ -456,7 +464,7 @@ export class KestUI {
   private stopActiveWork() {
     const study = this.agent.research ?? this.session.research;
     if (study && this.active) {
-      study.status = "paused";
+      if (study.status !== "ready") study.status = "paused";
       this.session.research = study;
       this.pauseDecisionPending = true;
       void saveSession(this.session).catch(() => {});
@@ -495,7 +503,7 @@ export class KestUI {
       "? Research paused — direction?",
       [
         "Resume research",
-        "Extend time budget (+30 min) and resume",
+        "Change research dollar budget",
         "Wrap up: review + final report now",
         "Stay paused (resume later with /research resume)",
       ],
@@ -506,7 +514,13 @@ export class KestUI {
           return;
         }
         if (value === "extend") {
-          study.maxMs += 30 * 60_000;
+          this.restoreInput();
+          this.composer.setText("/research budget ");
+          this.composer.focus();
+          this.info(
+            "Enter a new total USD allowance, e.g. /research budget 15$. Nothing has been increased.",
+          );
+          return;
         }
         study.status = "running";
         void saveSession(this.session).catch(() => {});
@@ -529,6 +543,10 @@ export class KestUI {
       this.active ||
       this.connectStep ||
       this.listPicker ||
+      (this.agent.research &&
+        ["budget_exhausted", "completed"].includes(
+          this.agent.research.status,
+        )) ||
       !this.credentials
     )
       return;
@@ -630,7 +648,7 @@ export class KestUI {
     const usable = MODELS.filter((m) => this.isConnected(m.provider));
     if (!usable.length) {
       this.info(
-        "No providers connected yet. Run /connect baseten or /connect modal first.",
+        "No providers connected yet. Run /connect baseten, /connect modal or /connect nebius first.",
       );
       return;
     }
@@ -639,7 +657,7 @@ export class KestUI {
       "Choose a model",
       usable.map(
         (m) =>
-          `${m.provider} — ${m.label}${m.id === current ? " (current)" : ""}`,
+          `${m.provider} — ${m.label}${m.id === current ? " (current)" : ""}\n    ${formatModelPricing(m.pricing)}\n    ${m.provider === "nebius" ? "Published rate" : "Public reference; endpoint billing unverified"}`,
       ),
       usable.map((m) => m.id),
       (id) => {
@@ -1232,14 +1250,16 @@ export class KestUI {
       this.connectStep === "id"
         ? `Modal token ID${keySuffix}`
         : this.connectStep === "key"
-          ? `Baseten API key${keySuffix}`
+          ? `${this.connectProvider === "nebius" ? "Nebius Token Factory" : "Baseten"} API key${keySuffix}`
           : "Modal token secret";
     this.secretText.content = `${label}\n${"•".repeat(Math.min(28, this.secretValue.length))}  ${this.secretValue.length} characters`;
   }
   private describeProvider(provider: Provider) {
-    return provider === "baseten"
-      ? "baseten — Baseten API key"
-      : "modal — Modal token ID + secret";
+    return provider === "nebius"
+      ? "nebius — Nebius Token Factory API key"
+      : provider === "baseten"
+        ? "baseten — Baseten API key"
+        : "modal — Modal token ID + secret";
   }
   private isConnected(provider: Provider) {
     return (
@@ -1289,7 +1309,7 @@ export class KestUI {
       const row = new TextRenderable(this.renderer, {
         content: label,
         fg: theme.fg,
-        height: 1,
+        height: label.split("\n").length,
         selectable: false,
         onMouseDown: (event) => {
           event.preventDefault();
@@ -1331,16 +1351,20 @@ export class KestUI {
     this.restoreInput();
   }
   private openProviderPicker() {
-    const labels = (["baseten", "modal"] as Provider[]).map((provider) => {
-      const count = this.keychain[provider]?.keys.length ?? 0;
-      const state =
-        count > 0 ? `  (${count} key${count === 1 ? "" : "s"}, connected)` : "";
-      return `${this.describeProvider(provider)}${state}`;
-    });
+    const labels = (["baseten", "modal", "nebius"] as Provider[]).map(
+      (provider) => {
+        const count = this.keychain[provider]?.keys.length ?? 0;
+        const state =
+          count > 0
+            ? `  (${count} key${count === 1 ? "" : "s"}, connected)`
+            : "";
+        return `${this.describeProvider(provider)}${state}`;
+      },
+    );
     this.openListPicker(
       "Choose a provider",
       labels,
-      ["baseten", "modal"],
+      ["baseten", "modal", "nebius"],
       (value) => this.connect(value as Provider),
     );
   }
@@ -1426,10 +1450,12 @@ export class KestUI {
     }
     this.startKeyEntry(provider, "a");
   }
+  private connectProvider: Provider = "modal";
   private startKeyEntry(provider: Provider, name: string) {
     this.renderer.clearSelection();
+    this.connectProvider = provider;
     this.connectKeyName = name;
-    this.connectStep = provider === "baseten" ? "key" : "id";
+    this.connectStep = provider !== "modal" ? "key" : "id";
     this.secretValue = "";
     this.tokenId = "";
     this.composer.blur();
@@ -1462,13 +1488,13 @@ export class KestUI {
     }
     const name =
       this.connectKeyName ??
-      nextKeyName(
-        this.storeForNames(),
-        this.connectStep === "key" ? "baseten" : "modal",
-      );
+      nextKeyName(this.storeForNames(), this.connectProvider);
     const next: Credentials =
       this.connectStep === "key"
-        ? { provider: "baseten", apiKey: value }
+        ? {
+            provider: this.connectProvider as "baseten" | "nebius",
+            apiKey: value,
+          }
         : {
             provider: "modal",
             tokenId: this.tokenId,
@@ -1492,7 +1518,7 @@ export class KestUI {
       this.credentials = next;
       this.agent.modelOverride = this.effectiveModel();
       this.info(
-        `${next.provider === "baseten" ? "Baseten" : "Modal"} key ${savedName} saved and active — tucked into the nest.`,
+        `${next.provider === "nebius" ? "Nebius" : next.provider === "baseten" ? "Baseten" : "Modal"} key ${savedName} saved and active — tucked into the nest.`,
       );
       this.ready();
     } catch {
@@ -1874,9 +1900,8 @@ export class KestUI {
         const study = this.agent.research ?? this.session.research;
         const hud = study ? ` │ ${this.liveHud()}` : "";
         this.status.content = `${frames[frame++ % frames.length]} ${this.loadingLabel}${hud}`;
-        this.status.fg = study && shouldOpenBudgetDecision(study)
-          ? theme.error
-          : theme.tool;
+        this.status.fg =
+          study && shouldOpenBudgetDecision(study) ? theme.error : theme.tool;
       }
     };
     draw();
@@ -1911,7 +1936,9 @@ export class KestUI {
         return;
       }
       if (!this.credentials) {
-        this.info("Use /connect baseten or /connect modal to add credentials.");
+        this.info(
+          "Use /connect baseten, /connect modal or /connect nebius to add credentials.",
+        );
         return;
       }
       this.add("you", text);
@@ -2016,6 +2043,21 @@ export class KestUI {
     }
     if (command === "/research") {
       const [action, ...parts] = value.split(/\s+/);
+      if (action === "show") {
+        const sessions = await listSessions(this.cwd);
+        const studies = [
+          this.session,
+          ...sessions.filter((saved) => saved.id !== this.session.id),
+        ].filter((saved) => saved.research);
+        this.info(
+          studies.length
+            ? studies.map((saved) =>
+                `${formatCompany(saved.research)}\nSession: ${saved.id}${saved.id === this.session.id ? " (current)" : ` — /resume ${saved.id} to open`}`,
+              ).join("\n\n")
+            : "No saved research in this workspace. /research prepare <objective> to prepare a study.",
+        );
+        return;
+      }
       if (!value) {
         this.info(formatCompany(this.session.research));
         return;
@@ -2043,14 +2085,16 @@ export class KestUI {
         await saveSession(this.session);
         this.info(
           formatCompany(this.session.research) +
-            "\nPrepared without model calls. Set /research budget if needed, then /research resume.",
+            "\nPrepared without model calls. Set /research budget, then /research start.",
         );
         return;
       }
       if (action === "model") {
         const [alias, provider, model] = parts;
         if (!alias || !provider || !model || parts.length !== 3)
-          throw new Error("/research model <alias> <modal|baseten> <model-id>");
+          throw new Error(
+            "/research model <alias> <modal|baseten|nebius> <model-id>",
+          );
         await saveResearchModel(alias, provider, model);
         this.info(
           `Research model ${alias} saved. Workers can select this profile.`,
@@ -2078,67 +2122,47 @@ export class KestUI {
         );
         return;
       }
-      if (
-        action === "tokens" ||
-        (action === "budget" && parts[0] === "tokens")
-      ) {
-        const tokenArgs = action === "budget" ? parts.slice(1) : parts;
-        const study = this.session.research;
-        if (!study || tokenArgs.length !== 1)
-          throw new Error(
-            "Prepare a research objective first, then /research tokens <total, e.g. 500k, 10m, 500b|off>.",
-          );
-        await recoverCompany(this.cwd, study);
-        const limit =
-          tokenArgs[0] === "off" ? null : parseTokenBudget(tokenArgs[0]!);
-        const consumed =
-          study.inputTokens + study.outputTokens + study.estimatedTokens;
-        if (limit !== null && limit < consumed)
-          throw new Error(
-            `Token total cannot be below ${consumed.toLocaleString("en-US")} already consumed or estimated.`,
-          );
-        study.maxTokens = limit;
-        study.status = "paused";
-        this.agent.research = study;
-        await saveSession(this.session);
-        this.info(formatCompany(study));
+      if (action === "tokens") {
+        this.info(
+          "Research uses a USD budget now. Use /research budget 10$. Token usage remains visible under /usage.",
+        );
         return;
       }
       if (action === "budget") {
-        // Only time (+ token via /research tokens) is limited now.
-        // Syntax: /research budget <total-minutes> [total-agents]
-        const minutes = Number(parts[0]);
-        const agents =
-          parts[1] === undefined
-            ? this.session.research?.maxAgents
-            : Number(parts[1]);
-        if (
-          !this.session.research ||
-          (parts.length !== 1 && parts.length !== 2) ||
-          !Number.isInteger(minutes) ||
-          minutes < 1 ||
-          minutes > 1440 ||
-          !Number.isInteger(agents) ||
-          agents! < 1 ||
-          agents! > 64 ||
-          agents! < this.session.research.agents ||
-          minutes * 60000 < this.session.research.elapsedMs
-        )
+        const study = this.session.research;
+        if (!study || parts.length !== 1)
           throw new Error(
-            "Start a research objective first, then /research budget <total-minutes 1–1440> [total-agents 1–64]. Token cap: /research tokens <total|off>. Requests are not limited.",
+            "Prepare a research objective first, then /research budget 10$.",
           );
-        this.session.research.maxMs = minutes * 60000;
-        this.session.research.maxAgents = agents!;
-        this.session.research.status = "paused";
+        const total = parseCostBudget(parts[0]!);
+        await recoverCompany(this.cwd, study);
+        const used = study.spentCostMicros + study.estimatedCostMicros;
+        if (Math.round(total * 1_000_000) < used)
+          throw new Error(
+            `Budget cannot be below $${(used / 1_000_000).toFixed(4)} already spent or reserved.`,
+          );
+        study.maxCostUsd = total;
+        if (study.status !== "ready") study.status = "paused";
+        this.agent.research = study;
         await saveSession(this.session);
-        this.info(formatCompany(this.session.research));
+        this.info(
+          formatCompany(study) +
+            `\nTotal allowance updated; consumption is preserved. /research ${study.status === "ready" ? "start to begin" : "resume to continue"}.`,
+        );
+        return;
+      }
+      const startPrepared = action === "start" && !parts.join(" ").trim();
+      if (startPrepared && !this.session.research) {
+        this.info(
+          "Prepare an objective with /research prepare <objective> (or /research start <objective>).\nThen set /research budget 10$ and run /research start.\nConnect a model provider with /connect if needed.",
+        );
         return;
       }
       if (!this.credentials) {
         this.info("Connect a model provider first with /connect.");
         return;
       }
-      if (action === "resume") {
+      if (action === "resume" || startPrepared) {
         if (!this.session.research) {
           this.info("No research objective yet. /research <objective>");
           return;
@@ -2153,6 +2177,21 @@ export class KestUI {
         this.session.tasks = [];
       }
       const study = this.session.research!;
+      if (study.maxCostUsd === null) {
+        this.session.goal = study.objective;
+        this.agent.research = study;
+        await saveSession(this.session);
+        this.info(
+          "Research prepared. Set /research budget 10$ then /research start. No model calls made.",
+        );
+        return;
+      }
+      if (study.status === "completed") {
+        this.info(
+          "This research study is complete. Start a new objective with /research prepare <objective>.",
+        );
+        return;
+      }
       this.session.goal = study.objective;
       this.agent = this.makeAgent(
         this.agent.messages,
@@ -2164,10 +2203,10 @@ export class KestUI {
       this.agent.tasks = this.session.tasks.map((t) => ({ ...t }));
       await saveSession(this.session);
       this.info(
-        `Research company started · budget: ${formatDuration(study.maxMs)}${study.maxTokens === null ? " · no token cap" : ` · ${study.maxTokens.toLocaleString("en-US")} tokens`} · requests metered, not limited. Experiments still follow /permission; Ctrl+C pauses. Logs: research/${study.id}/`,
+        `Research company started · shared cost allowance: $${study.maxCostUsd.toFixed(2)} USD (estimated rates). Director manages delegation, model selection and experiments. Ctrl+C pauses. Logs: research/${study.id}/`,
       );
       this.composer.setText(
-        `Research objective: ${study.objective}\nUse the company workflow, preserve reproducible evidence and negative findings, and reserve time for independent review. Persist source, raw logs, results and the paper in research/${study.id}/. Continue within the shared token/time budget (requests are not limited); never fabricate results or claim unsupported novelty.`,
+        `Research objective: ${study.objective}\nUse the company workflow, preserve reproducible evidence and negative findings, and reserve money for independent review. Persist source, raw logs, results and the paper in research/${study.id}/. Manage the shared $${study.maxCostUsd.toFixed(2)} USD allowance across your own calls, subagents, reviewers and summaries. Use research_status to check spending. Do useful research within this allowance, without wasting credits. When supported by reviewed artifacts, save a final report and call research_complete. If incomplete near exhaustion, write funding-proposal.md with evidence-backed progress, unresolved questions, next experiments, requested additional USD and a reasoned cost estimate; ask the user whether to increase the total. Never increase credits yourself; never fabricate results or claim unsupported novelty.`,
       );
       await this.submit();
       return;
@@ -2228,12 +2267,12 @@ export class KestUI {
         this.openProviderPicker();
         return;
       }
-      if (arg === "modal" || arg === "baseten") {
+      if (arg === "modal" || arg === "baseten" || arg === "nebius") {
         this.connect(arg);
         return;
       }
       this.info(
-        "Usage: /connect [modal|baseten]\n/connect baseten  Baseten API key\n/connect modal  Modal token ID + secret",
+        "Usage: /connect [modal|baseten|nebius]\n/connect baseten  Baseten API key\n/connect modal  Modal token ID + secret\n/connect nebius  Nebius Token Factory API key",
       );
       return;
     }
@@ -2285,7 +2324,7 @@ export class KestUI {
       this.ready();
       if (!this.credentials) {
         this.info(
-          "Connect first: /connect baseten or /connect modal, then send any message to begin.",
+          "Connect first: /connect baseten, /connect modal or /connect nebius, then send any message to begin.",
         );
         return;
       }
@@ -2315,11 +2354,14 @@ export class KestUI {
         formatUsage(await loadUsage(), {
           sessions: sessions.length,
           workspaces: new Set(sessions.map((s) => s.cwd)).size,
-        }),
+        }) +
+          "\n\n" +
+          formatModelCosts(await loadUsage()),
       );
       return;
     }
-    if (command === "/stats" || command === "/stat") {
+    if (command === "/stats") {
+      await flushUsage();
       const sessions = await allSessions(this.session);
       this.info(
         formatToolStats(
@@ -2423,17 +2465,17 @@ export class KestUI {
         );
       } else {
         this.info(
-          `No provider connected.\nbaseten  ${BASETEN_MODEL}\nmodal  ${MODAL_MODEL}\n\n/connect baseten  or  /connect modal`,
+          `No provider connected.\nbaseten  ${BASETEN_MODEL}\nmodal  ${MODAL_MODEL}\nnebius  ${NEBIUS_MODEL}\n\n/connect baseten, /connect modal or /connect nebius`,
         );
       }
       return;
     }
     if (command === "/help") {
       this.info(
-        "Research: /research start <objective> · /research prepare <objective> · /research resume · /research budget <minutes> [agents] · /research tokens <total|off> · /agents [id] inspects workers",
+        "Research: /research show · /research prepare <objective> · /research start · /research resume · /research budget <USD, e.g. 10$> · /agents [id] inspects workers",
       );
       this.info(
-        "/connect [modal|baseten]  credentials (provider switcher)\n/provider  current provider and model\n/model  list models and select one\n/research start|prepare|resume|budget|tokens  research company, model profiles and budgets\n/context  context size, memory, archives and compaction\n/usage  all-time token usage and session count (this machine)\n/stats or /stat  all-time tool counts and timings across sessions (ms)\n/permission [all|minimal|strict]  approval level\n/browser [url|tabs|close]  control the visible browser\n/goal <text>|clear  session objective\n/tasks  plan checklist and progress\n/new  fresh session\n/sessions  saved workspace sessions\n/resume <id>  reopen a session\n/tools  available tools\n/status  model and connection\n/system <instructions>  customize agent (new session)\n/exit  quit\n\nEnter send · Shift+Enter or Ctrl+Enter newline · Tab completes commands + subcommands (/res → /research, /research b → /research budget)\nUp/Down prompt history · Mouse wheel or PgUp/PgDn scroll\nEdits and shell commands require y/n approval.",
+        "/connect [modal|baseten|nebius]  credentials (provider switcher)\n/provider  current provider and model\n/model  list models and select one\n/research start|prepare|resume|budget  research company, model profiles and budgets\n/context  context size, memory, archives and compaction\n/usage  token usage, pricing and estimated cost (this machine)\n/stats  all-time tool counts and timings across sessions (ms)\n/permission [all|minimal|strict]  approval level\n/browser [url|tabs|close]  control the visible browser\n/goal <text>|clear  session objective\n/tasks  plan checklist and progress\n/new  fresh session\n/sessions  saved workspace sessions\n/resume <id>  reopen a session\n/tools  available tools\n/status  model and connection\n/system <instructions>  customize agent (new session)\n/exit  quit\n\nEnter send · Shift+Enter or Ctrl+Enter newline · Tab completes commands + subcommands (/res → /research, /research b → /research budget)\nUp/Down prompt history · Mouse wheel or PgUp/PgDn scroll\nEdits and shell commands require y/n approval.",
       );
       return;
     }
@@ -2457,7 +2499,7 @@ export class KestUI {
         { input: 0, output: 0 },
       );
       this.info(
-        `${this.credentials ? `${this.credentials.provider === "baseten" ? "Baseten" : "Modal"} credentials loaded; access checked on request` : "Not connected"}\n${model ? `Model: ${model}${selected ? " (selected)" : " (default)"}` : `baseten  ${BASETEN_MODEL}\nmodal  ${MODAL_MODEL}`}\n${endpoint ? `${endpoint.baseURL}\n` : ""}${this.credentials ? `${this.describeKeys(this.credentials.provider)}\n` : ""}Usage (this machine): in ${totals.input.toLocaleString("en-US")} · out ${totals.output.toLocaleString("en-US")} · /usage for details\nGoal: ${this.session.goal ?? "none — /goal <objective>"}\nWorkspace: ${this.cwd}\nCredentials: ${configPath}\nSession: ${this.session.id}`,
+        `${this.credentials ? `${this.credentials.provider === "nebius" ? "Nebius" : this.credentials.provider === "baseten" ? "Baseten" : "Modal"} credentials loaded; access checked on request` : "Not connected"}\n${model ? `Model: ${model}${selected ? " (selected)" : " (default)"}` : `baseten  ${BASETEN_MODEL}\nmodal  ${MODAL_MODEL}\nnebius  ${NEBIUS_MODEL}`}\n${endpoint ? `${endpoint.baseURL}\n` : ""}${this.credentials ? `${this.describeKeys(this.credentials.provider)}\n` : ""}Usage (this machine): in ${totals.input.toLocaleString("en-US")} · out ${totals.output.toLocaleString("en-US")} · /usage for details\nGoal: ${this.session.goal ?? "none — /goal <objective>"}\nWorkspace: ${this.cwd}\nCredentials: ${configPath}\nSession: ${this.session.id}`,
       );
       return;
     }

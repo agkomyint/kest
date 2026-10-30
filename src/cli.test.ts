@@ -9,6 +9,8 @@ import {
   loadSelectedModel,
   loadStore,
   modelProvider,
+  modelPricing,
+  formatModelPricing,
   saveActiveKey,
   saveActiveProvider,
   saveCredentials,
@@ -19,6 +21,8 @@ import {
   BASETEN_MODEL,
   MODAL_BASE_URL,
   MODAL_MODEL,
+  NEBIUS_MODEL,
+  NEBIUS_BASE_URL,
 } from "./config";
 
 async function withIsolatedConfig(run: (dir: string) => Promise<void>) {
@@ -176,11 +180,34 @@ test("selected model persists and reloads", async () => {
 test("model catalog covers both providers and resolves owners", () => {
   expect(MODELS.length).toBeGreaterThanOrEqual(2);
   expect(new Set(MODELS.map((m) => m.provider))).toEqual(
-    new Set(["baseten", "modal"]),
+    new Set(["baseten", "modal", "nebius"]),
   );
   expect(modelProvider(BASETEN_MODEL)).toBe("baseten");
   expect(modelProvider(MODAL_MODEL)).toBe("modal");
   expect(modelProvider("no-such-model")).toBeNull();
+});
+
+test("model prices are provider-specific and unknown models remain unpriced", () => {
+  expect(modelPricing("nebius", NEBIUS_MODEL)?.inputUsdPerMillionTokens).toBe(
+    0.3,
+  );
+  expect(modelPricing("nebius", NEBIUS_MODEL)?.outputUsdPerMillionTokens).toBe(
+    0.9,
+  );
+  expect(modelPricing("baseten", BASETEN_MODEL)?.inputUsdPerMillionTokens).toBe(
+    1.25,
+  );
+  expect(
+    modelPricing("baseten", BASETEN_MODEL)?.outputUsdPerMillionTokens,
+  ).toBe(4.25);
+  expect(modelPricing("modal", MODAL_MODEL)?.note).toContain("unverified");
+  expect(modelPricing("baseten", NEBIUS_MODEL)).toBeNull();
+  expect(modelPricing("custom", NEBIUS_MODEL)).toBeNull();
+  expect(modelPricing("nebius", "another-model")).toBeNull();
+  expect(formatModelPricing(null)).toContain("unknown");
+  expect(formatModelPricing(modelPricing("nebius", NEBIUS_MODEL))).toBe(
+    "Input $0.30 · output $0.90 / 1M tokens (USD)",
+  );
 });
 
 test("permission levels persist and survive credential/model updates", async () => {
@@ -204,4 +231,47 @@ test("permission levels persist and survive credential/model updates", async () 
     expect((await loadStore()).permission).toBe("strict");
     expect(() => parsePermission("unknown")).toThrow();
   });
+});
+
+test("nebius credentials resolve, persist and switch named keys", async () => {
+  expect(() => parseCredentials({ provider: "nebius", apiKey: " " })).toThrow(
+    "Nebius",
+  );
+  const credential = parseCredentials({ provider: "nebius", apiKey: " key " });
+  expect(endpointFor(credential)).toEqual({
+    baseURL: NEBIUS_BASE_URL,
+    model: NEBIUS_MODEL,
+    apiKey: "key",
+  });
+  expect(modelProvider(NEBIUS_MODEL)).toBe("nebius");
+  await withIsolatedConfig(async () => {
+    await saveCredentials(credential);
+    await saveCredentials({ provider: "nebius", apiKey: "second" });
+    await saveActiveKey("nebius", "a");
+    expect(await loadCredentials()).toEqual(credential);
+    await saveSelectedModel(NEBIUS_MODEL);
+    expect(await loadSelectedModel()).toBe(NEBIUS_MODEL);
+    expect((await loadStore()).activeProvider).toBe("nebius");
+  });
+});
+
+test("nebius environment credentials seed the store", async () => {
+  const previous = process.env.NEBIUS_API_KEY;
+  try {
+    process.env.NEBIUS_API_KEY = " env-nebius ";
+    await withIsolatedConfig(async () => {
+      expect(await loadCredentials("nebius")).toEqual({
+        provider: "nebius",
+        apiKey: "env-nebius",
+      });
+      await saveCredentials({ provider: "nebius", apiKey: "saved" });
+      expect(await loadCredentials("nebius")).toEqual({
+        provider: "nebius",
+        apiKey: "saved",
+      });
+    });
+  } finally {
+    if (previous === undefined) delete process.env.NEBIUS_API_KEY;
+    else process.env.NEBIUS_API_KEY = previous;
+  }
 });

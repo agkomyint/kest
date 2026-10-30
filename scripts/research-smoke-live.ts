@@ -1,10 +1,14 @@
-// Explicit opt-in: real provider requests, bounded to 18 requests / 3 minutes.
+// Explicit opt-in: real provider requests within a USD allowance and a smoke-test timeout.
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent } from "../src/agent";
 import { loadCredentials } from "../src/config";
-import { CompanyRuntime, newCompany } from "../src/research-company";
+import {
+  CompanyRuntime,
+  newCompany,
+  parseCostBudget,
+} from "../src/research-company";
 import { recordUsage, flushUsage } from "../src/usage";
 
 if (!Bun.argv.includes("--live"))
@@ -15,13 +19,15 @@ const cwd = await mkdtemp(join(tmpdir(), "kest-research-live-"));
 const state = newCompany(
   "Verify arithmetic evidence, collect three independent inspections, and write a reviewed workflow smoke report. No performance or novelty claims.",
 );
-state.maxRequests = 18;
-state.maxMs = 180000;
+const budgetIndex = Bun.argv.indexOf("--budget");
+if (budgetIndex < 0)
+  throw new Error("Pass --budget 1$ to authorize a total USD allowance.");
+state.maxCostUsd = parseCostBudget(Bun.argv[budgetIndex + 1] ?? "");
 const runtime = new CompanyRuntime(state, cwd);
 const agent = new Agent(cwd, async (request) => request.kind === "file");
 agent.research = state;
 agent.useCompany(runtime, 0);
-const signal = AbortSignal.timeout(state.maxMs);
+const signal = AbortSignal.timeout(180000);
 const events: unknown[] = [];
 const observe = (event: Parameters<Parameters<Agent["run"]>[3]>[0]) => {
   events.push(event);
@@ -59,11 +65,10 @@ try {
   console.log(
     `Three researchers returned; ${state.requests} requests consumed.`,
   );
-  // Enter the normal controller's final-review phase, including evidence reads,
-  // the paper write, and a final response, without expanding the original cap.
-  state.maxRequests = Math.min(18, state.requests + 10);
+  // Request explicit review and completion within the same dollar allowance.
+
   await agent.run(
-    "Read evidence.json and team.json. Have the review board inspect these artifacts, then write paper.md using write_file. Keep it under 200 words: methods, actual arithmetic result, limitations, review reconciliation. No shell, browser, or additional teams. Finish after writing the report.",
+    `Read evidence.json and team.json. Have the review board inspect these artifacts, then write research/${state.id}/paper.md using write_file. Keep it under 200 words: methods, actual arithmetic result, limitations, review reconciliation. No shell, browser, or additional teams. Call research_complete with the reportPath and finish.`,
     credentials,
     signal,
     (event) => {
@@ -71,7 +76,10 @@ try {
       if (event.type === "tool") console.log(`${event.state}: ${event.name}`);
     },
   );
-  const paper = await readFile(join(cwd, "paper.md"), "utf8");
+  const paper = await readFile(
+    join(cwd, "research", state.id, "paper.md"),
+    "utf8",
+  );
   if (!paper.trim() || state.reviews < 1)
     throw new Error("Missing paper or independent review.");
   await runtime.finish("paused");
@@ -80,9 +88,7 @@ try {
   );
 } catch (error) {
   await runtime.finish(
-    !runtime.remainingMs || !runtime.remainingRequests
-      ? "budget_exhausted"
-      : "paused",
+    !runtime.remainingCostMicros ? "budget_exhausted" : "paused",
   );
   throw error;
 } finally {

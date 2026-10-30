@@ -134,6 +134,11 @@ test("a cancelled background task does not wake the agent afterwards", async () 
 test("aborting a research run stops its background work and leaves a resumable paused checkpoint", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "kest-research-stop-"));
   const state = newCompany("Stop and resume this study");
+  state.maxCostUsd = 10;
+  state.costRates[JSON.stringify(["fixture", "fixture"])] = {
+    input: 1,
+    output: 1,
+  };
   const controller = new AbortController();
   let directorCalls = 0;
   const server = Bun.serve({
@@ -164,7 +169,9 @@ test("aborting a research run stops its background work and leaves a resumable p
       if (directorCalls === 2) await Bun.sleep(400);
       return new Response(
         `data: ${JSON.stringify({ id: "fixture", object: "chat.completion.chunk", created: 1, model: "fixture", usage: { prompt_tokens: 10, completion_tokens: 1 }, choices: [{ index: 0, delta, finish_reason: directorCalls === 1 ? "tool_calls" : "stop" }] })}\n\ndata: [DONE]\n\n`,
-        { headers: { "Content-Type": "text/event-stream", Connection: "close" } },
+        {
+          headers: { "Content-Type": "text/event-stream", Connection: "close" },
+        },
       );
     },
   });
@@ -218,9 +225,9 @@ test("aborting a research run stops its background work and leaves a resumable p
         1,
       );
       expect(resumedState.requests).toBe(saved.requests + 1);
-      expect(
-        resumed.messages.some((m) => m.content === "Director reply"),
-      ).toBe(true);
+      expect(resumed.messages.some((m) => m.content === "Director reply")).toBe(
+        true,
+      );
     } finally {
       await resumed.browser.close();
     }

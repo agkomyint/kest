@@ -29,11 +29,11 @@ test("tab completes slash commands and child subcommands with cycling", async ()
     await testUI.renderOnce();
     const hintFrame = testUI.captureCharFrame();
     expect(hintFrame).toContain("/research budget");
-    expect(hintFrame).toContain("/research tokens");
+    expect(hintFrame).not.toContain("/research tokens");
 
     ui.composer.setText("/research b");
     tab();
-    expect(ui.composer.plainText).toBe("/research budget ");
+    expect(ui.composer.plainText).toBe("/research budget");
 
     ui.composer.setText("/research m");
     tab();
@@ -62,6 +62,12 @@ test("research commands configure models and budgets without starting paid work"
   };
   try {
     expect(await command("/research")).toContain("No research run");
+    expect(await command("/research show")).toContain("No saved research");
+    const startHelp = await command("/research start");
+    expect(startHelp).toContain("/research start <objective>");
+    expect(startHelp).toContain("/research budget 10$");
+    expect(startHelp).toContain("run /research start");
+    expect(ui["session"].research).toBeUndefined();
     expect(
       await command("/research model critic modal test-review-model"),
     ).toContain("saved");
@@ -76,6 +82,25 @@ test("research commands configure models and budgets without starting paid work"
     );
     await command("/goal Old unrelated goal");
     await command("/research prepare New indexing study");
+    const preparedStats = await command("/research show");
+    expect(preparedStats).toContain("prepared (not started)");
+    expect(preparedStats).toContain("New indexing study");
+    expect(preparedStats).toContain("Cost budget: not set");
+    expect(preparedStats).toContain("Requests: 0");
+    // A fresh UI has no active study, but can still inspect the saved session.
+    const reopenedRenderer = await createTestRenderer({ width: 130, height: 40 });
+    const reopened = new KestUI(reopenedRenderer.renderer, process.cwd(), null);
+    try {
+      await reopened["command"]("/research show");
+      const savedStats = reopened["session"].entries.at(-1)!.text;
+      expect(savedStats).toContain("New indexing study");
+      expect(savedStats).toContain("prepared (not started)");
+      expect(savedStats).toContain(`/resume ${ui["session"].id}`);
+      expect(reopened["session"].research).toBeUndefined();
+    } finally {
+      reopened.close();
+      await reopenedRenderer.dispose();
+    }
     expect(ui["session"].goal).toBe("New indexing study");
     expect(String(ui["agent"].messages[0]!.content)).not.toContain(
       "User goal:\nOld unrelated goal",
@@ -83,20 +108,38 @@ test("research commands configure models and budgets without starting paid work"
     const { newCompany } = await import("./research-company");
     ui["session"].research = newCompany("Test budget persistence");
     ui["agent"].research = ui["session"].research!;
-    await command("/research budget 60");
-    expect(ui["agent"].research?.maxMs).toBe(3600000);
-    expect(ui["agent"].research?.maxRequests).toBe(Number.MAX_SAFE_INTEGER);
-    await command("/research budget 120 32");
-    expect(ui["agent"].research?.maxAgents).toBe(32);
-    expect(ui["agent"].research?.maxMs).toBe(7200000);
-    await command("/research tokens 500b");
-    expect(ui["agent"].research?.maxTokens).toBe(500_000_000_000);
-    expect(await command("/research")).toContain("500,000,000,000");
-    ui["agent"].research!.inputTokens = 100;
-    expect(await command("/research tokens 99")).toContain("cannot be below");
-    expect(ui["agent"].research?.inputTokens).toBe(100);
-    await command("/research tokens off");
-    expect(ui["agent"].research?.maxTokens).toBeNull();
+    await command("/research budget 10$");
+    expect(ui["agent"].research?.maxCostUsd).toBe(10);
+    ui["agent"].research!.spentCostMicros = 3_000_000;
+    await command("/research budget $15");
+    expect(ui["agent"].research?.maxCostUsd).toBe(15);
+    expect(ui["agent"].research?.spentCostMicros).toBe(3_000_000);
+    expect(await command("/research budget 1$")).toContain("cannot be below");
+    expect(await command("/research budget 60")).toContain("Use a USD total");
+    expect(await command("/research tokens 10m")).toContain("USD budget now");
+    await command("/research prepare Prepared launch study");
+    await command("/research budget 10$");
+    const prepared = ui["session"].research!;
+    expect(prepared.status).toBe("ready");
+    ui["credentials"] = { provider: "baseten", apiKey: "not-used" };
+    const originalSubmit = ui["submit"].bind(ui);
+    const launched: string[] = [];
+    ui["submit"] = async () => { launched.push(ui.composer.plainText); };
+    try {
+      await ui["command"]("/research start");
+      expect(ui["session"].research).toBe(prepared);
+      expect(ui["agent"].research).toBe(prepared);
+      expect(prepared.maxCostUsd).toBe(10);
+      expect(launched[0]).toContain("Research objective: Prepared launch study");
+      prepared.status = "paused";
+      prepared.spentCostMicros = 100;
+      await ui["command"]("/research resume");
+      expect(ui["session"].research).toBe(prepared);
+      expect(prepared.spentCostMicros).toBe(100);
+      expect(launched).toHaveLength(2);
+    } finally {
+      ui["submit"] = originalSubmit;
+    }
     await command("/new");
     expect(ui["agent"].research).toBeNull();
   } finally {
@@ -347,6 +390,29 @@ test("/connect baseten prompts for the Baseten API key with masking", async () =
   }
 });
 
+test("/connect nebius prompts for the Nebius API key with masking", async () => {
+  const testUI = await createTestRenderer({ width: 90, height: 28 });
+  const ui = new KestUI(testUI.renderer, process.cwd(), null);
+  try {
+    ui.composer.setText("/connect nebius");
+    ui.composer.submit();
+    await ui.settled;
+    await testUI.mockInput.pasteBracketedText("nebius-key-123");
+    await testUI.renderOnce();
+    const frame = testUI.captureCharFrame();
+    expect(frame).toContain("Nebius Token Factory API key");
+    expect(frame).toContain("14 characters");
+    expect(frame).not.toContain("nebius-key-123");
+    testUI.mockInput.pressEscape();
+    await Bun.sleep(40); // Escape is ambiguous with terminal escape sequence prefixes.
+    await testUI.flush();
+    expect(ui.composer.visible).toBe(true);
+  } finally {
+    ui.close();
+    await testUI.dispose();
+  }
+});
+
 test("/model lists only models whose provider is connected", async () => {
   const testUI = await createTestRenderer({ width: 100, height: 30 });
   const ui = new KestUI(testUI.renderer, process.cwd(), {
@@ -361,6 +427,9 @@ test("/model lists only models whose provider is connected", async () => {
     const frame = testUI.captureCharFrame();
     expect(frame).toContain("Choose a model");
     expect(frame).toContain("baseten");
+    expect(frame).toContain("Input $1.25");
+    expect(frame).toContain("output $4.25 / 1M tokens (USD)");
+    expect(frame).toContain("Public reference; endpoint billing unverified");
     expect(frame).not.toContain("modal —");
     testUI.mockInput.pressEscape();
     await Bun.sleep(40); // Escape is ambiguous with terminal escape sequence prefixes.
@@ -508,6 +577,11 @@ test("/usage shows recorded per-model token totals", async () => {
       expect(frame).toContain("meta-models/muse-spark-open-1026");
       expect(frame).toContain("1,200");
       expect(frame).toContain("340");
+      const usageText = ui["session"].entries.at(-1)?.text ?? "";
+      expect(usageText).toContain(
+        "Input $1.25 · output $4.25 / 1M tokens (USD)",
+      );
+      expect(usageText).toContain("ESTIMATED TOTAL $0.0029 USD");
     } finally {
       ui.close();
       await testUI.dispose();
@@ -1146,9 +1220,7 @@ test("sequential tools across model rounds collapse into one group row", async (
         output: "ok",
       });
     }
-    const toolEntries = ui["session"].entries.filter(
-      (e) => e.role === "tool",
-    );
+    const toolEntries = ui["session"].entries.filter((e) => e.role === "tool");
     // 1 group head + 3 individual rows (rows hidden until head expands).
     expect(toolEntries).toHaveLength(4);
     expect(toolEntries[0]!.text).toContain("Tools (3)");
@@ -1210,11 +1282,14 @@ test("tool timing appears on rows and /stats aggregates all saved sessions", asy
       "3 calls · 1 errors · total 50.00 ms · avg 16.67 ms · max 28.00 ms",
     );
     expect(ui["session"].toolStats).toHaveLength(2);
-    ui.composer.setText("/stat");
+    ui.composer.setText("/stats");
     ui.composer.submit();
     await ui.settled;
     expect(ui["session"].entries.at(-1)?.text).toContain(
       "3 calls across saved sessions",
+    );
+    expect(ui["session"].entries.at(-1)?.text).not.toContain(
+      "Estimated model cost",
     );
     ui.composer.setText("/usage");
     ui.composer.submit();
@@ -1222,6 +1297,13 @@ test("tool timing appears on rows and /stats aggregates all saved sessions", asy
     expect(ui["session"].entries.at(-1)?.text).toContain(
       "2 sessions · 2 workspaces",
     );
+    expect(ui["session"].entries.at(-1)?.text).toContain(
+      "Estimated model cost",
+    );
+    ui.composer.setText("/stat");
+    ui.composer.submit();
+    await ui.settled;
+    expect(ui["session"].entries.at(-1)?.text).toBe("Unknown command. /help");
   } finally {
     ui.close();
     await testUI.dispose();

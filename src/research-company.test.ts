@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { Agent, systemPrompt } from "./agent";
 import {
   newCompany,
+  costKey,
   CompanyRuntime,
   recoverCompany,
   validateCompany,
@@ -40,6 +41,11 @@ test("manual summaries reserve persisted project budget and cannot bypass its li
   });
   const agent = new Agent(cwd, async () => false);
   agent.research = newCompany("Summary accounting");
+  agent.research.maxCostUsd = 1;
+  agent.research.costRates[costKey("fixture", "summary")] = {
+    input: 1,
+    output: 1,
+  };
   agent.connectionOverride = {
     provider: "fixture",
     baseURL: `http://127.0.0.1:${server.port}/v1`,
@@ -54,8 +60,9 @@ test("manual summaries reserve persisted project budget and cannot bypass its li
       () => {},
     );
     expect(agent.research.requests).toBe(1);
-    // Exhaust the time budget: the next summary must not start a request.
-    agent.research.elapsedMs = agent.research.maxMs;
+    // Exhaust the dollar allowance: the next summary must not dispatch.
+    agent.research.spentCostMicros = 1_000_000;
+    agent.research.costRevision++;
     await expect(
       agent.summarizeContext(
         "History",
@@ -71,7 +78,7 @@ test("manual summaries reserve persisted project budget and cannot bypass its li
   }
 });
 
-test("entering the last 10% of the time budget enters final review, even for long objectives", async () => {
+test("entering the final 20% of the dollar budget enters final review, even for long objectives", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "kest-company-final-review-"));
   let reviewerCalls = 0,
     reconciled = false;
@@ -113,8 +120,12 @@ test("entering the last 10% of the time budget enters final review, even for lon
   });
   const agent = new Agent(cwd, async () => false);
   agent.research = newCompany("Long research objective. ".repeat(150));
-  agent.research.maxMs = 60_000;
-  agent.research.elapsedMs = 55_000;
+  agent.research.maxCostUsd = 10;
+  agent.research.spentCostMicros = 8_100_000;
+  agent.research.costRates[costKey("fixture", "fixture")] = {
+    input: 1,
+    output: 1,
+  };
   agent.connectionOverride = {
     provider: "fixture",
     baseURL: `http://127.0.0.1:${server.port}/v1`,
@@ -167,15 +178,17 @@ test("company reservations enforce shared concurrency; requests are metered, not
   expect(peak).toBe(2);
   expect(() => runtime.addAgent(4)).toThrow("depth");
   state.agents = 11;
-  expect(() => runtime.addAgent(1)).toThrow("agent budget");
+  runtime.addAgent(1);
   runtime.addAgent(1, true);
-  expect(state.agents).toBe(12);
+  expect(state.agents).toBe(13);
 });
 
 test("research checkpoints recover consumed budget without renewal, and reject unsafe state", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "kest-company-state-"));
   try {
     const state = newCompany("Preserve evidence");
+    state.maxCostUsd = 1;
+    state.costRates[costKey("fixture", "model-a")] = { input: 1, output: 1 };
     const stale = structuredClone(state);
     const runtime = new CompanyRuntime(state, cwd);
     const release = await runtime.acquire(
@@ -183,6 +196,7 @@ test("research checkpoints recover consumed budget without renewal, and reject u
       "model-a",
       new AbortController().signal,
       { id: "worker-a", depth: 1 },
+      { input: 100, output: 100 },
     );
     release();
     await runtime.finish("paused");
@@ -224,12 +238,16 @@ test("company approvals serialize and expired or cancelled requests cannot dispa
   );
   expect(peak).toBe(1);
   const expired = newCompany("Expired");
-  expired.elapsedMs = expired.maxMs;
+  expired.maxCostUsd = 1;
+  expired.spentCostMicros = 1_000_000;
+  expired.costRates[costKey("fixture", "model")] = { input: 1, output: 1 };
   await expect(
     new CompanyRuntime(expired).acquire(
       "fixture",
       "model",
       new AbortController().signal,
+      undefined,
+      { input: 1, output: 1 },
     ),
   ).rejects.toThrow("budget");
   const controller = new AbortController();

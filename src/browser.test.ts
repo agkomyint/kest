@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { BrowserSession, browserRequest } from "./browser";
 import { WorkspaceTools } from "./tools";
 import { Agent } from "./agent";
+import { CompanyRuntime, newCompany } from "./research-company";
 
 const signal = () => new AbortController().signal;
 test("browser requests reject invalid actions, URLs, and target indices", () => {
@@ -205,6 +206,12 @@ test.skipIf(!hasChrome)(
       apiKey: "fixture",
       model: "director",
     };
+    // Research tools require an explicit company assignment; a plain chat turn
+    // deliberately does not expose research_team.
+    agent.useCompany(
+      new CompanyRuntime(newCompany("Browser research fixture")),
+      0,
+    );
     try {
       await agent.run(
         "Inspect evidence in parallel",

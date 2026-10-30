@@ -7,6 +7,7 @@ import {
   rm,
 } from "node:fs/promises";
 import { join } from "node:path";
+import { modelPricing } from "./config";
 import type { Approve, Approval } from "./tools";
 
 import companyInstructions from "../prompts/research-company.md" with { type: "text" };
@@ -24,10 +25,19 @@ export type CompanyState = {
   parallel: number;
   maxMs: number;
   elapsedMs: number;
-  status: "ready" | "running" | "paused" | "budget_exhausted";
+  status: "ready" | "running" | "paused" | "budget_exhausted" | "completed";
   cycles: number;
   reviews: number;
+  /** Legacy fields retained only for loading older sessions; never enforced. */
   maxTokens: number | null;
+  maxCostUsd: number | null;
+  spentCostMicros: number;
+  estimatedCostMicros: number;
+  costRevision: number;
+  untrackedCostRequests: number;
+  costRates: Record<string, { input: number; output: number }>;
+  fundingProposal?: string;
+  finalReportPath?: string;
   inputTokens: number;
   outputTokens: number;
   estimatedTokens: number;
@@ -41,9 +51,9 @@ export function newCompany(objective: string): CompanyState {
     requests: 0,
     agents: 0,
     // Deprecated: requests are counted for stats, never limited.
-    // Only token (maxTokens) and time (maxMs) budgets bind.
+    // Legacy request/time/token totals are retained only for old checkpoints.
     maxRequests: Number.MAX_SAFE_INTEGER,
-    maxAgents: 12,
+    maxAgents: Number.MAX_SAFE_INTEGER,
     maxDepth: 3,
     parallel: 3,
     maxMs: 30 * 60_000,
@@ -52,6 +62,12 @@ export function newCompany(objective: string): CompanyState {
     cycles: 0,
     reviews: 0,
     maxTokens: null,
+    maxCostUsd: null,
+    spentCostMicros: 0,
+    estimatedCostMicros: 0,
+    costRevision: 0,
+    untrackedCostRequests: 0,
+    costRates: {},
     inputTokens: 0,
     outputTokens: 0,
     estimatedTokens: 0,
@@ -59,20 +75,24 @@ export function newCompany(objective: string): CompanyState {
   };
 }
 export class ResearchBudgetError extends Error {}
+export class ResearchPricingError extends Error {}
 
-export function parseTokenBudget(value: string): number {
+export function parseCostBudget(value: string): number {
   const match = value
     .trim()
-    .replace(/[,_]/g, "")
-    .match(/^(\d+(?:\.\d+)?)\s*([kmbt]?)$/i);
-  const amount = match
-    ? Number(match[1]) *
-      ({ "": 1, k: 1e3, m: 1e6, b: 1e9, t: 1e12 }[match[2]!.toLowerCase()] ?? 1)
-    : NaN;
-  if (!Number.isSafeInteger(amount) || amount < 1)
-    throw new Error("Use a positive token total such as 500k, 10m or 500b.");
+    .match(/^(?:\$(\d+(?:\.\d{1,2})?)|(\d+(?:\.\d{1,2})?)\$)$/);
+  const amount = match ? Number(match[1] ?? match[2]) : NaN;
+  if (!Number.isFinite(amount) || amount < 0.01 || amount > 1_000_000)
+    throw new Error(
+      "Use a USD total such as /research budget 10$ (minimum $0.01).",
+    );
   return amount;
 }
+export const costKey = (provider: string, model: string) =>
+  JSON.stringify([provider, model]);
+export const formatUsd = (micros: number) =>
+  `$${(micros / 1_000_000).toFixed(4)}`;
+
 export function tokenReservation(data: unknown, output: number) {
   // Conservative preflight headroom, not a model-specific tokenizer. Provider
   // usage replaces this reservation after the request completes.
@@ -108,6 +128,13 @@ export function validateCompany(state: CompanyState): CompanyState {
       state.outputTokens === undefined ||
       state.estimatedTokens === undefined;
     state.untrackedRequests ??= legacyTokens ? state.requests : 0;
+    state.untrackedCostRequests ??=
+      state.spentCostMicros === undefined ? state.requests : 0;
+    state.maxCostUsd ??= null;
+    state.spentCostMicros ??= 0;
+    state.estimatedCostMicros ??= 0;
+    state.costRevision ??= 0;
+    state.costRates ??= {};
     state.maxTokens ??= null;
     state.inputTokens ??= 0;
     state.outputTokens ??= 0;
@@ -122,23 +149,46 @@ export function validateCompany(state: CompanyState): CompanyState {
     typeof state.objective !== "string" ||
     state.objective.length > 100000 ||
     !integer(state.maxRequests, 1, Number.MAX_SAFE_INTEGER) ||
-    !integer(state.requests, 0, 10000) ||
-    !integer(state.maxAgents, 1, 64) ||
-    !integer(state.agents, 0, 64) ||
+    !integer(state.requests, 0, Number.MAX_SAFE_INTEGER) ||
+    !integer(state.maxAgents, 1, Number.MAX_SAFE_INTEGER) ||
+    !integer(state.agents, 0, Number.MAX_SAFE_INTEGER) ||
     !integer(state.maxDepth, 1, 3) ||
     !integer(state.parallel, 1, 3) ||
     !integer(state.maxMs, 1000, 86400000) ||
     !Number.isFinite(state.elapsedMs) ||
     state.elapsedMs < 0 ||
-    !integer(state.cycles, 0, 10000) ||
-    !integer(state.reviews, 0, 64) ||
+    !integer(state.cycles, 0, Number.MAX_SAFE_INTEGER) ||
+    !integer(state.reviews, 0, Number.MAX_SAFE_INTEGER) ||
     (state.maxTokens !== null &&
       !integer(state.maxTokens, 1, Number.MAX_SAFE_INTEGER)) ||
     !integer(state.inputTokens, 0, Number.MAX_SAFE_INTEGER) ||
     !integer(state.outputTokens, 0, Number.MAX_SAFE_INTEGER) ||
     !integer(state.estimatedTokens, 0, Number.MAX_SAFE_INTEGER) ||
-    !integer(state.untrackedRequests, 0, 10000) ||
-    !["ready", "running", "paused", "budget_exhausted"].includes(state.status)
+    !integer(state.untrackedRequests, 0, Number.MAX_SAFE_INTEGER) ||
+    (state.maxCostUsd !== null &&
+      (!Number.isFinite(state.maxCostUsd) ||
+        state.maxCostUsd < 0.01 ||
+        state.maxCostUsd > 1_000_000)) ||
+    !integer(state.spentCostMicros, 0, Number.MAX_SAFE_INTEGER) ||
+    !integer(state.estimatedCostMicros, 0, Number.MAX_SAFE_INTEGER) ||
+    !integer(state.costRevision, 0, Number.MAX_SAFE_INTEGER) ||
+    !integer(state.untrackedCostRequests, 0, Number.MAX_SAFE_INTEGER) ||
+    !state.costRates ||
+    typeof state.costRates !== "object" ||
+    Array.isArray(state.costRates) ||
+    Object.values(state.costRates).some(
+      (rate) =>
+        !rate ||
+        typeof rate.input !== "number" ||
+        typeof rate.output !== "number" ||
+        !Number.isFinite(rate.input) ||
+        !Number.isFinite(rate.output) ||
+        rate.input < 0 ||
+        rate.output < 0,
+    ) ||
+    !["ready", "running", "paused", "budget_exhausted", "completed"].includes(
+      state.status,
+    )
   )
     throw new Error(
       "Invalid saved research state. Start a new research run instead of resuming it.",
@@ -165,8 +215,17 @@ export async function recoverCompany(cwd: string, state: CompanyState) {
       "outputTokens",
       "estimatedTokens",
       "untrackedRequests",
+      "untrackedCostRequests",
     ] as const)
       state[key] = Math.max(state[key], saved[key]);
+    // Reconciliation can reduce a reservation. Recover the ledger as one
+    // revision, rather than adding stale reservations to already settled costs.
+    if (saved.costRevision >= state.costRevision) {
+      state.spentCostMicros = saved.spentCostMicros;
+      state.estimatedCostMicros = saved.estimatedCostMicros;
+      state.costRevision = saved.costRevision;
+      state.costRates = { ...state.costRates, ...saved.costRates };
+    }
   } catch (error: any) {
     if (error.code !== "ENOENT") throw error;
   }
@@ -190,24 +249,26 @@ export class CompanyRuntime {
   snapshot(): CompanyState {
     return { ...this.state, elapsedMs: this.liveElapsedMs() };
   }
-  get remainingMs() {
+  get costLimited() {
+    return this.directory !== null || this.state.maxCostUsd !== null;
+  }
+  get usedCostMicros() {
+    return this.state.spentCostMicros + this.state.estimatedCostMicros;
+  }
+  get remainingCostMicros() {
+    if (!this.costLimited) return Infinity;
     return Math.max(
       0,
-      this.state.maxMs -
-        this.state.elapsedMs -
-        (performance.now() - this.started),
+      Math.round((this.state.maxCostUsd ?? 0) * 1_000_000) -
+        this.usedCostMicros,
     );
   }
-  get remainingRequests() {
-    return Infinity; // requests are metered, not limited
-  }
-  // Low when <10% of time or token budget remains (drives final-review).
   get budgetLow() {
-    const timeLow = this.remainingMs <= Math.max(60_000, this.state.maxMs * 0.1);
-    const tokenLow =
-      this.state.maxTokens !== null &&
-      this.remainingTokens <= this.state.maxTokens * 0.1;
-    return timeLow || tokenLow;
+    return (
+      this.costLimited &&
+      this.remainingCostMicros <=
+        Math.round((this.state.maxCostUsd ?? 0) * 1_000_000 * 0.2)
+    );
   }
   get usedTokens() {
     return (
@@ -216,18 +277,18 @@ export class CompanyRuntime {
       this.state.estimatedTokens
     );
   }
+  // Compatibility accessors for old integrations. Time/tokens/requests no longer bind.
+  get remainingMs() {
+    return Infinity;
+  }
   get remainingTokens() {
-    return this.state.maxTokens === null
-      ? Infinity
-      : Math.max(0, this.state.maxTokens - this.usedTokens);
+    return Infinity;
+  }
+  get remainingRequests() {
+    return Infinity;
   }
   get directorReserve() {
-    // Research workers must leave real room for implementation and experiments,
-    // in addition to the final review. Ordinary transient delegates retain the
-    // smaller reconciliation reserve.
-    return this.directory
-      ? Math.max(2, Math.min(30, Math.floor(this.state.maxRequests * 0.3)))
-      : 2;
+    return 0;
   }
   async approve(approve: Approve, request: Approval, signal: AbortSignal) {
     const previous = this.approvalTail;
@@ -275,8 +336,7 @@ export class CompanyRuntime {
   addAgent(depth: number, reviewer = false) {
     if (depth > this.state.maxDepth)
       throw new ResearchBudgetError("Research delegation depth reached.");
-    if (this.state.agents >= this.state.maxAgents - (reviewer ? 0 : 1))
-      throw new ResearchBudgetError("Research agent budget reached.");
+    // The director allocates paid work; depth and simultaneous calls remain bounded.
     this.state.agents++;
   }
   async acquire(
@@ -289,32 +349,58 @@ export class CompanyRuntime {
     const reserved = reservation.input + reservation.output;
     if (
       !Number.isSafeInteger(reserved) ||
+      !Number.isSafeInteger(reservation.input) ||
+      !Number.isSafeInteger(reservation.output) ||
       reserved < 0 ||
       reservation.input < 0 ||
       reservation.output < 0
     )
       throw new Error("Invalid token reservation.");
-    if (this.state.maxTokens !== null && !reserved)
-      throw new ResearchBudgetError(
-        "A token budget requires preflight input/output headroom.",
+    if (this.costLimited && this.state.maxCostUsd === null)
+      throw new ResearchPricingError(
+        "Set a research budget first: /research budget 10$",
       );
+    const key = costKey(provider, model);
+    let rate = this.state.costRates[key];
+    if (this.costLimited && !rate) {
+      const published =
+        provider === "custom" ? null : modelPricing(provider, model);
+      if (!published)
+        throw new ResearchPricingError(
+          `Input/output pricing is unknown for ${provider}/${model}; no paid request was dispatched. Select a model with configured pricing.`,
+        );
+      rate = {
+        input: published.inputUsdPerMillionTokens,
+        output: published.outputUsdPerMillionTokens,
+      };
+      this.state.costRates[key] = rate;
+    }
+    if (this.costLimited && !reserved)
+      throw new ResearchBudgetError(
+        "A cost budget requires preflight input/output headroom.",
+      );
+    const reserveCost = rate
+      ? Math.ceil(
+          reservation.input * rate.input + reservation.output * rate.output,
+        )
+      : 0;
+    // Workers leave 20% for director experiments and independent review.
+    const protectedCost =
+      this.costLimited && (agent?.depth ?? 0) > 0 && agent?.role !== "reviewer"
+        ? Math.round((this.state.maxCostUsd ?? 0) * 1_000_000 * 0.2)
+        : 0;
     while (
       this.inFlight >= this.state.parallel ||
-      (this.inFlight > 0 && reserved > this.remainingTokens)
+      (this.inFlight > 0 &&
+        reserveCost > this.remainingCostMicros - protectedCost)
     ) {
       signal.throwIfAborted();
-      if (!this.remainingMs)
-        throw new ResearchBudgetError("Research time budget reached.");
       await Bun.sleep(10);
     }
     signal.throwIfAborted();
-    if (!this.remainingMs)
+    if (reserveCost > this.remainingCostMicros - protectedCost)
       throw new ResearchBudgetError(
-        "Research time budget reached. Checkpoint the findings; no further model requests were started.",
-      );
-    if (reserved > this.remainingTokens)
-      throw new ResearchBudgetError(
-        `Research token budget cannot fit the next request (${reserved.toLocaleString("en-US")} tokens of conservative headroom required; ${this.remainingTokens.toLocaleString("en-US")} available). Existing artifacts are preserved.`,
+        `Research cost budget cannot fit the next request (${formatUsd(reserveCost)} reserved; ${formatUsd(this.remainingCostMicros)} available${protectedCost ? "; director/review reserve protected" : ""}). Existing artifacts are preserved.`,
       );
     // Reserve synchronously before any await so parallel workers cannot overspend.
     this.state.requests++;
@@ -322,6 +408,8 @@ export class CompanyRuntime {
     // Persist unresolved reservations before dispatch so a crash cannot reset
     // the token allowance of requests whose final usage was never observed.
     this.state.estimatedTokens += reserved;
+    this.state.estimatedCostMicros += reserveCost;
+    this.state.costRevision++;
     try {
       await this.record("model_request", {
         provider,
@@ -329,10 +417,14 @@ export class CompanyRuntime {
         request: this.state.requests,
         agent,
         reservation,
+        reservedCostMicros: reserveCost,
+        rate,
       });
     } catch (error) {
       this.inFlight--;
       this.state.estimatedTokens -= reserved;
+      this.state.estimatedCostMicros -= reserveCost;
+      this.state.costRevision++;
       throw error;
     }
     let released = false;
@@ -348,11 +440,39 @@ export class CompanyRuntime {
           usage.output >= 0
         ) {
           this.state.estimatedTokens -= reserved;
+          this.state.estimatedCostMicros -= reserveCost;
+          this.state.costRevision++;
+          this.state.spentCostMicros += rate
+            ? Math.ceil(usage.input * rate.input + usage.output * rate.output)
+            : 0;
           this.state.inputTokens += usage.input;
           this.state.outputTokens += usage.output;
         } // Otherwise retain the persisted estimate; missing usage is not free.
       }
     };
+  }
+  async saveFundingProposal(reason: string): Promise<string> {
+    this.state.status = "budget_exhausted";
+    const current = this.state.maxCostUsd ?? 0;
+    const additional = Math.max(1, Math.round(current * 0.5 * 100) / 100);
+    const proposed = Math.round((current + additional) * 100) / 100;
+    const text = `# Research funding proposal\n\nObjective: ${this.state.objective}\n\nStatus: incomplete. ${reason}\n\nRecorded cost: ${formatUsd(this.state.spentCostMicros)} USD; estimated/in-flight: ${formatUsd(this.state.estimatedCostMicros)}.\nEvidence: research/${this.state.id}/events.jsonl, state.json and agents/. Inspect saved experiment artifacts before accepting any findings.\n\nRequested additional allowance: $${additional.toFixed(2)} USD (proposed total $${proposed.toFixed(2)}). This is a provisional continuation allowance, not a prediction of completion.\n\nNext work: inspect the latest checkpoint and reviewer findings, identify unresolved evidence, estimate the required model calls, run justified follow-up experiments and obtain final independent review. The director should refine these tasks and their costs in funding-proposal.md while budget remains.\n\nWould you like to increase the allowance? Set /research budget ${proposed.toFixed(2)}$ then /research resume. No additional credit has been authorized.\n`;
+    // Keep a detailed director-authored proposal if it already exists.
+    if (this.directory) {
+      await mkdir(this.directory, { recursive: true });
+      const file = join(this.directory, "funding-proposal.md");
+      try {
+        await writeFile(file, text, { flag: "wx" });
+      } catch (error: any) {
+        if (error.code !== "EEXIST") throw error;
+      }
+    }
+    this.state.fundingProposal = text;
+    await this.record("funding_proposal", {
+      reason,
+      proposedTotalUsd: proposed,
+    });
+    return `Further funding requested. Inspect research/${this.state.id}/funding-proposal.md.\n${text}`;
   }
   async finish(status: CompanyState["status"]) {
     this.state.elapsedMs += performance.now() - this.started;
@@ -365,9 +485,6 @@ export function formatCompany(state?: CompanyState | null) {
   if (!state)
     return "No research run yet. /research start <objective> (or /research <objective>) starts a budgeted company workflow.";
   validateCompany(state);
-  const used = state.inputTokens + state.outputTokens + state.estimatedTokens;
-  let tokens = `Tokens: ${used.toLocaleString("en-US")}/${state.maxTokens === null ? "no token cap" : state.maxTokens.toLocaleString("en-US")} · input ${state.inputTokens.toLocaleString("en-US")} + output ${state.outputTokens.toLocaleString("en-US")} + estimated ${state.estimatedTokens.toLocaleString("en-US")} (pending/missing provider usage)`;
-  if (state.untrackedRequests)
-    tokens += `\n${state.untrackedRequests} earlier requests predate token accounting; their token usage is unknown and excluded.`;
-  return `Kest Research · ${state.status}\nObjective: ${state.objective}\n${tokens}\n${state.maxTokens === null ? "" : "Additional safeguards remain active:\n"}Requests: ${state.requests} (metered only — no request limit; token + time budgets bind)\nAgents: ${state.agents}/${state.maxAgents} · max depth ${state.maxDepth} · max parallel model calls ${state.parallel}\nIndependent reviews returned: ${state.reviews} (model reviews, not empirical certification)\nActive time: ${(state.elapsedMs / 60_000).toFixed(1)}/${(state.maxMs / 60_000).toFixed(1)} minutes · cycles ${state.cycles}\nArtifacts: research/${state.id}/\n/research resume · /research tokens <total|off> · /research budget <minutes> [total-agents] · /research models`;
+  const used = state.spentCostMicros + state.estimatedCostMicros;
+  return `Kest Research · ${state.status === "ready" ? "prepared (not started)" : state.status}\nObjective: ${state.objective}\nCost budget: ${state.maxCostUsd === null ? "not set — /research budget 10$" : `$${state.maxCostUsd.toFixed(2)} USD`}\nUsed: ${formatUsd(used)} · reported ${formatUsd(state.spentCostMicros)} + estimated/in-flight ${formatUsd(state.estimatedCostMicros)}\nRequests: ${state.requests} · delegates: ${state.agents} · reviews returned: ${state.reviews}\nModel rates are estimates; provider discounts/credits may differ.${state.untrackedCostRequests ? `\n${state.untrackedCostRequests} earlier requests have unknown costs, excluded from this allowance.` : ""}\nArtifacts: research/${state.id}/\n/research ${state.status === "ready" ? "start" : "resume"} · /research budget <total USD, e.g. 10$> · /research models`;
 }

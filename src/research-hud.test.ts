@@ -34,30 +34,20 @@ test("budgetBar shows fill and reserve", () => {
   expect(budgetBar(50, 100, 25)).toBe("▓▓▓▓░░··");
 });
 
-test("budgetHud is one line with time, tokens, requests", () => {
-  const s = newCompany("obj");
-  s.elapsedMs = 41 * 60000;
-  s.maxMs = 120 * 60000;
-  s.inputTokens = 100000;
-  s.outputTokens = 18000;
-  s.maxTokens = 400000;
-  s.requests = 63;
-  s.maxRequests = 300;
-  const hud = budgetHud(s);
-  expect(hud).not.toContain("\n");
-  expect(hud).toContain("41m/120m");
-  expect(hud).toContain("tok 118k/400k");
-  expect(hud).not.toContain("req");
-  expect(shouldOpenBudgetDecision(s)).toBe(false);
-  s.elapsedMs = 100 * 60000;
-  expect(shouldOpenBudgetDecision(s)).toBe(true);
-  expect(budgetHud(s)).toContain("budget watch");
+test("budgetHud shows only the dollar allowance and cost pressure", () => {
+  const state = newCompany("obj");
+  state.maxCostUsd = 10;
+  state.spentCostMicros = 3_000_000;
+  state.estimatedCostMicros = 500_000;
+  expect(budgetHud(state)).toContain("$3.5000/$10.00");
+  expect(budgetHud(state)).not.toContain("tok");
+  expect(budgetHud(state)).not.toContain("⏱");
+  expect(shouldOpenBudgetDecision(state)).toBe(false);
+  state.spentCostMicros = 8_000_000;
+  expect(shouldOpenBudgetDecision(state)).toBe(true);
+  expect(budgetHud(state)).toContain("budget watch");
 });
 
-test("budgetHud ticks with live elapsed override", () => {
-  const s = newCompany("obj");
-  s.maxMs = 120 * 60000;
-  expect(budgetHud(s, 65 * 60000)).toContain("65m/120m");
-  s.inputTokens = 5000;
-  expect(budgetHud(s, 0)).toContain("tok 5.0k/∞");
+test("unconfigured studies show a dollar budget setup hint", () => {
+  expect(budgetHud(newCompany("obj"))).toContain("/research budget 10$");
 });

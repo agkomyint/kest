@@ -7,7 +7,6 @@ export const slashCommands = [
   "/agents",
   "/usage",
   "/stats",
-  "/stat",
   "/permission",
   "/browser",
   "/goal",
@@ -27,17 +26,17 @@ export type SlashCommand = (typeof slashCommands)[number];
 export const slashSubcommands: Record<string, string[]> = {
   "/research": [
     "start",
+    "show",
     "prepare",
     "resume",
     "budget",
-    "tokens",
     "models",
     "model",
     "endpoint",
     "off",
   ],
   "/context": ["summary", "messages", "archive", "show", "archived", "compact"],
-  "/connect": ["modal", "baseten"],
+  "/connect": ["modal", "baseten", "nebius"],
   "/permission": ["all", "minimal", "strict"],
   "/browser": ["open", "tabs", "close"],
   "/goal": ["clear"],
@@ -72,19 +71,10 @@ export function completeCandidates(input: string): string[] {
     if (frag === "") return subs.map((s) => `${cmd} ${s}`);
     return subs.filter((s) => s.startsWith(frag)).map((s) => `${cmd} ${s}`);
   }
-  if (parts.length === 3) {
-    const [cmd, sub, frag] = parts as [string, string, string];
-    if (cmd === "/research" && sub === "budget") {
-      if (frag === "") return [`${cmd} ${sub} tokens`];
-      if ("tokens".startsWith(frag)) return [`${cmd} ${sub} tokens`];
-    }
-    return [];
-  }
   return [];
 }
 
 export function completionHasChildren(candidate: string): boolean {
   if (slashSubcommands[candidate]?.length) return true;
-  if (candidate === "/research budget") return true;
   return false;
 }

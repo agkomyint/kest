@@ -39,41 +39,22 @@ export function budgetBar(used: number, total: number, reserve = 0): string {
   );
 }
 
-const compact = (n: number) =>
-  n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : `${n}`;
-
-// One-line HUD: only the two binding budgets — time and tokens.
-// Requests are metered (shown in /research), never limited.
-// liveElapsedMs lets the UI tick the clock between budget syncs.
-export function budgetHud(state: CompanyState, liveElapsedMs?: number): string {
-  const elapsed = liveElapsedMs ?? state.elapsedMs;
-  const usedTokens =
-    state.inputTokens + state.outputTokens + state.estimatedTokens;
-  const time = `⏱ ${formatDuration(elapsed)}/${formatDuration(state.maxMs)} ${budgetBar(elapsed, state.maxMs)}`;
-  const tokens =
-    state.maxTokens === null
-      ? `tok ${compact(usedTokens)}/∞`
-      : `tok ${compact(usedTokens)}/${compact(state.maxTokens)} ${budgetBar(usedTokens, state.maxTokens)}`;
-  const levels = [
-    budgetLevel(elapsed, state.maxMs),
-    ...(state.maxTokens === null
-      ? []
-      : [budgetLevel(usedTokens, state.maxTokens)]),
-  ];
-  const worst = levels.includes("critical")
-    ? "critical"
-    : levels.includes("watch")
-      ? "watch"
-      : "healthy";
-  return `${time} · ${tokens}${worst !== "healthy" ? ` · budget ${worst}` : ""}`;
+export function budgetHud(
+  state: CompanyState,
+  _legacyElapsedMs?: number,
+): string {
+  if (state.maxCostUsd === null)
+    return "Research budget not set · /research budget 10$";
+  const used = (state.spentCostMicros + state.estimatedCostMicros) / 1_000_000;
+  const level = budgetLevel(used, state.maxCostUsd);
+  return `USD $${used.toFixed(4)}/$${state.maxCostUsd.toFixed(2)} ${budgetBar(used, state.maxCostUsd)}${level === "healthy" ? "" : ` · budget ${level}`}`;
 }
-
 export function shouldOpenBudgetDecision(state: CompanyState): boolean {
-  const usedTokens =
-    state.inputTokens + state.outputTokens + state.estimatedTokens;
   return (
-    budgetLevel(state.elapsedMs, state.maxMs) !== "healthy" ||
-    (state.maxTokens !== null &&
-      budgetLevel(usedTokens, state.maxTokens) !== "healthy")
+    state.maxCostUsd === null ||
+    budgetLevel(
+      (state.spentCostMicros + state.estimatedCostMicros) / 1_000_000,
+      state.maxCostUsd,
+    ) !== "healthy"
   );
 }
