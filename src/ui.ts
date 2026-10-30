@@ -601,6 +601,8 @@ export class KestUI {
         this.info(
           error instanceof Error ? clean(error.message) : "Action failed.",
         );
+      this.status.content = this.active?.signal.aborted ? "Paused · progress saved" : "Stopped · see error above";
+      this.status.fg = theme.error;
     } finally {
       this.stopLoading();
       this.pendingText = "";
@@ -1989,6 +1991,11 @@ export class KestUI {
       this.flushResponse();
       this.status.content = `Landed · ${((performance.now() - start) / 1000).toFixed(1)}s`;
     } catch (error) {
+      this.stopLoading();
+      this.status.content = this.active?.signal.aborted
+        ? "Paused · progress saved"
+        : "Stopped · see error above";
+      this.status.fg = theme.error;
       if (this.active?.signal.aborted) this.info(this.stoppedMessage());
       else if (error instanceof OpenAI.APIError)
         this.info(

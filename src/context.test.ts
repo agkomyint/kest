@@ -93,6 +93,27 @@ test("long single-turn work compacts only complete tool batches and preserves it
   assertCompleteGroups(result);
   assertCompleteGroups(state.archive);
 });
+test("oversized final completed tool batch can be archived without an extra model reply", () => {
+  const messages: Message[] = [
+    { role: "system", content: "Keep evidence." },
+    { role: "user", content: "Continue this research." },
+    { role: "assistant", content: null, tool_calls: ["read", "search"].map(id => ({
+      id, type: "function" as const, function: { name: "read_file", arguments: "{}" },
+    })) },
+    { role: "tool", tool_call_id: "read", content: "log entry ".repeat(4000) },
+    { role: "tool", tool_call_id: "search", content: "search result ".repeat(3000) },
+  ];
+  const state = newContext();
+  const plan = planCompaction(messages, [], state)!;
+  expect(plan).not.toBeNull();
+  const compacted = commitCompaction(plan, "Logs inspected; original evidence is archived. Continue reviewing the study.", [], state);
+  expect(compacted.at(-1)).toEqual(messages[1]);
+  expect(compacted.some(m => m.role === "tool")).toBe(false);
+  expect(contextReport(compacted, [], state).input + 4096).toBeLessThan(contextReport(compacted, [], state).budget);
+  assertCompleteGroups(state.archive);
+  expect(state.archive).toHaveLength(3);
+});
+
 test("short history stays untouched; invalid summaries cannot discard history", () => {
   const short: Message[] = [{ role: "user", content: "Hello" }];
   expect(planCompaction(short, [], newContext(), true)).toBeNull();

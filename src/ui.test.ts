@@ -210,6 +210,26 @@ test("research budget restores a paused funded study after restart and rejects a
   }
 });
 
+test("failed turns clear summarizing status and leave no loading timer", async () => {
+  const testUI = await createTestRenderer({ width: 100, height: 30 });
+  const ui = new KestUI(testUI.renderer, process.cwd(), { provider: "baseten", apiKey: "not-used" });
+  try {
+    ui["agent"].run = async (_text, _credentials, _signal, emit) => {
+      emit({ type: "status", text: "Summarizing context · 18s · Esc to cancel" });
+      throw new Error("Context exceeds the local budget");
+    };
+    ui.composer.setText("Continue");
+    await ui["submit"]();
+    expect(ui["loadingTimer"]).toBeNull();
+    expect(ui["status"].plainText).toBe("Stopped · see error above");
+    expect(ui["active"]).toBeNull();
+    expect(ui["session"].entries.at(-1)?.text).toContain("Context exceeds");
+  } finally {
+    ui.close();
+    await testUI.dispose();
+  }
+});
+
 test("/context inspects active messages without a provider and does not add model context", async () => {
   const testUI = await createTestRenderer({ width: 125, height: 40 });
   const ui = new KestUI(testUI.renderer, process.cwd(), null);

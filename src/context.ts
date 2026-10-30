@@ -135,7 +135,8 @@ export function planCompaction(
       report.trigger * 0.7
   ) {
     const eligible = cuts.filter(
-      (i) => i > starts.at(-1)! && i < history.length,
+      (i) => i > starts.at(-1)! &&
+        (i < history.length || history.at(-1)?.role === "tool"),
     );
     const target = Math.floor(history.length * 0.65);
     cut = eligible.find((i) => i >= target) ?? eligible.at(-1) ?? cut;
