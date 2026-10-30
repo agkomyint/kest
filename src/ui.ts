@@ -458,6 +458,37 @@ export class KestUI {
     return agent;
   }
 
+  private openSession(session: Session) {
+    this.session = session;
+    this.agent = this.makeAgent(session.messages, session.goal, session.context);
+    session.context = this.agent.context;
+    this.agent.tasks = session.tasks.map((task) => ({ ...task }));
+    this.clearView();
+    for (const entry of session.entries.slice(-180)) this.display(entry);
+    this.ready();
+  }
+
+  private async restoreResearch() {
+    if (this.session.research) return true;
+    const studies = new Map<string, Session>();
+    for (const saved of await listSessions(this.cwd)) {
+      if (saved.research && saved.research.status !== "completed" && !studies.has(saved.research.id))
+        studies.set(saved.research.id, saved);
+    }
+    if (studies.size > 1) {
+      this.info("Multiple saved research studies. Use /research show, then /resume <session-id> to choose before updating a budget or continuing.");
+      return false;
+    }
+    const saved = studies.values().next().value;
+    if (saved) {
+      await recoverCompany(this.cwd, saved.research!);
+      if (saved.research!.status === "running") saved.research!.status = "paused";
+      this.openSession(saved);
+      this.info(`Restored saved research: ${saved.research!.objective}. Progress and spending preserved.`);
+    }
+    return true;
+  }
+
   // Ctrl+C / Esc: stop the active turn and any background work with it.
   // During a research run this is a PAUSE: state flips to paused, the
   // session is saved, and a decision sheet opens once the turn unwinds.
@@ -2043,6 +2074,8 @@ export class KestUI {
     }
     if (command === "/research") {
       const [action, ...parts] = value.split(/\s+/);
+      if ((action === "budget" || action === "resume" || (action === "start" && !parts.length)) &&
+          !(await this.restoreResearch())) return;
       if (action === "show") {
         const sessions = await listSessions(this.cwd);
         const studies = [
@@ -2525,17 +2558,7 @@ export class KestUI {
         this.info("Session not found or ID is ambiguous. Use /sessions.");
         return;
       }
-      this.session = matches[0]!;
-      this.agent = this.makeAgent(
-        this.session.messages,
-        this.session.goal,
-        this.session.context,
-      );
-      this.session.context = this.agent.context;
-      this.agent.tasks = this.session.tasks.map((t) => ({ ...t }));
-      this.clearView();
-      for (const entry of this.session.entries.slice(-180)) this.display(entry);
-      this.ready();
+      this.openSession(matches[0]!);
       return;
     }
     if (command === "/new" || command === "/system") {

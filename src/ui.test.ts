@@ -97,6 +97,13 @@ test("research commands configure models and budgets without starting paid work"
       expect(savedStats).toContain("prepared (not started)");
       expect(savedStats).toContain(`/resume ${ui["session"].id}`);
       expect(reopened["session"].research).toBeUndefined();
+      const savedId = ui["session"].research!.id;
+      await reopened["command"]("/research budget 12$");
+      expect(reopened["session"].id).toBe(ui["session"].id);
+      expect(reopened["session"].research?.id).toBe(savedId);
+      expect(reopened["session"].research?.objective).toBe("New indexing study");
+      expect(reopened["agent"].research?.maxCostUsd).toBe(12);
+      expect(reopened["agent"].research?.status).toBe("ready");
     } finally {
       reopened.close();
       await reopenedRenderer.dispose();
@@ -145,6 +152,58 @@ test("research commands configure models and budgets without starting paid work"
   } finally {
     ui.close();
     await testUI.dispose();
+    if (previous === undefined) delete process.env.KEST_CONFIG_DIR;
+    else process.env.KEST_CONFIG_DIR = previous;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("research budget restores a paused funded study after restart and rejects ambiguous selection", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "kest-restart-"));
+  const previous = process.env.KEST_CONFIG_DIR;
+  process.env.KEST_CONFIG_DIR = directory;
+  const { saveSession, listSessions } = await import("./sessions");
+  const firstRenderer = await createTestRenderer({ width: 100, height: 30 });
+  const first = new KestUI(firstRenderer.renderer, directory, null);
+  let studyId: string;
+  try {
+    await first["command"]("/research prepare Continue a saved proposal");
+    const study = first["session"].research!;
+    studyId = study.id;
+    study.status = "budget_exhausted";
+    study.maxCostUsd = 5;
+    study.spentCostMicros = 4_500_000;
+    study.estimatedCostMicros = 100_000;
+    study.requests = 8;
+    await saveSession(first["session"]);
+  } finally {
+    first.close();
+    await firstRenderer.dispose();
+  }
+  const secondRenderer = await createTestRenderer({ width: 100, height: 30 });
+  const second = new KestUI(secondRenderer.renderer, directory, null);
+  try {
+    await second["command"]("/research budget 10$");
+    const study = second["agent"].research!;
+    expect(study.id).toBe(studyId!);
+    expect(study.maxCostUsd).toBe(10);
+    expect(study.spentCostMicros).toBe(4_500_000);
+    expect(study.estimatedCostMicros).toBe(100_000);
+    expect(study.requests).toBe(8);
+    expect(study.status).toBe("paused");
+    expect((await listSessions(directory)).find(s => s.research?.id === studyId)?.research?.maxCostUsd).toBe(10);
+    const { newSession } = await import("./sessions");
+    const { newCompany } = await import("./research-company");
+    const another = newSession(directory, []);
+    another.research = newCompany("Another study");
+    await saveSession(another);
+    await second["command"]("/new");
+    await second["command"]("/research budget 20$");
+    expect(second["session"].research).toBeUndefined();
+    expect(second["session"].entries.at(-1)?.text).toContain("Multiple saved research studies");
+  } finally {
+    second.close();
+    await secondRenderer.dispose();
     if (previous === undefined) delete process.env.KEST_CONFIG_DIR;
     else process.env.KEST_CONFIG_DIR = previous;
     await rm(directory, { recursive: true, force: true });
