@@ -1,4 +1,7 @@
 import { responseText } from "./response-text";
+import { tipsFor, type Tip } from "./tips";
+import { tavilyKey, saveTavilyKey, tavilyConnectionMessage } from "./tavily";
+import { lsiKey, saveLsiKey, lsiConnectionMessage, lsiBaseUrl } from "./lsi";
 import { BrowserSession, browserRequest } from "./browser";
 import {
   toolPanel,
@@ -64,6 +67,9 @@ import {
   type Entry,
   type Session,
 } from "./sessions";
+import { Room, RoomManager, companyBar, statusSymbol, studySpentUsd } from "./rooms";
+import { loadCompanyLimits, saveCompanyLimits } from "./company-settings";
+import { formatStudyTab, loadStudyArtifacts, studyTabs, type StudyTab } from "./study-view";
 import {
   formatUsage,
   formatModelCosts,
@@ -92,6 +98,10 @@ import {
   completeCandidates,
   completionHasChildren,
   longestCommonPrefix,
+  describeCandidate,
+  argumentHint,
+  suggestCommand,
+  setStudyHints,
 } from "./complete";
 import {
   budgetHud,
@@ -147,6 +157,25 @@ type ToolView = {
   lastOutput?: string;
 };
 
+/** Wrap up: stop new experiments, review, report, then publish to LSI if connected. */
+// Commands that only read, so they are safe while a study is running.
+const runningSafeCommand =
+  /^\/(chat|rooms|help|status|usage|stats|tasks|agents|tools|permission)(\s|$)|^\/research\s+(show|open)(\s|$)/;
+
+/** Fastest path: the study is done, so publish its saved report in one tool call. */
+function publishPrompt(study: { id: string; finalReportPath?: string }, domain: string) {
+  return `Publish this completed study to LSI now, in as few steps as possible. Read ${study.finalReportPath ?? `research/${study.id}/`} once, then ${domain ? `use domain "${domain}"` : "call lsi_domains and pick the best domain id"}, and call lsi_publish a single time. Summarize the report into the URS: findings as short strings, honest limitations, conclusion, method. For evidence use inline text excerpts (key result tables, numbers, review verdicts copied from research/${study.id}/ files, up to 6000 chars each) when nothing is hosted publicly, or uri for real public links; never invent links. If you claimed an LSI question set answers_question. Add provenance {tool: "kest"}. Then reply with the LSI id and stop. Do not run new experiments.`;
+}
+
+function wrapupPrompt() {
+  return (
+    "Wrap up now: stop new experiments, run independent review of existing evidence, and write the final report with limitations and the evidence chain. Then call research_complete." +
+    (lsiKey()
+      ? " After it succeeds, publish the reviewed findings to LSI with lsi_publish: a short URS summarizing the report, evidence as links (repository evidence needs a full commit), honest limitations, and answers_question if you claimed a question. If publishing fails, report the error instead of retrying blindly."
+      : "")
+  );
+}
+
 export class KestUI {
   readonly composer: TextareaRenderable;
   readonly scroll: ScrollBoxRenderable;
@@ -154,6 +183,16 @@ export class KestUI {
   private footer: TextRenderable;
   private secretText: TextRenderable;
   private hints: TextRenderable;
+  private roomBar: TextRenderable;
+  private tipRow: BoxRenderable;
+  private tipText: TextRenderable;
+  private tipPrevious: TextRenderable;
+  private tipNext: TextRenderable;
+  private tipCounter: TextRenderable;
+  private availableTips: Tip[] = [];
+  private tipIndex = 0;
+  private tipContextKey = "";
+  private tipsBlockedByError = false;
   private activity: TextRenderable;
   private unseenActivity = false;
   private promptBox: BoxRenderable;
@@ -166,10 +205,32 @@ export class KestUI {
   private keychain: Partial<Record<Provider, ProviderKeys>> = {};
   private connectKeyName: string | null = null;
   private selectedModel: string | null = null;
-  private session: Session;
-  private agent: Agent;
+  // Rooms: the chat plus one room per research study. These accessors always
+  // mean the focused room, so single-room code paths keep working unchanged.
+  private rooms = new RoomManager();
+  private agentRooms = new WeakMap<Agent, Room>();
   private browser = new BrowserSession();
-  private active: AbortController | null = null;
+  private get session(): Session {
+    // Undefined only while the constructor is still creating the chat room.
+    return this.rooms.focused?.session as Session;
+  }
+  private set session(value: Session) {
+    this.rooms.focused!.session = value;
+  }
+  private get agent(): Agent {
+    return this.rooms.focused!.agent;
+  }
+  private set agent(value: Agent) {
+    const room = this.rooms.focused!;
+    room.agent = value;
+    this.agentRooms.set(value, room);
+  }
+  private get active(): AbortController | null {
+    return this.rooms.focused?.controller ?? null;
+  }
+  private set active(value: AbortController | null) {
+    this.rooms.focused!.controller = value;
+  }
   private pendingText = "";
   private toolNode: TextRenderable | null = null;
   private toolEntry: Entry | null = null;
@@ -231,6 +292,7 @@ export class KestUI {
     candidates: string[];
     index: number;
   } | null = null;
+  private menu: { items: string[]; index: number; touched: boolean; value: string } | null = null;
   private closed = false;
   settled: Promise<void> = Promise.resolve();
   private inputHistory: string[] = [];
@@ -260,9 +322,18 @@ export class KestUI {
         active: "a",
       };
     }
-    this.agent = this.makeAgent();
-    this.session = newSession(cwd, this.agent.messages);
-    this.session.context = this.agent.context;
+    const chatAgent = this.makeAgent();
+    const chatSession = newSession(cwd, chatAgent.messages);
+    chatSession.context = chatAgent.context;
+    const chat = new Room(
+      "chat",
+      "chat",
+      chatSession,
+      chatAgent,
+      this.browser,
+    );
+    this.rooms.add(chat);
+    this.agentRooms.set(chatAgent, chat);
     this.style = SyntaxStyle.fromStyles(
       {
         default: { fg: theme.fg },
@@ -310,6 +381,14 @@ export class KestUI {
       fg: theme.accent,
       height: 1,
       flexShrink: 0,
+    });
+    this.roomBar = new TextRenderable(renderer, {
+      content: "",
+      visible: false,
+      fg: theme.muted,
+      height: 1,
+      flexShrink: 0,
+      wrapMode: "none",
     });
     this.promptBox = new BoxRenderable(renderer, {
       border: false,
@@ -366,6 +445,52 @@ export class KestUI {
     this.promptBox.add(this.promptMark);
     this.promptBox.add(this.composer);
     this.promptBox.add(this.secretText);
+    this.tipRow = new BoxRenderable(renderer, {
+      width: "100%",
+      height: 1,
+      flexShrink: 0,
+      flexDirection: "row",
+    });
+    const arrow = (content: string, direction: number) =>
+      new TextRenderable(renderer, {
+        content,
+        width: 3,
+        height: 1,
+        flexShrink: 0,
+        fg: theme.muted,
+        textAlign: "center",
+        selectable: false,
+        onMouseDown: (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          this.changeTip(direction);
+        },
+      });
+    this.tipPrevious = arrow("‹", -1);
+    this.tipNext = arrow("›", 1);
+    this.tipText = new TextRenderable(renderer, {
+      content: "",
+      flexGrow: 1,
+      flexShrink: 1,
+      minWidth: 0,
+      height: "100%",
+      fg: theme.muted,
+      wrapMode: "word",
+      selectable: false,
+    });
+    this.tipCounter = new TextRenderable(renderer, {
+      content: "",
+      width: 7,
+      height: 1,
+      flexShrink: 0,
+      textAlign: "right",
+      fg: theme.muted,
+      selectable: false,
+    });
+    this.tipRow.add(this.tipPrevious);
+    this.tipRow.add(this.tipText);
+    this.tipRow.add(this.tipNext);
+    this.tipRow.add(this.tipCounter);
     this.footer = new TextRenderable(renderer, {
       content: cwd,
       fg: theme.muted,
@@ -392,7 +517,9 @@ export class KestUI {
     root.add(this.activity);
     root.add(this.status);
     root.add(this.hints);
+    root.add(this.roomBar);
     root.add(this.modelTag);
+    root.add(this.tipRow);
     root.add(this.promptBox);
     root.add(this.footer);
     renderer.root.add(root);
@@ -430,8 +557,7 @@ export class KestUI {
     });
     renderer.on("destroy", () => {
       this.closed = true;
-      this.active?.abort();
-      this.agent.cancelBackground();
+      this.stopAllRooms();
       this.approval?.finish(false);
       this.stopLoading();
       void this.clipboard?.dispose().catch(() => {});
@@ -445,13 +571,14 @@ export class KestUI {
     messages?: Session["messages"],
     goal: string | null = null,
     context?: ContextState,
+    browser?: BrowserSession,
   ) {
-    const agent = new Agent(
+    const agent: Agent = new Agent(
       this.cwd,
-      (request, signal) => this.ask(request, signal),
+      (request, signal) => this.askFor(agent, request, signal),
       messages,
       goal,
-      this.browser,
+      browser ?? this.rooms.focused?.browser ?? this.browser,
       context,
     );
     agent.modelOverride = this.effectiveModel();
@@ -460,7 +587,8 @@ export class KestUI {
         ? null
         : (this.session?.research ?? null);
     agent.onBackground = () => {
-      void this.wakeFromBackground();
+      const room = this.agentRooms.get(agent);
+      if (room) void this.wakeFromBackground(room);
     };
     return agent;
   }
@@ -474,6 +602,11 @@ export class KestUI {
     );
     session.context = this.agent.context;
     this.agent.tasks = session.tasks.map((task) => ({ ...task }));
+    this.renderEntries(session);
+    this.ready();
+  }
+
+  private renderEntries(session: Session) {
     this.clearView();
     let legacyGroup: string | undefined;
     for (const entry of session.entries.slice(-180)) {
@@ -491,26 +624,45 @@ export class KestUI {
         entry.parentActivityGroup = legacyGroup;
       this.display(entry);
     }
-    this.ready();
   }
 
   private async prepareResearch(objective: string) {
-    // Each study owns a session: preserve the previous study and start with
-    // fresh model context instead of mixing unrelated experiments and goals.
-    await saveSession(this.session);
-    this.session = newSession(this.cwd, []);
-    this.session.research = newCompany(objective);
-    this.session.goal = objective;
-    this.session.title = objective.slice(0, 70);
-    this.agent = this.makeAgent(undefined, objective);
-    this.session.messages = this.agent.messages;
-    this.session.context = this.agent.context;
-    this.clearView();
-    await saveSession(this.session);
-    this.ready();
+    // Each study is its own room with a fresh session, agent and browser. The
+    // chat and any other studies keep their state (and keep running).
+    const session = newSession(this.cwd, []);
+    session.research = newCompany(objective);
+    session.goal = objective;
+    session.title = objective.slice(0, 70);
+    await saveSession(session);
+    return this.openStudy(session);
+  }
+
+  /** Open a study session as a room (or focus its room) and make it current. */
+  private openStudy(session: Session): Room | null {
+    const room = this.rooms.get(session.id) ?? this.addStudyRoom(session);
+    return this.focusRoom(room) ? room : null;
+  }
+
+  /** Add saved, unfinished studies as paused rooms. Idempotent. */
+  private async loadSavedStudies(): Promise<Room[]> {
+    const added: Room[] = [];
+    const seen = new Set(this.rooms.studies().map((room) => room.study?.id));
+    for (const saved of await listSessions(this.cwd)) {
+      const study = saved.research;
+      if (!study || study.status === "completed" || seen.has(study.id)) continue;
+      if (this.rooms.get(saved.id)) continue;
+      seen.add(study.id);
+      await recoverCompany(this.cwd, study);
+      if (study.status === "running") study.status = "paused";
+      added.push(this.addStudyRoom(saved));
+      if (this.rooms.studies().length >= 8) break;
+    }
+    return added;
   }
 
   async showSavedResearchHint() {
+    Object.assign(this.rooms.limits, await loadCompanyLimits());
+    await this.loadSavedStudies();
     const saved = (await listSessions(this.cwd)).filter(
       (session) => session.research,
     );
@@ -531,32 +683,23 @@ export class KestUI {
   }
 
   private async restoreResearch() {
-    if (this.session.research) return true;
-    const studies = new Map<string, Session>();
-    for (const saved of await listSessions(this.cwd)) {
-      if (
-        saved.research &&
-        saved.research.status !== "completed" &&
-        !studies.has(saved.research.id)
-      )
-        studies.set(saved.research.id, saved);
-    }
-    if (studies.size > 1) {
+    if (this.rooms.focused?.kind === "study") return true;
+    await this.loadSavedStudies();
+    const open = this.rooms
+      .studies()
+      .filter((room) => room.study?.status !== "completed");
+    if (open.length > 1) {
       this.info(
-        "Multiple saved research studies. Use /research show, then /resume <session-id> to choose before updating a budget or continuing.",
+        "Multiple saved research studies. Use /research show, or Ctrl+K to switch rooms, before updating a budget or continuing.",
       );
       return false;
     }
-    const saved = studies.values().next().value;
-    if (saved) {
-      await recoverCompany(this.cwd, saved.research!);
-      if (saved.research!.status === "running")
-        saved.research!.status = "paused";
-      this.openSession(saved);
-      this.info(
-        `Restored saved research: ${saved.research!.objective}. Progress and spending preserved.`,
-      );
-    }
+    const room = open[0];
+    if (!room) return true;
+    if (!this.focusRoom(room)) return false;
+    this.info(
+      `Restored saved research: ${room.study!.objective}. Progress and spending preserved.`,
+    );
     return true;
   }
 
@@ -638,7 +781,7 @@ export class KestUI {
         void saveSession(this.session).catch(() => {});
         this.composer.setText(
           value === "wrapup"
-            ? "Wrap up now: stop new experiments, run independent review of existing evidence, and write the final report with limitations and the evidence chain."
+            ? wrapupPrompt()
             : "Resume the research from the last checkpoint. Continue within budget; do not repeat completed work.",
         );
         this.settled = this.submit();
@@ -649,61 +792,266 @@ export class KestUI {
   // A finished background task wakes the agent in its own turn. If a turn
   // is already active, the wake-up stays queued and is drained at the head
   // of the next turn instead.
-  private async wakeFromBackground() {
+  private async wakeFromBackground(room: Room = this.rooms.focused!) {
     if (
       this.closed ||
-      this.active ||
-      this.connectStep ||
-      this.listPicker ||
-      (this.agent.research &&
+      room.controller ||
+      (this.rooms.focused === room && (this.connectStep || this.listPicker)) ||
+      (room.agent.research &&
         ["budget_exhausted", "completed"].includes(
-          this.agent.research.status,
+          room.agent.research.status,
         )) ||
       !this.credentials
     )
       return;
-    const wakes = this.agent.takeBackgroundWakeups();
+    const wakes = room.agent.takeBackgroundWakeups();
     if (!wakes.length) return;
-    this.info("Background result arrived · waking the agent to review it.");
-    this.active = new AbortController();
+    const note = "Background result arrived · waking the agent to review it.";
+    if (this.rooms.focused === room) this.info(note);
+    else room.buffer.push({ type: "note", text: note });
+    await this.runTurn(room, wakes.join("\n\n"), "wake");
+  }
+
+  private emitFor(room: Room) {
+    return (event: AgentEvent) => {
+      if (this.closed) return;
+      if (this.rooms.focused === room) this.event(event);
+      else this.observe(room, event);
+    };
+  }
+
+  // Events from a room that is not on screen: keep its state current and
+  // buffer what the user will want to see when they open it.
+  private observe(room: Room, event: AgentEvent) {
+    if (event.type === "budget") {
+      room.agent.research = event.state;
+      room.session.research = event.state;
+      this.drawBar();
+      return;
+    }
+    if (event.type === "usage") {
+      void recordUsage(event.model, event.input, event.output).catch(() => {});
+      return;
+    }
+    if (event.type === "response") room.lastText = "";
+    if (event.type === "text") room.lastText += event.delta;
+    room.buffer.push(event);
+  }
+
+  private errorText(error: unknown) {
+    if (error instanceof OpenAI.APIError)
+      return `Endpoint error ${error.status ?? "network"}. ${error.status === 401 || error.status === 403 ? "Use /connect to update credentials." : "Try again; /new clears context."}`;
+    return error instanceof Error ? clean(error.message) : "Action failed.";
+  }
+
+  // One turn in one room. Everything it needs from the UI is captured per
+  // room, so the user can switch rooms while it runs.
+  private async runTurn(
+    room: Room,
+    input: string,
+    mode: "turn" | "wake" = "turn",
+  ) {
+    const credentials = this.credentials;
+    if (!credentials || room.controller || this.closed) return;
+    const controller = new AbortController();
+    room.controller = controller;
+    room.question = null;
+    room.lastText = "";
+    const emit = this.emitFor(room);
+    const focused = () => this.rooms.focused === room;
     const start = performance.now();
+    if (focused()) {
+      this.tipRow.visible = false;
+      // Study rooms stay typeable so the user can steer the director.
+      if (room.kind === "chat") this.composer.blur();
+      if (mode === "turn")
+        this.idleVerb = `${idleVerbs[Math.floor(Math.random() * idleVerbs.length)]}…`;
+    }
+    this.drawBar();
     try {
-      await this.agent.run(
-        wakes.join("\n\n"),
-        this.credentials,
-        this.active.signal,
-        (event) => this.event(event),
-      );
-      this.stopLoading();
-      this.flushResponse();
-      this.status.content = `Landed · ${((performance.now() - start) / 1000).toFixed(1)}s`;
-    } catch (error) {
-      this.status.content = this.active?.signal.aborted
-        ? "Paused · progress saved"
-        : "Stopped · see error above";
-      this.status.fg = theme.error;
-      if (!this.active?.signal.aborted && !this.showConnectionFailure(error))
-        this.info(
-          error instanceof Error ? clean(error.message) : "Action failed.",
-        );
-    } finally {
-      this.stopLoading();
-      this.pendingText = "";
-      this.active = null;
-      this.session.messages = this.agent.messages;
-      this.session.context = this.agent.context;
-      if (this.agent.research) this.session.research = this.agent.research;
-      this.session.tasks = this.agent.tasks;
-      try {
-        await saveSession(this.session);
-      } catch {
-        if (!this.closed) this.info("Could not save session to disk.");
+      await room.agent.run(input, credentials, controller.signal, emit);
+      if (focused()) {
+        this.stopLoading();
+        this.flushResponse();
+        this.status.content = `Landed · ${((performance.now() - start) / 1000).toFixed(1)}s`;
       }
-      if (!this.closed && !this.connectStep && !this.approval)
-        this.composer.focus();
-      void this.wakeFromBackground();
+    } catch (error) {
+      const aborted = controller.signal.aborted;
+      if (focused()) {
+        this.stopLoading();
+        this.tipsBlockedByError = !aborted;
+        this.status.content = aborted
+          ? "Paused · progress saved"
+          : "Stopped · see error above";
+        this.status.fg = theme.error;
+        if (aborted) {
+          if (mode === "turn") this.info(this.stoppedMessage());
+        } else if (!this.showConnectionFailure(error))
+          this.info(this.errorText(error));
+      } else if (!aborted)
+        room.buffer.push({ type: "note", text: this.errorText(error) });
+      else
+        room.buffer.push({
+          type: "note",
+          text: `Paused · progress checkpointed in research/${room.study?.id ?? ""}/`,
+        });
+    } finally {
+      room.controller = null;
+      if (focused()) {
+        this.stopLoading();
+        this.toolGroup = null;
+        this.pendingText = "";
+      }
+      room.session.messages = room.agent.messages;
+      room.session.context = room.agent.context;
+      if (room.agent.research) room.session.research = room.agent.research;
+      room.session.tasks = room.agent.tasks;
+      try {
+        await saveSession(room.session);
+      } catch {
+        if (!this.closed && focused())
+          this.info("Could not save session to disk.");
+      }
+      if (!focused() && !controller.signal.aborted && room.kind === "study")
+        room.question = brief(
+          room.lastText.trim() || "Waiting for your direction.",
+          120,
+        );
+      this.drawBar();
+      if (!this.closed && focused()) {
+        if (!this.connectStep && !this.approval) this.composer.focus();
+        if (this.pauseDecisionPending && room.kind === "study") {
+          this.pauseDecisionPending = false;
+          this.openPauseDecision();
+        } else void this.wakeFromBackground(room);
+        this.refreshTipRow();
+      } else if (!this.closed) void this.wakeFromBackground(room);
     }
   }
+
+  private drawBar() {
+    if (this.closed || !this.roomBar) return;
+    const rooms = this.rooms.list();
+    const focused = this.rooms.focused;
+    setStudyHints(
+      this.rooms
+        .studies()
+        .map((room) =>
+          (room.study?.objective ?? room.session.title)
+            .replace(/\s+/g, " ")
+            .slice(0, 40),
+        ),
+    );
+    this.composer.placeholder =
+      focused?.kind === "study"
+        ? "to director ❯ direct this study…  /chat leaves"
+        : "Build, fix, explain…  /help";
+    if (rooms.length < 2) {
+      this.roomBar.visible = false;
+      return;
+    }
+    const lines = [
+      companyBar(this.rooms, Math.max(20, this.renderer.width - 2)),
+    ];
+    for (const room of this.rooms
+      .needingYou()
+      .filter((r) => r !== focused)
+      .slice(0, 2)) {
+      const ask = room.pending[0]?.request.title
+        ? `wants approval: ${brief(room.pending[0].request.title, 60)}`
+        : `says: ${brief(room.question ?? "", 80)}`;
+      lines.push(`▲ ${room.title} ${ask} · Ctrl+K to open`);
+    }
+    if (focused?.kind === "study")
+      lines.push(
+        `↳ You are in "${focused.title}" · typing directs this study · /chat leaves · Ctrl+K rooms`,
+      );
+    this.roomBar.content = lines.join("\n");
+    this.roomBar.height = lines.length;
+    this.roomBar.visible = true;
+  }
+
+  // Bring a room on screen. Its transcript is rebuilt from saved entries and
+  // whatever it did while hidden is replayed. Nothing running is interrupted.
+  private focusRoom(target: Room): boolean {
+    const leaving = this.rooms.focused;
+    if (!leaving || leaving === target) return true;
+    if (this.approval || this.connectStep || this.listPicker) {
+      this.info("Finish the current prompt first, then switch rooms.");
+      return false;
+    }
+    this.flushResponse();
+    for (const entry of leaving.session.entries) {
+      if (entry.detail?.output === "Running…") {
+        const where = leaving.study
+          ? `research/${leaving.study.id}/events.jsonl`
+          : "the session";
+        entry.detail.output = `Still running when you left this room. Result recorded in ${where}.`;
+        entry.text = entry.text.replace("Running…", entry.detail.output);
+      }
+    }
+    void saveSession(leaving.session).catch(() => {});
+    this.rooms.focus(target.id);
+    this.stopLoading();
+    this.pauseDecisionPending = false;
+    this.renderEntries(target.session);
+    const { events, dropped } = target.buffer.drain();
+    if (dropped)
+      this.info(
+        `${dropped} earlier events were not kept while you were away${target.study ? ` · full log: research/${target.study.id}/events.jsonl` : ""}`,
+      );
+    for (const event of events) {
+      if (event.type === "note") this.info(event.text);
+      else this.event(event);
+    }
+    target.question = null;
+    if (target.running) this.showLoading("Working");
+    else {
+      this.flushResponse();
+      this.ready();
+    }
+    this.drawBar();
+    void this.presentApprovals(target);
+    this.composer.focus();
+    return true;
+  }
+
+  // A study gets its own session, agent and browser, so it runs independently.
+  private addStudyRoom(session: Session): Room {
+    const browser = new BrowserSession();
+    const fresh = session.messages.length === 0;
+    const agent = this.makeAgent(
+      fresh ? undefined : session.messages,
+      session.goal,
+      session.context,
+      browser,
+    );
+    if (fresh) session.messages = agent.messages;
+    agent.research =
+      session.researchEnabled === false ? null : (session.research ?? null);
+    agent.tasks = session.tasks.map((task) => ({ ...task }));
+    session.context = agent.context;
+    const room = new Room(session.id, "study", session, agent, browser);
+    this.rooms.add(room);
+    this.startBarTimer();
+    this.agentRooms.set(agent, room);
+    this.drawBar();
+    return room;
+  }
+
+  private async presentApprovals(room: Room) {
+    while (
+      !this.closed &&
+      this.rooms.focused === room &&
+      room.pending.length &&
+      !this.approval
+    ) {
+      const entry = room.nextApproval()!;
+      const signal = room.controller?.signal ?? new AbortController().signal;
+      entry.resolve(await this.ask(entry.request, signal));
+    }
+  }
+
   private activeKeyCredential(provider: Provider): Credentials | null {
     if (this.credentials?.provider === provider) return this.credentials;
     const slot = this.keychain[provider];
@@ -785,7 +1133,69 @@ export class KestUI {
     const line = nestLines[Math.floor(Math.random() * nestLines.length)];
     this.display({ role: "info", text: `[k] kest  v${version}\n${line}` });
   }
-  private ready() {
+
+  private refreshTipRow() {
+    if (!this.tipRow) return;
+    this.tipRow.visible =
+      !this.closed &&
+      !this.active &&
+      !this.loadingTimer &&
+      !this.approval &&
+      !this.connectStep &&
+      !this.listPicker &&
+      !this.tipsBlockedByError;
+    if (!this.tipRow.visible) return;
+    if (!this.availableTips.length || !this.composer.plainText) {
+      const context = {
+        connected: Boolean(this.credentials),
+        permission: this.permission,
+        research: this.session.research,
+        researchEnabled: this.session.researchEnabled !== false,
+        tavily: Boolean(tavilyKey()),
+        lsi: Boolean(lsiKey()),
+      };
+      const key = JSON.stringify([
+        context.connected,
+        context.permission,
+        context.research?.status,
+        context.research?.maxCostUsd === null,
+        Boolean(context.research?.agents),
+        context.researchEnabled,
+        context.tavily,
+        context.lsi,
+      ]);
+      if (key !== this.tipContextKey || !this.availableTips.length) {
+        this.availableTips = tipsFor(context);
+        this.tipContextKey = key;
+        this.tipIndex = 0;
+      }
+    }
+    const tip = this.availableTips[this.tipIndex];
+    if (!tip) {
+      this.tipRow.visible = false;
+      return;
+    }
+    const width = Math.max(8, this.renderer.width - 17);
+    const text = `Tip: ${tip.text}`;
+    const rows = Math.min(2, Math.max(1, Math.ceil(text.length / width)));
+    this.tipRow.height = rows;
+    this.tipText.content =
+      text.length > width * 2 ? text.slice(0, width * 2 - 1) + "…" : text;
+    this.tipCounter.content = `${this.tipIndex + 1}/${this.availableTips.length}`;
+  }
+
+  private changeTip(direction: number) {
+    if (!this.tipRow.visible || !this.availableTips.length) return;
+    this.tipIndex =
+      (this.tipIndex + direction + this.availableTips.length) %
+      this.availableTips.length;
+    this.refreshTipRow();
+    this.composer.focus();
+  }
+
+  private ready(clearTipError = true) {
+    if (clearTipError) this.tipsBlockedByError = false;
+    this.refreshTipRow();
     this.status.fg = theme.muted;
     const goal =
       this.session.goal && !this.session.research
@@ -1083,6 +1493,8 @@ export class KestUI {
       !connectionFailure(error)
     )
       return false;
+    this.tipsBlockedByError = true;
+    this.tipRow.visible = false;
     const research = Boolean(this.agent.research);
     const recovery = research ? "/research resume" : "Send your request again";
     const value = error as Error & {
@@ -1138,6 +1550,7 @@ export class KestUI {
       this.composer.focus();
   }
   private inputChanged() {
+    this.refreshTipRow();
     if (
       !this.composer ||
       this.closed ||
@@ -1160,17 +1573,54 @@ export class KestUI {
       );
     this.promptBox.height = Math.min(9, Math.max(5, rows + 2));
     const matches = completeCandidates(value);
-    this.hints.visible =
-      (matches.length > 0 || value.length > 80) &&
+    const single = !value.includes("\n");
+    const exact = matches.length === 1 && matches[0] === value.trim();
+    const idle =
       !this.connectStep &&
-      !this.active;
-    this.hints.content = matches.length
-      ? matches.slice(0, 6).join("   ") +
-        (matches.length > 6 ? `   +${matches.length - 6} more` : "")
-      : `${value.length} chars · ${value.split("\n").length} lines`;
+      (!this.active || this.rooms.focused?.kind === "study");
+    if (single && matches.length && !exact) {
+      if (!this.menu || this.menu.value !== value)
+        this.menu = { items: matches, index: 0, touched: false, value };
+      const start = Math.max(
+        0,
+        Math.min(this.menu.index - 7, matches.length - 8),
+      );
+      const window = matches.slice(start, start + 8);
+      const pad = Math.max(...window.map((m) => m.length)) + 2;
+      this.hints.height = window.length + (matches.length > 8 ? 1 : 0);
+      this.hints.content =
+        window
+          .map(
+            (m, i) =>
+              `${start + i === this.menu!.index ? "▸" : " "} ${m.padEnd(pad)}${describeCandidate(m)}`,
+          )
+          .join("\n") +
+        (matches.length > 8
+          ? `\n  ${matches.length} matches · ↑↓ select · Tab fill`
+          : "");
+      this.hints.visible = idle;
+      return;
+    }
+    this.menu = null;
+    const hint = single ? argumentHint(value) : "";
+    this.hints.height = 1;
+    this.hints.content =
+      hint || `${value.length} chars · ${value.split("\n").length} lines`;
+    this.hints.visible = idle && (Boolean(hint) || value.length > 80);
   }
 
   private key(key: KeyEvent) {
+    if (
+      (key.meta || key.option) &&
+      !key.ctrl &&
+      ["left", "right"].includes(key.name) &&
+      this.tipRow.visible
+    ) {
+      key.preventDefault();
+      key.stopPropagation();
+      this.changeTip(key.name === "left" ? -1 : 1);
+      return;
+    }
     if (
       !this.connectStep &&
       key.ctrl &&
@@ -1226,6 +1676,7 @@ export class KestUI {
       if (this.listPicker) {
         this.cancelListPicker();
       } else if (this.connectStep) {
+        this.serviceConnect = null;
         this.connectStep = null;
         this.connectKeyName = null;
         this.secretValue = this.tokenId = "";
@@ -1304,6 +1755,11 @@ export class KestUI {
       else tool.outputScroll?.focus();
       return;
     }
+    if (key.ctrl && key.name === "k" && this.rooms.list().length > 1) {
+      key.preventDefault();
+      this.openRoomPicker();
+      return;
+    }
     if (key.ctrl && key.name === "o" && this.lastTool) {
       key.preventDefault();
       const tool = this.lastTool;
@@ -1313,8 +1769,27 @@ export class KestUI {
       this.applyTeamVisibility();
       return;
     }
-    if (this.active) {
+    if (this.active && this.rooms.focused?.kind !== "study") {
       key.preventDefault();
+      return;
+    }
+    if (
+      this.menu &&
+      (key.name === "up" || key.name === "down") &&
+      this.menu.items.length > 1
+    ) {
+      key.preventDefault();
+      const n = this.menu.items.length;
+      this.menu.index = (this.menu.index + (key.name === "up" ? n - 1 : 1)) % n;
+      this.menu.touched = true;
+      const keep = this.menu;
+      this.inputChanged();
+      this.menu = keep;
+      return;
+    }
+    if (key.name === "tab" && this.menu?.touched) {
+      key.preventDefault();
+      this.fillMenuSelection();
       return;
     }
     if (key.name === "tab" && this.composer.plainText.startsWith("/")) {
@@ -1416,11 +1891,15 @@ export class KestUI {
       ? ` · key ${this.connectKeyName}`
       : "";
     const label =
-      this.connectStep === "id"
-        ? `Modal token ID${keySuffix}`
-        : this.connectStep === "key"
-          ? `${this.connectProvider === "nebius" ? "Nebius Token Factory" : "Baseten"} API key${keySuffix}`
-          : "Modal token secret";
+      this.serviceConnect === "tavily"
+        ? "Tavily API key"
+        : this.serviceConnect === "lsi"
+          ? "LSI API key (lsi_…)"
+          : this.connectStep === "id"
+            ? `Modal token ID${keySuffix}`
+            : this.connectStep === "key"
+              ? `${this.connectProvider === "nebius" ? "Nebius Token Factory" : "Baseten"} API key${keySuffix}`
+              : "Modal token secret";
     this.secretText.content = `${label}\n${"•".repeat(Math.min(28, this.secretValue.length))}  ${this.secretValue.length} characters`;
   }
   private describeProvider(provider: Provider) {
@@ -1456,6 +1935,7 @@ export class KestUI {
     values: string[],
     confirm: (value: string) => void,
   ) {
+    this.tipRow.visible = false;
     this.composer.setText("");
     this.composer.blur();
     this.composer.visible = false;
@@ -1492,6 +1972,7 @@ export class KestUI {
       return row;
     });
     this.listPicker = { selected: 0, rows, box, labels, values, confirm };
+    this.refreshTipRow();
     this.scroll.add(box);
     this.drawListPicker();
     this.status.content = "Up/Down choose · Enter continue · Esc cancel";
@@ -1530,11 +2011,20 @@ export class KestUI {
         return `${this.describeProvider(provider)}${state}`;
       },
     );
+    labels.push(
+      `tavily — Web research tools${tavilyKey() ? " (connected)" : ""}`,
+      `lsi — Publish and query research${lsiKey() ? " (connected)" : ""}`,
+    );
     this.openListPicker(
       "Choose a provider",
       labels,
-      ["baseten", "modal", "nebius"],
-      (value) => this.connect(value as Provider),
+      ["baseten", "modal", "nebius", "tavily", "lsi"],
+      (value) =>
+        value === "tavily"
+          ? this.startTavilyEntry()
+          : value === "lsi"
+            ? this.startLsiEntry()
+            : this.connect(value as Provider),
     );
   }
   private storeForNames(): {
@@ -1620,7 +2110,31 @@ export class KestUI {
     this.startKeyEntry(provider, "a");
   }
   private connectProvider: Provider = "modal";
+  private serviceConnect: "tavily" | "lsi" | null = null;
+  private startLsiEntry() {
+    this.startKeyEntry("baseten", "a");
+    this.serviceConnect = "lsi";
+    this.connectKeyName = null;
+    let host = "LSI";
+    try {
+      host = lsiBaseUrl();
+    } catch {
+      /* invalid override is reported on use */
+    }
+    this.status.content = `LSI API key from ${host}/account · saved locally in plaintext. Enter to save, Esc to cancel. Model provider stays unchanged.`;
+    this.drawSecret();
+  }
+  private startTavilyEntry() {
+    this.startKeyEntry("baseten", "a");
+    this.serviceConnect = "tavily";
+    this.connectKeyName = null;
+    this.status.content =
+      "Tavily API key · saved locally in plaintext. Enter to save, Esc to cancel. Model provider stays unchanged.";
+    this.drawSecret();
+  }
   private startKeyEntry(provider: Provider, name: string) {
+    this.tipRow.visible = false;
+    this.serviceConnect = null;
     this.renderer.clearSelection();
     this.connectProvider = provider;
     this.connectKeyName = name;
@@ -1646,6 +2160,38 @@ export class KestUI {
     const value = this.secretValue.trim();
     if (!value) {
       this.status.content = "A value is required. Paste or type your token.";
+      return;
+    }
+    if (this.serviceConnect === "lsi") {
+      try {
+        await saveLsiKey(value);
+        this.connectStep = null;
+        this.serviceConnect = null;
+        this.connectKeyName = null;
+        this.secretValue = "";
+        this.restoreInput();
+        this.info(lsiConnectionMessage);
+      } catch (error) {
+        this.status.content =
+          error instanceof Error && /valid LSI/.test(error.message)
+            ? error.message
+            : "Could not save LSI key. Check the config directory permissions, then try again.";
+      }
+      return;
+    }
+    if (this.serviceConnect === "tavily") {
+      try {
+        await saveTavilyKey(value);
+        this.connectStep = null;
+        this.serviceConnect = null;
+        this.connectKeyName = null;
+        this.secretValue = "";
+        this.restoreInput();
+        this.info(tavilyConnectionMessage);
+      } catch {
+        this.status.content =
+          "Could not save Tavily key. Check the key and config directory permissions, then try again.";
+      }
       return;
     }
     if (this.connectStep === "id") {
@@ -1707,10 +2253,27 @@ export class KestUI {
     this.composer.focus();
     this.ready();
   }
+  // Approvals from a room that is not on screen wait in that room's queue
+  // (it shows as "needs you") and are presented when the user opens it.
+  private askFor(
+    agent: Agent,
+    request: Approval,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (signal.aborted || this.closed) return Promise.resolve(false);
+    if (autoApprove(this.permission, request)) return Promise.resolve(true);
+    const room = this.agentRooms.get(agent);
+    if (!room || room === this.rooms.focused) return this.ask(request, signal);
+    const answer = room.queueApproval(request, signal);
+    this.drawBar();
+    return answer;
+  }
+
   private ask(request: Approval, signal: AbortSignal): Promise<boolean> {
     if (signal.aborted || this.closed) return Promise.resolve(false);
     if (autoApprove(this.permission, request)) return Promise.resolve(true);
     this.stopLoading();
+    this.tipRow.visible = false;
     this.info(`${request.title}\n${brief(request.preview, 32_000)}`);
     this.composer.blur();
     this.composer.visible = false;
@@ -2068,6 +2631,7 @@ export class KestUI {
     this.pendingText = "";
   }
   private showLoading(label: string) {
+    this.tipRow.visible = false;
     this.status.fg = theme.tool;
     this.loadingLabel = label;
     if (this.loadingTimer) return;
@@ -2097,9 +2661,29 @@ export class KestUI {
     this.loadingTimer = null;
   }
 
+  private fillMenuSelection() {
+    const menu = this.menu;
+    if (!menu) return;
+    const next = menu.items[menu.index]!;
+    const filled = completionHasChildren(next) ? `${next} ` : next;
+    this.menu = null;
+    this.composer.setText(filled);
+    this.composer.cursorOffset = filled.length;
+    this.inputChanged();
+  }
+
   private async submit(displayLabel?: string) {
-    if (this.active || this.connectStep || this.listPicker || this.closed)
+    if (
+      (this.active && this.rooms.focused?.kind !== "study") ||
+      this.connectStep ||
+      this.listPicker ||
+      this.closed
+    )
       return;
+    if (this.menu?.touched && !displayLabel) {
+      this.fillMenuSelection();
+      return;
+    }
     this.tabCycle = null;
     const draft = this.composer.plainText;
     const text = draft
@@ -2109,11 +2693,30 @@ export class KestUI {
       )
       .trim();
     if (!text) return;
+    this.tipsBlockedByError = false;
+    this.tipRow.visible = false;
     this.pastedTexts.clear();
     this.composer.setText("");
     this.hints.visible = false;
+    this.tipRow.visible = false;
     this.inputHistory.push(text);
     this.historyIndex = this.inputHistory.length;
+    const room = this.rooms.focused!;
+    if (this.active) {
+      // A study is running: slash commands that only read are fine; anything
+      // else is direction for the director, delivered before its next step.
+      if (text.startsWith("/")) {
+        if (!runningSafeCommand.test(text))
+          this.info("Press Esc to pause this study before running that command.");
+        else await this.command(text);
+        return;
+      }
+      room.agent.pendingNotes.push(text);
+      this.add("you", text);
+      this.info("Direction queued · the director reads it before its next step.");
+      return;
+    }
+    let turn = false;
     try {
       if (text.startsWith("/")) {
         await this.command(text);
@@ -2135,59 +2738,28 @@ export class KestUI {
       else this.add("you", text);
       if (this.session.title === "New session")
         this.session.title = text.replace(/\s+/g, " ").slice(0, 70);
-      this.active = new AbortController();
-      this.composer.blur();
-      this.idleVerb = `${idleVerbs[Math.floor(Math.random() * idleVerbs.length)]}…`;
-      const start = performance.now();
-      await this.agent.run(
-        text,
-        this.credentials,
-        this.active.signal,
-        (event) => this.event(event),
-      );
-      this.stopLoading();
-      this.flushResponse();
-      this.status.content = `Landed · ${((performance.now() - start) / 1000).toFixed(1)}s`;
+      turn = true;
     } catch (error) {
       this.stopLoading();
-      this.status.content = this.active?.signal.aborted
-        ? "Paused · progress saved"
-        : "Stopped · see error above";
+      this.tipsBlockedByError = true;
+      this.status.content = "Stopped · see error above";
       this.status.fg = theme.error;
-      if (this.active?.signal.aborted) this.info(this.stoppedMessage());
-      else if (this.showConnectionFailure(error)) {
-        // Keep the recovery message and expandable original error together.
-      } else if (error instanceof OpenAI.APIError)
-        this.info(
-          `Endpoint error ${error.status ?? "network"}. ${error.status === 401 || error.status === 403 ? "Use /connect to update credentials." : "Try again; /new clears context."}`,
-        );
-      else
-        this.info(
-          error instanceof Error ? clean(error.message) : "Action failed.",
-        );
+      if (!this.showConnectionFailure(error)) this.info(this.errorText(error));
     } finally {
-      this.stopLoading();
-      this.toolGroup = null;
-      this.pendingText = "";
-      if (this.active) {
-        this.active = null;
-        this.session.messages = this.agent.messages;
-        this.session.context = this.agent.context;
-        if (this.agent.research) this.session.research = this.agent.research;
-        this.session.tasks = this.agent.tasks;
-        try {
-          await saveSession(this.session);
-        } catch {
-          if (!this.closed) this.info("Could not save session to disk.");
-        }
+      if (!turn) {
+        this.stopLoading();
+        this.toolGroup = null;
+        this.pendingText = "";
+        if (!this.closed && !this.connectStep && !this.approval)
+          this.composer.focus();
+        if (this.pauseDecisionPending) {
+          this.pauseDecisionPending = false;
+          this.openPauseDecision();
+        } else void this.wakeFromBackground();
+        this.refreshTipRow();
       }
-      if (!this.closed && !this.connectStep && !this.approval)
-        this.composer.focus();
-      if (this.pauseDecisionPending) {
-        this.pauseDecisionPending = false;
-        this.openPauseDecision();
-      } else void this.wakeFromBackground();
     }
+    if (turn) await this.runTurn(room, text);
   }
 
   private async command(text: string) {
@@ -2241,16 +2813,39 @@ export class KestUI {
       return;
     }
     if (command === "/research") {
-      const [action, ...parts] = value.split(/\s+/);
+      const [action, ...rest] = value.split(/\s+/);
+      let parts = rest;
+      if (action === "budget" && parts.length > 1) {
+        const amount = parts.at(-1)!;
+        const room = await this.resolveStudy(parts.slice(0, -1).join(" "));
+        if (!room || !this.focusRoom(room)) return;
+        parts = [amount];
+      } else if ((action === "resume" || action === "wrapup") && parts.length) {
+        const room = await this.resolveStudy(parts.join(" "));
+        if (!room || !this.focusRoom(room)) return;
+        parts = [];
+      }
       if (
         (action === "budget" ||
           action === "resume" ||
+          action === "wrapup" ||
           (action === "start" && !parts.length)) &&
         !(await this.restoreResearch())
       )
         return;
+      if (action === "show" && parts.length) {
+        const room = await this.resolveStudy(parts.join(" "));
+        if (!room) return;
+        await recoverCompany(this.cwd, room.study!);
+        this.info(
+          `${formatCompany(room.study)}\nSession: ${room.session.id.slice(0, 8)}\n/research open report|evidence|reviews|timeline ${room.session.id.slice(0, 8)}`,
+        );
+        return;
+      }
       if (action === "show") {
-        const sessions = await listSessions(this.cwd);
+        const sessions = (await listSessions(this.cwd)).map(
+          (saved) => this.rooms.get(saved.id)?.session ?? saved,
+        );
         const studies = [
           this.session,
           ...sessions.filter((saved) => saved.id !== this.session.id),
@@ -2270,7 +2865,109 @@ export class KestUI {
         return;
       }
       if (!value) {
-        this.info(formatCompany(this.session.research));
+        if (this.rooms.studies().length) this.openRoomPicker();
+        else this.info(formatCompany(this.session.research));
+        return;
+      }
+      if (action === "publish") {
+        if (!lsiKey()) {
+          this.info("Connect LSI first: /connect lsi");
+          return;
+        }
+        const words = [...parts];
+        const domainAt = words.findIndex((w) => /^domain=/.test(w));
+        const domain = domainAt >= 0 ? words.splice(domainAt, 1)[0]!.slice(7) : "";
+        const room = words.length
+          ? await this.resolveStudy(words.join(" "))
+          : this.rooms.focused?.kind === "study"
+            ? this.rooms.focused
+            : null;
+        if (!room || !this.focusRoom(room)) {
+          if (!room && !words.length) this.info("/research publish [domain=<id>] [study]  (open a study or name one)");
+          return;
+        }
+        const study = room.study!;
+        if (study.status !== "completed" || !study.finalReportPath) {
+          this.info(`Not ready: publishing needs a completed, reviewed study. Use /research wrapup ${room.title.slice(0, 20)} to finish and publish in one step.`);
+          return;
+        }
+        const blocker = this.rooms.startBlocker(room);
+        if (blocker) {
+          this.info(blocker);
+          return;
+        }
+        this.info("Publishing to LSI… (one model call, then one lsi_publish)");
+        this.composer.setText(publishPrompt(study, domain));
+        await this.submit("Publish instructions · expand to inspect");
+        return;
+      }
+      if (action === "open") {
+        const words = [...parts];
+        const tab = (studyTabs as readonly string[]).includes(words[0] ?? "")
+          ? (words.shift() as StudyTab)
+          : null;
+        const only = this.rooms.studies();
+        const room = words.length
+          ? await this.resolveStudy(words.join(" "))
+          : this.rooms.focused?.kind === "study"
+            ? this.rooms.focused
+            : only.length === 1
+              ? only[0]!
+              : null;
+        if (!room) {
+          if (!words.length)
+            this.info("/research open [report|evidence|reviews|timeline] <study>");
+          return;
+        }
+        const study = room.study!;
+        const show = async (which: StudyTab) =>
+          this.info(
+            formatStudyTab(which, await loadStudyArtifacts(this.cwd, study), study.id),
+          );
+        if (tab) await show(tab);
+        else
+          this.openListPicker(
+            `Open which part of "${room.title}"?`,
+            ["Report", "Evidence", "Reviews", "Timeline"],
+            [...studyTabs],
+            (which) => void show(which as StudyTab),
+          );
+        return;
+      }
+      if (action === "total") {
+        const limits = this.rooms.limits;
+        if (!parts.length) {
+          this.info(
+            `Total research allowance: ${limits.totalUsd === null ? "none" : `$${limits.totalUsd.toFixed(2)}`} · spent across studies $${this.rooms.totalSpentUsd().toFixed(2)}\n/research total 30$ sets it · /research total off removes it`,
+          );
+          return;
+        }
+        limits.totalUsd =
+          parts[0] === "off" ? null : parseCostBudget(parts[0]!);
+        await saveCompanyLimits(limits);
+        this.info(
+          limits.totalUsd === null
+            ? "Total allowance removed. Each study keeps its own budget."
+            : `Total allowance $${limits.totalUsd.toFixed(2)} across all studies. Running studies pause when it is reached.`,
+        );
+        this.enforceAllowance();
+        this.drawBar();
+        return;
+      }
+      if (action === "parallel") {
+        const limits = this.rooms.limits;
+        if (!parts.length) {
+          this.info(`Studies may run at once: ${limits.maxRunning} · /research parallel <1-10>`);
+          return;
+        }
+        const n = Number(parts[0]);
+        if (!Number.isInteger(n) || n < 1 || n > 10) {
+          this.info("/research parallel <1-10>");
+          return;
+        }
+        limits.maxRunning = n;
+        await saveCompanyLimits(limits);
+        this.info(`Up to ${n} studies may run at once.`);
         return;
       }
       if (action === "models") {
@@ -2283,7 +2980,7 @@ export class KestUI {
           this.info("/research prepare <objective>");
           return;
         }
-        await this.prepareResearch(objective);
+        if (!(await this.prepareResearch(objective))) return;
         this.add(
           "info",
           "Research prepared · set a budget with /research budget 10$",
@@ -2385,7 +3082,7 @@ export class KestUI {
         this.info("Connect a model provider first with /connect.");
         return;
       }
-      if (action === "resume" || startPrepared) {
+      if (action === "resume" || action === "wrapup" || startPrepared) {
         if (!this.session.research) {
           this.info("No research objective yet. /research <objective>");
           return;
@@ -2396,7 +3093,7 @@ export class KestUI {
           this.info("/research <objective>");
           return;
         }
-        await this.prepareResearch(objective);
+        if (!(await this.prepareResearch(objective))) return;
       }
       const study = this.session.research!;
       await recoverCompany(this.cwd, study);
@@ -2415,6 +3112,17 @@ export class KestUI {
         );
         return;
       }
+      if (action === "wrapup" && study.status === "ready") {
+        this.info(
+          "Nothing to wrap up yet: this study has not started. Run /research start first.",
+        );
+        return;
+      }
+      const blocker = this.rooms.startBlocker(this.rooms.focused!);
+      if (blocker) {
+        this.info(blocker);
+        return;
+      }
       this.session.goal = study.objective;
       this.session.researchEnabled = true;
       this.agent = this.makeAgent(
@@ -2427,12 +3135,18 @@ export class KestUI {
       this.agent.tasks = this.session.tasks.map((t) => ({ ...t }));
       await saveSession(this.session);
       this.info(
-        `${study.status === "ready" ? "Starting" : "Resuming"} research · $${study.maxCostUsd.toFixed(2)} total allowance\nEsc to pause · /agents for workers · /research show for status`,
+        `${action === "wrapup" ? "Wrapping up" : study.status === "ready" ? "Starting" : "Resuming"} research · $${study.maxCostUsd.toFixed(2)} total allowance\nEsc to pause · /agents for workers · /research show for status`,
       );
+      if (tavilyKey())
+        this.info(
+          "This allowance covers model calls. Tavily requests use separate credits.",
+        );
       this.composer.setText(
-        study.status === "ready"
-          ? `Research objective: ${study.objective}\nUse the research company workflow. Save reproducible evidence in research/${study.id}/. Check research_status for the shared allowance. Reserve funding for independent review; call research_complete only with a reviewed report.`
-          : `Resume research/${study.id}/ from the saved checkpoint. Objective: ${study.objective}\nUse research_status for spending. Read the saved report, worker findings and relevant evidence before choosing the next unresolved task. Do not repeat completed experiments or read the whole event journal for status. Keep the shared allowance and obtain independent review before research_complete.`,
+        action === "wrapup"
+          ? wrapupPrompt()
+          : study.status === "ready"
+            ? `Research objective: ${study.objective}\nUse the research company workflow. Save reproducible evidence in research/${study.id}/. Check research_status for the shared allowance. Reserve funding for independent review; call research_complete only with a reviewed report.`
+            : `Resume research/${study.id}/ from the saved checkpoint. Objective: ${study.objective}\nUse research_status for spending. Read the saved report, worker findings and relevant evidence before choosing the next unresolved task. Do not repeat completed experiments or read the whole event journal for status. Keep the shared allowance and obtain independent review before research_complete.`,
       );
       await this.submit("Research instructions · expand to inspect");
       return;
@@ -2468,6 +3182,8 @@ export class KestUI {
         this.info(
           error instanceof Error ? error.message : "Browser action failed.",
         );
+        this.tipsBlockedByError = true;
+        this.tipRow.visible = false;
       }
       return;
     }
@@ -2489,6 +3205,14 @@ export class KestUI {
     }
     if (command === "/connect") {
       const arg = value.toLowerCase();
+      if (arg === "tavily") {
+        this.startTavilyEntry();
+        return;
+      }
+      if (arg === "lsi") {
+        this.startLsiEntry();
+        return;
+      }
       if (!arg) {
         this.openProviderPicker();
         return;
@@ -2498,7 +3222,7 @@ export class KestUI {
         return;
       }
       this.info(
-        "Usage: /connect [modal|baseten|nebius]\n/connect baseten  Baseten API key\n/connect modal  Modal token ID + secret\n/connect nebius  Nebius Token Factory API key",
+        "Usage: /connect [modal|baseten|nebius|tavily]\n/connect baseten  Baseten API key\n/connect modal  Modal token ID + secret\n/connect nebius  Nebius Token Factory API key\n/connect tavily  Tavily web tools API key",
       );
       return;
     }
@@ -2571,6 +3295,15 @@ export class KestUI {
         return;
       }
       await this.selectModel(value);
+      return;
+    }
+    if (command === "/rooms") {
+      this.openRoomPicker();
+      return;
+    }
+    if (command === "/chat") {
+      const chat = this.rooms.list().find((room) => room.kind === "chat");
+      if (chat && this.focusRoom(chat)) return;
       return;
     }
     if (command === "/usage" || command === "/tokens") {
@@ -2661,6 +3394,8 @@ export class KestUI {
               : "No completed history is eligible for compaction yet.",
           );
         } catch (error) {
+          this.tipsBlockedByError = true;
+          this.tipRow.visible = false;
           if (!this.closed)
             this.info(
               error instanceof Error
@@ -2670,7 +3405,7 @@ export class KestUI {
         } finally {
           this.active = null;
           this.stopLoading();
-          if (!this.closed) this.ready();
+          if (!this.closed) this.ready(false);
         }
       } else
         this.info(
@@ -2698,16 +3433,22 @@ export class KestUI {
     }
     if (command === "/help") {
       this.info(
-        "Research: /research show · /research prepare <objective> · /research start · /research resume · /research budget <USD, e.g. 10$> · /agents [id] inspects workers",
+        "Research: /research (pick a study) · prepare <objective> · start · resume|wrapup|budget [study] · open [report|evidence|reviews|timeline] [study] · total <USD>$ · parallel <1-10> · /rooms or Ctrl+K switches · /chat leaves a study · /agents [id] inspects workers",
       );
       this.info(
-        "/connect [modal|baseten|nebius]  credentials (provider switcher)\n/provider  current provider and model\n/model  list models and select one\n/research start|prepare|resume|budget  research company, model profiles and budgets\n/context  context size, memory, archives and compaction\n/usage  token usage, pricing and estimated cost (this machine)\n/stats  all-time tool counts and timings across sessions (ms)\n/permission [all|minimal|strict]  approval level\n/browser [url|tabs|close]  control the visible browser\n/goal <text>|clear  session objective\n/tasks  plan checklist and progress\n/new  fresh session\n/sessions  saved workspace sessions\n/resume <id>  reopen a session\n/tools  available tools\n/status  model and connection\n/system <instructions>  customize agent (new session)\n/exit  quit\n\nEnter send · Shift+Enter or Ctrl+Enter newline · Tab completes commands + subcommands (/res → /research, /research b → /research budget)\nUp/Down prompt history · Mouse wheel or PgUp/PgDn scroll\nEdits and shell commands require y/n approval.",
+        "/connect [modal|baseten|nebius|tavily]  credentials (provider switcher)\n/provider  current provider and model\n/model  list models and select one\n/research start|prepare|resume|wrapup|budget  research company, model profiles and budgets\n/rooms  switch between chat and running studies (Ctrl+K)\n/chat  leave a study room, keep it running\n/context  context size, memory, archives and compaction\n/usage  token usage, pricing and estimated cost (this machine)\n/stats  all-time tool counts and timings across sessions (ms)\n/permission [all|minimal|strict]  approval level\n/browser [url|tabs|close]  control the visible browser\n/goal <text>|clear  session objective\n/tasks  plan checklist and progress\n/new  fresh session\n/sessions  saved workspace sessions\n/resume <id>  reopen a session\n/tools  available tools\n/status  model and connection\n/system <instructions>  customize agent (new session)\n/exit  quit\n\nEnter send · Shift+Enter or Ctrl+Enter newline · Tab completes commands + subcommands (/res → /research, /research b → /research budget)\nUp/Down prompt history · Mouse wheel or PgUp/PgDn scroll\nAlt+Left/Right previous/next tip · clickable ‹ / › above input\nEdits and shell commands require y/n approval.",
       );
       return;
     }
     if (command === "/tools") {
       this.info(
         `${this.agent.toolDefs().length} tools available\n` +
+          (tavilyKey()
+            ? tavilyConnectionMessage.replace(
+                "Tavily connected · your model provider is unchanged.\n\nNew tools:",
+                "Tavily web tools:",
+              ) + "\n\n"
+            : "Tavily: /connect tavily adds web search, extraction, mapping, crawling and remote research.\n\n") +
           "read_file · list_files · search  → automatic\nedit_file · write_file · shell  → approval required\nset_plan · update_task  → agent plans and tracks its own tasks\nspawn_subagent · research_team  → bounded hierarchical researchers\nlist_models · research_status · research_review  → profiles, budgets and independent review\nbrowser  → visible browser with page and tab control\n\nFiles stay inside this workspace. Credential files are excluded.\nApproved shell commands can access your system; they are not sandboxed.",
       );
       return;
@@ -2757,6 +3498,15 @@ export class KestUI {
         if (saved.research.status === "running")
           saved.research.status = "paused";
       }
+      if (saved.research) {
+        const room = this.rooms.get(saved.id);
+        this.openStudy(room ? room.session : saved);
+        return;
+      }
+      if (this.rooms.focused?.kind === "study") {
+        const chat = this.rooms.list().find((room) => room.kind === "chat");
+        if (!chat || !this.focusRoom(chat)) return;
+      }
       this.openSession(saved);
       return;
     }
@@ -2764,6 +3514,10 @@ export class KestUI {
       if (command === "/system" && !value) {
         this.info("Usage: /system <instructions>");
         return;
+      }
+      if (this.rooms.focused?.kind === "study") {
+        const chat = this.rooms.list().find((room) => room.kind === "chat");
+        if (!chat || !this.focusRoom(chat)) return;
       }
       this.agent = this.makeAgent(
         command === "/system"
@@ -2784,7 +3538,14 @@ export class KestUI {
       this.ready();
       return;
     }
-    this.info("Unknown command. /help");
+    const guess = suggestCommand(command);
+    this.composer.setText(text);
+    this.composer.cursorOffset = text.length;
+    this.info(
+      guess
+        ? `Unknown command ${command}. Did you mean ${guess}? Your text is still in the prompt. /help lists commands.`
+        : `Unknown command ${command}. Your text is still in the prompt. /help lists commands.`,
+    );
   }
   private clearView() {
     this.workerViews.clear();
@@ -2802,15 +3563,93 @@ export class KestUI {
     this.scroll.stickyScroll = true;
     for (const child of this.scroll.getChildren()) child.destroyRecursively();
   }
+  private barTimer: ReturnType<typeof setInterval> | null = null;
+  // Spend and status of background studies change without any UI event.
+  private startBarTimer() {
+    if (this.barTimer) return;
+    this.barTimer = setInterval(() => {
+      if (this.rooms.running().length) {
+        this.enforceAllowance();
+        this.drawBar();
+      }
+    }, 1000);
+    this.barTimer.unref?.();
+  }
+  // Pause every running study once combined spend reaches the company allowance.
+  private enforceAllowance() {
+    for (const room of this.rooms.overAllowance()) {
+      const cap = this.rooms.limits.totalUsd!;
+      this.pauseRoom(
+        room,
+        `Paused: total research allowance $${cap.toFixed(2)} reached across all studies. Raise it with /research total <amount>$, then /research resume.`,
+      );
+    }
+  }
+  private pauseRoom(room: Room, reason: string) {
+    const study = room.study;
+    if (!study || !room.running) return;
+    if (study.status !== "ready") study.status = "paused";
+    room.session.research = study;
+    void saveSession(room.session).catch(() => {});
+    room.agent.cancelBackground();
+    room.controller?.abort();
+    if (room === this.rooms.focused) this.info(reason);
+    else room.buffer.push({ type: "note", text: reason });
+  }
+  private async resolveStudy(query: string): Promise<Room | null> {
+    await this.loadSavedStudies();
+    const matches = this.rooms.find(query);
+    if (matches.length === 1) return matches[0]!;
+    this.info(
+      matches.length
+        ? `Several studies match "${query}":\n${matches.map((r) => `• ${r.title} (${r.session.id.slice(0, 8)})`).join("\n")}\nBe more specific.`
+        : `No study matches "${query}". /research show lists them.`,
+    );
+    return null;
+  }
+  private openRoomPicker() {
+    if (this.approval || this.connectStep || this.listPicker) return;
+    const rooms = this.rooms.list();
+    const here = this.rooms.focused;
+    const labels = rooms.map((room) => {
+      const study = room.study;
+      const spend =
+        study && study.maxCostUsd !== null
+          ? `  $${studySpentUsd(study).toFixed(1)}/${study.maxCostUsd}`
+          : "";
+      return `${statusSymbol(room.status)} ${room.title}${spend}  ${room.status}${room === here ? "  (here)" : ""}`;
+    });
+    this.openListPicker(
+      "Rooms · Enter opens · Esc closes",
+      labels,
+      rooms.map((room) => room.id),
+      (id) => {
+        const room = this.rooms.get(id);
+        if (room) this.focusRoom(room);
+      },
+    );
+    const picker = this.listPicker as KestUI["listPicker"];
+    if (picker && here) {
+      picker.selected = Math.max(0, rooms.indexOf(here));
+      this.drawListPicker();
+    }
+  }
+  private stopAllRooms() {
+    if (this.barTimer) clearInterval(this.barTimer);
+    this.barTimer = null;
+    for (const room of this.rooms.list()) {
+      room.controller?.abort();
+      room.agent.cancelBackground();
+    }
+  }
   close() {
     if (this.closed) return;
     this.closed = true;
-    this.active?.abort();
-    this.agent.cancelBackground();
+    this.stopAllRooms();
     this.approval?.finish(false);
     this.secretValue = this.tokenId = "";
     this.stopLoading();
-    void this.browser.close();
+    for (const room of this.rooms.list()) void room.browser.close();
     this.renderer.destroy();
   }
 }

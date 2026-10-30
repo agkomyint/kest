@@ -1,5 +1,7 @@
 import { BrowserSession } from "./browser";
 import { saveWorkerRecord } from "./research-workers";
+import { tavilyKey, tavilyToolDefinitions } from "./tavily";
+import { lsiKey, lsiToolDefinitions, lsiReadToolDefinitions } from "./lsi";
 import { bunContext } from "./bun-context";
 import OpenAI from "openai";
 import { endpointFor, type Credentials } from "./config";
@@ -409,6 +411,8 @@ export class Agent {
   private company: CompanyRuntime | null = null;
   companyWorker = false;
   private activeCompanyRun = false;
+  /** Direction queued by the user mid-run; delivered before the next model round. */
+  pendingNotes: string[] = [];
   private toolDurations = new Map<string, number[]>();
   allowBackground = true;
   onBackground: ((event: AgentEvent) => void) | null = null;
@@ -612,13 +616,34 @@ export class Agent {
   }
 
   toolDefs(): OpenAI.ChatCompletionTool[] {
+    const webTools = tavilyKey() ? tavilyToolDefinitions : [];
+    const lsiReads = lsiKey() ? lsiReadToolDefinitions : [];
+    // Claim/post exist only inside a /research run; publishing only after the director has
+    // completed the study (independent review done, final report saved). Chat and workers only read.
+    const inResearch = Boolean(this.research || this.activeCompanyRun);
+    const finished = this.company?.state ?? this.research;
+    const studyDone =
+      this.depth === 0 &&
+      finished?.status === "completed" &&
+      Boolean(finished.finalReportPath);
+    const lsiAll = lsiKey()
+      ? inResearch
+        ? lsiToolDefinitions.filter(
+            (t) =>
+              t.type === "function" &&
+              (t.function.name !== "lsi_publish" || studyDone),
+          )
+        : lsiReadToolDefinitions
+      : [];
     if (this.toolScope !== "workspace")
       return [
         ...readOnlyToolDefinitions,
         ...(this.toolScope === "research"
-          ? toolDefinitions.filter(
-              (t) => t.type === "function" && t.function.name === "browser",
-            )
+          ? toolDefinitions
+              .filter(
+                (t) => t.type === "function" && t.function.name === "browser",
+              )
+              .concat(webTools, lsiReads)
           : []),
         ...companyToolDefinitions.filter(
           (t) =>
@@ -644,6 +669,8 @@ export class Agent {
     if (!this.canSpawn) return readOnlyToolDefinitions;
     return [
       ...toolDefinitions,
+      ...webTools,
+      ...lsiAll,
       ...planToolDefinitions,
       spawnToolDefinition,
       ...(this.allowBackground ? backgroundToolDefinitions : []),
@@ -769,7 +796,7 @@ export class Agent {
       await this.company.record("research_completed", {
         reportPath: args.reportPath,
       });
-      return "Study marked complete. Return the supported findings and report path; do not spend the unused allowance.";
+      return `Study marked complete. Return the supported findings and report path; do not spend the unused allowance.${lsiKey() ? " LSI is connected. If you claimed an LSI question or the user asked you to publish, call lsi_publish now, before your final answer: summarize the report, link artifacts as evidence, set answers_question to the claimed question, and use a domain id from lsi_domains. Otherwise publishing is optional; do not publish unasked." : ""}`;
     }
     if (name === "research_review") {
       return this.executeSpawn(
@@ -1057,9 +1084,20 @@ export class Agent {
         });
       }
       let finalReviewAttempted = false;
+      // A completed study that claimed an LSI question gets a few rounds to publish.
+      let lsiClaimed = false;
+      let lsiPublished = false;
+      let publishRounds = 0;
       let emptyResponses = 0;
       for (let round = 0; round < roundLimit; round++) {
         signal.throwIfAborted();
+        if (this.pendingNotes.length) {
+          // Direction typed while the run was busy: deliver before the next model round.
+          this.messages.push({
+            role: "user",
+            content: `User direction received while you were working. Take it into account now; if it changes the plan, say so briefly and adjust:\n${this.pendingNotes.splice(0).join("\n\n")}`,
+          });
+        }
         if (this.activeCompanyRun && this.messages[0]?.role === "system") {
           const first = this.messages[0];
           const instructions = String(first.content).replace(
@@ -1451,6 +1489,27 @@ export class Agent {
                   )
                 : output,
           });
+        for (const { call, output } of results) {
+          const done = !output.startsWith("Error:");
+          if (call.function.name === "lsi_claim" && done) lsiClaimed = true;
+          if (call.function.name === "lsi_publish" && done) lsiPublished = true;
+        }
+        if (
+          this.research &&
+          runtime.state.status === "completed" &&
+          lsiClaimed &&
+          !lsiPublished &&
+          lsiKey() &&
+          publishRounds < 3
+        ) {
+          publishRounds++;
+          this.messages.push({
+            role: "user",
+            content:
+              "Research controller: the study is complete and you claimed an LSI question. Call lsi_publish now with the reviewed findings (domain from lsi_domains, answers_question set, artifacts linked as evidence), then give the final answer.",
+          });
+          continue;
+        }
         if (this.research && runtime.state.status === "completed") {
           const completion = `Research complete. Report: ${runtime.state.finalReportPath}\nRecorded estimated cost: ${formatUsd(runtime.usedCostMicros)} USD. Unused allowance is preserved.`;
           this.messages.push({ role: "assistant", content: completion });

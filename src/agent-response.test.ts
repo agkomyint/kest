@@ -275,3 +275,23 @@ test("empty-response retries cannot overrun a shared research cost budget", asyn
     );
   });
 });
+
+test("direction queued while a run is busy is delivered before the next model round", async () => {
+  await fixture(
+    [{ delta: { content: "Understood." }, finish: "stop" }],
+    async (agent, events) => {
+      agent.pendingNotes.push("drop approach B", "focus on recall");
+      await agent.run("go", credentials, AbortSignal.timeout(5000), (event) =>
+        events.push(event),
+      );
+      const note = agent.messages.find(
+        (m) =>
+          m.role === "user" &&
+          String(m.content).includes("User direction received"),
+      );
+      expect(String(note?.content)).toContain("drop approach B");
+      expect(String(note?.content)).toContain("focus on recall");
+      expect(agent.pendingNotes).toHaveLength(0);
+    },
+  );
+});

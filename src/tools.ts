@@ -3,11 +3,13 @@ import type OpenAI from "openai";
 import { readdir, realpath, stat, mkdir } from "node:fs/promises";
 import { resolve, relative, isAbsolute, dirname, join } from "node:path";
 import { createPatch } from "diff";
+import { TavilyTools, isTavilyTool } from "./tavily";
+import { LsiTools, isLsiTool } from "./lsi";
 
 export type Approval = {
   title: string;
   preview: string;
-  kind?: "file" | "script" | "browser";
+  kind?: "file" | "script" | "browser" | "web" | "lsi";
 };
 export type Approve = (
   request: Approval,
@@ -198,6 +200,8 @@ export class WorkspaceTools {
     const env = { ...process.env };
     delete env.MODAL_PROXY_TOKEN_ID;
     delete env.MODAL_PROXY_TOKEN_SECRET;
+    delete env.TAVILY_API_KEY;
+    delete env.LSI_KEY;
     return Bun.spawn([Bun.which("bun") ?? process.execPath, "run", "-"], {
       cwd: this.root,
       env,
@@ -216,6 +220,9 @@ export class WorkspaceTools {
   ) {
     this.root = resolve(root);
   }
+
+  // One per Tools so the retry and duplicate-claim guards see every call.
+  private lsi?: LsiTools;
 
   private async path(
     input: string,
@@ -304,6 +311,10 @@ export class WorkspaceTools {
     const args = JSON.parse(raw) as Record<string, unknown>;
     if (!args || typeof args !== "object" || Array.isArray(args))
       throw new Error("Tool arguments must be an object.");
+    if (isLsiTool(name))
+      return (this.lsi ??= new LsiTools(this.approve)).execute(name, args, signal);
+    if (isTavilyTool(name))
+      return new TavilyTools(this.approve).execute(name, args, signal);
     if (name === "browser") {
       const request = browserRequest(args);
       if (

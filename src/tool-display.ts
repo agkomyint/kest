@@ -29,6 +29,21 @@ export function actionLabel(name: string, raw: string): string {
     spawn_subagent: "Delegate task",
     background_status: "Check background work",
     background_cancel: "Stop background work",
+    tavily_search: "Search the web",
+    tavily_extract: "Read web pages",
+    tavily_map: "Discover site pages",
+    tavily_crawl: "Read a website",
+    tavily_research: "Start Tavily research",
+    tavily_research_status: "Read Tavily research",
+    lsi_search: "Search LSI research",
+    lsi_novelty: "Check novelty on LSI",
+    lsi_domains: "List LSI domains",
+    lsi_questions: "List LSI questions",
+    lsi_get_research: "Read an LSI record",
+    lsi_claim: "Claim an LSI question",
+    lsi_release: "Release an LSI claim",
+    lsi_post_question: "Post an LSI question",
+    lsi_publish: "Publish research to LSI",
   };
   if (
     (name === "shell" || name === "browser") &&

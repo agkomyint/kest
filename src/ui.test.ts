@@ -6,6 +6,98 @@ import { createTestRenderer } from "@opentui/core/testing";
 import { KestUI } from "./ui";
 import { MODAL_MODEL } from "./config";
 
+test("tip arrows wrap, preserve the draft, support Alt navigation and fit narrow terminals", async () => {
+  const renderer = await createTestRenderer({ width: 100, height: 30 });
+  const ui = new KestUI(renderer.renderer, process.cwd(), null);
+  try {
+    await renderer.renderOnce();
+    expect(ui["tipRow"].visible).toBe(true);
+    expect(renderer.captureCharFrame()).toContain("Tip:");
+    const initial = ui["tipText"].plainText;
+    ui.composer.setText("Keep this draft");
+    await renderer.renderOnce();
+    expect(ui["tipText"].plainText).toBe(initial);
+    await renderer.mockMouse.click(ui["tipNext"].x + 1, ui["tipNext"].y);
+    await renderer.flush();
+    expect(ui["tipIndex"]).toBe(1);
+    expect(ui["tipText"].plainText).not.toBe(initial);
+    expect(ui.composer.plainText).toBe("Keep this draft");
+    await renderer.mockMouse.click(
+      ui["tipPrevious"].x + 1,
+      ui["tipPrevious"].y,
+    );
+    await renderer.flush();
+    expect(ui["tipIndex"]).toBe(0);
+    ui["changeTip"](-1);
+    expect(ui["tipIndex"]).toBe(ui["availableTips"].length - 1);
+    await renderer.mockInput.pressKey("ARROW_RIGHT", { meta: true });
+    await renderer.flush();
+    expect(ui["tipIndex"]).toBe(0);
+    await renderer.mockInput.pressKey("ARROW_LEFT");
+    await renderer.flush();
+    expect(ui["tipIndex"]).toBe(0);
+    expect(ui.composer.plainText).toBe("Keep this draft");
+    renderer.resize(42, 22);
+    await renderer.flush();
+    expect(ui["tipRow"].height).toBeLessThanOrEqual(2);
+    expect(ui["tipNext"].x + ui["tipNext"].width).toBeLessThanOrEqual(42);
+    expect(renderer.captureCharFrame()).toContain(
+      `1/${ui["availableTips"].length}`,
+    );
+  } finally {
+    ui.close();
+    await renderer.dispose();
+  }
+});
+
+test("tips hide for work, credentials, pickers, approvals and errors", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "kest-tips-ui-"));
+  const previous = process.env.KEST_CONFIG_DIR;
+  process.env.KEST_CONFIG_DIR = directory;
+  const renderer = await createTestRenderer({ width: 110, height: 34 });
+  const ui = new KestUI(renderer.renderer, directory, {
+    provider: "baseten",
+    apiKey: "unused",
+  });
+  try {
+    ui["showLoading"]("Working");
+    expect(ui["tipRow"].visible).toBe(false);
+    ui["stopLoading"]();
+    ui["ready"]();
+    expect(ui["tipRow"].visible).toBe(true);
+    await ui["command"]("/connect baseten");
+    expect(ui["tipRow"].visible).toBe(false);
+    ui["cancelListPicker"]();
+    ui["startKeyEntry"]("baseten", "a");
+    expect(ui["tipRow"].visible).toBe(false);
+    ui["connectStep"] = null;
+    ui["restoreInput"]();
+    const approval = ui["ask"](
+      { kind: "script", title: "Run experiment", preview: "example" },
+      new AbortController().signal,
+    );
+    expect(ui["tipRow"].visible).toBe(false);
+    ui["approval"]!.finish(false);
+    await approval;
+    ui["agent"].run = async () => {
+      throw new Error("An example failure");
+    };
+    ui.composer.setText("Run the task");
+    await ui["submit"]();
+    expect(ui["tipRow"].visible).toBe(false);
+    expect(ui["status"].plainText).toContain("Stopped");
+    expect(
+      ui["session"].entries.some((entry) => entry.text.startsWith("Tip:")),
+    ).toBe(false);
+  } finally {
+    ui.close();
+    await renderer.dispose();
+    if (previous === undefined) delete process.env.KEST_CONFIG_DIR;
+    else process.env.KEST_CONFIG_DIR = previous;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("tab completes slash commands and child subcommands with cycling", async () => {
   const testUI = await createTestRenderer({ width: 130, height: 40 });
   const ui = new KestUI(testUI.renderer, process.cwd(), null);
@@ -560,6 +652,45 @@ test("/connect baseten prompts for the Baseten API key with masking", async () =
   } finally {
     ui.close();
     await testUI.dispose();
+  }
+});
+
+test("/connect tavily masks and stores its key, preserves the model, and shows every added tool", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "kest-tavily-ui-"));
+  const previous = process.env.KEST_CONFIG_DIR;
+  process.env.KEST_CONFIG_DIR = directory;
+  const renderer = await createTestRenderer({ width: 130, height: 42 });
+  const ui = new KestUI(renderer.renderer, process.cwd(), {
+    provider: "baseten",
+    apiKey: "model-key-fixture",
+  });
+  try {
+    await ui["command"]("/connect tavily");
+    await renderer.mockInput.pasteBracketedText("tvly-secret-fixture");
+    await renderer.renderOnce();
+    expect(renderer.captureCharFrame()).toContain("Tavily API key");
+    expect(renderer.captureCharFrame()).not.toContain("tvly-secret-fixture");
+    await ui["submitSecret"]();
+    expect(ui["credentials"]).toEqual({
+      provider: "baseten",
+      apiKey: "model-key-fixture",
+    });
+    expect(ui["connectStep"]).toBeNull();
+    const { tavilyCapabilities, tavilyKey } = await import("./tavily");
+    expect(tavilyKey()).toBe("tvly-secret-fixture");
+    const announcement = ui["session"].entries.at(-1)!.text;
+    for (const [name] of tavilyCapabilities)
+      expect(announcement).toContain(name);
+    expect(announcement).toContain("billed separately");
+    expect(JSON.stringify(ui["session"])).not.toContain("tvly-secret-fixture");
+    await ui["command"]("/tools");
+    expect(ui["session"].entries.at(-1)?.text).toContain("tavily_search");
+  } finally {
+    ui.close();
+    await renderer.dispose();
+    if (previous === undefined) delete process.env.KEST_CONFIG_DIR;
+    else process.env.KEST_CONFIG_DIR = previous;
+    await rm(directory, { recursive: true, force: true });
   }
 });
 
@@ -1613,7 +1744,7 @@ test("tool timing appears on rows and /stats aggregates all saved sessions", asy
     ui.composer.setText("/stat");
     ui.composer.submit();
     await ui.settled;
-    expect(ui["session"].entries.at(-1)?.text).toBe("Unknown command. /help");
+    expect(ui["session"].entries.at(-1)?.text).toContain("Did you mean /stats?");
   } finally {
     ui.close();
     await testUI.dispose();
@@ -1783,6 +1914,200 @@ test("long tool input and output have independent bounded scroll panels", async 
     await Bun.sleep(40);
     await testUI.flush();
     expect(ui.composer.focused).toBe(true);
+  } finally {
+    ui.close();
+    await testUI.dispose();
+  }
+});
+
+test("slash menu lists descriptions, arrows select, Enter fills before sending", async () => {
+  const testUI = await createTestRenderer({ width: 130, height: 40 });
+  const ui = new KestUI(testUI.renderer, process.cwd(), null);
+  const press = (name: string) =>
+    ui["key"]({ name, preventDefault: () => {}, stopPropagation: () => {} } as never);
+  try {
+    ui.composer.setText("/");
+    ui["inputChanged"]();
+    await testUI.renderOnce();
+    const frame = testUI.captureCharFrame();
+    expect(frame).toContain("▸ /connect");
+    expect(frame).toContain("budgeted research team");
+
+    press("down");
+    expect(ui["menu"]?.index).toBe(1);
+    const picked = ui["menu"]!.items[1]!;
+    await ui["submit"]();
+    expect(ui.composer.plainText.trim()).toBe(picked);
+
+    ui.composer.setText("/research budget");
+    ui["inputChanged"]();
+    await testUI.renderOnce();
+    expect(testUI.captureCharFrame()).toContain("<amount>$ · e.g. 10$");
+  } finally {
+    ui.close();
+    await testUI.dispose();
+  }
+});
+
+test("a study keeps running in the background while chat is used, and replays when opened", async () => {
+  const testUI = await createTestRenderer({ width: 100, height: 30 });
+  const ui = new KestUI(testUI.renderer, process.cwd(), {
+    provider: "baseten",
+    apiKey: "not-used",
+  });
+  try {
+    const { newCompany } = await import("./research-company");
+    const { newSession } = await import("./sessions");
+    const session = newSession(process.cwd(), []);
+    session.research = newCompany("Compare indexing algorithms");
+    session.title = "Compare indexing algorithms";
+    const room = ui["addStudyRoom"](session);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    room.agent.run = async (_input, _credentials, _signal, emit) => {
+      emit({ type: "text", delta: "Director note alpha " });
+      await gate;
+      emit({ type: "text", delta: "beta" });
+    };
+    const chat = ui["rooms"].focused!;
+    expect(chat.kind).toBe("chat");
+    const turn = ui["runTurn"](room, "go");
+    await Bun.sleep(5);
+    expect(room.running).toBe(true);
+    expect(chat.running).toBe(false);
+    expect(ui["rooms"].running()).toEqual([room]);
+    expect(room.buffer.length).toBeGreaterThan(0);
+    ui["drawBar"]();
+    await testUI.renderOnce();
+    expect(testUI.captureCharFrame()).toContain("Compare indexing");
+    expect(testUI.captureCharFrame()).not.toContain("alpha");
+
+    release();
+    await turn;
+    expect(room.running).toBe(false);
+    expect(room.question).toContain("alpha beta");
+    expect(room.status).not.toBe("running");
+
+    expect(ui["focusRoom"](room)).toBe(true);
+    await testUI.renderOnce();
+    expect(ui["agent"]).toBe(room.agent);
+    expect(testUI.captureCharFrame()).toContain("Director note alpha beta");
+    expect(room.question).toBeNull();
+    ui["focusRoom"](chat);
+    await testUI.renderOnce();
+    expect(ui["agent"]).toBe(chat.agent);
+    expect(testUI.captureCharFrame()).not.toContain("Director note alpha");
+  } finally {
+    ui.close();
+    await testUI.dispose();
+  }
+});
+
+test("/research prepare opens a study room; chat is untouched; saved studies return as paused rooms", async () => {
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const directory = await mkdtemp(join(tmpdir(), "kest-rooms-"));
+  const firstRenderer = await createTestRenderer({ width: 110, height: 30 });
+  const first = new KestUI(firstRenderer.renderer, directory, {
+    provider: "baseten",
+    apiKey: "not-used",
+  });
+  let chatId = "";
+  try {
+    chatId = first["session"].id;
+    await first["command"]("/research prepare Study one");
+    await first["command"]("/research budget 3$");
+    const one = first["rooms"].focused!;
+    expect(one.kind).toBe("study");
+    expect(one.study?.objective).toBe("Study one");
+    await first["command"]("/chat");
+    expect(first["session"].id).toBe(chatId);
+    await first["command"]("/research prepare Study two");
+    expect(first["rooms"].studies().length).toBe(2);
+    expect(first["rooms"].focused).not.toBe(one);
+    first["rooms"].limits.maxRunning = 0;
+    first["rooms"].limits.totalUsd = null;
+    await first["command"]("/research budget 2$");
+    await first["command"]("/research start");
+    expect(first["session"].entries.at(-1)?.text).toContain("limit 0");
+    expect(first["rooms"].focused!.running).toBe(false);
+    await first["command"]("/chat");
+    await first["command"]("/research show");
+    const shown = first["session"].entries.at(-1)!.text;
+    expect(shown).toContain("Study one");
+    expect(shown).toContain("Study two");
+  } finally {
+    first.close();
+    await firstRenderer.dispose();
+  }
+  const secondRenderer = await createTestRenderer({ width: 110, height: 30 });
+  const second = new KestUI(secondRenderer.renderer, directory, null);
+  try {
+    await second.showSavedResearchHint();
+    expect(second["rooms"].focused!.kind).toBe("chat");
+    expect(second["rooms"].studies().map((r) => r.study?.objective).sort()).toEqual(["Study one", "Study two"]);
+    expect(second["rooms"].studies().every((r) => !r.running)).toBe(true);
+    await second["command"]("/research budget 4$");
+    expect(second["rooms"].focused!.kind).toBe("chat");
+    expect(second["session"].entries.at(-1)?.text).toContain("Multiple saved research studies");
+    const target = second["rooms"].find("two")[0]!;
+    second["focusRoom"](target);
+    await second["command"]("/research budget 4$");
+    expect(second["agent"].research?.maxCostUsd).toBe(4);
+  } finally {
+    second.close();
+    await secondRenderer.dispose();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a background study queues approvals, shows needs-you, and presents them when opened", async () => {
+  const testUI = await createTestRenderer({ width: 110, height: 30 });
+  const ui = new KestUI(testUI.renderer, process.cwd(), {
+    provider: "baseten",
+    apiKey: "not-used",
+  });
+  try {
+    const { newCompany } = await import("./research-company");
+    const { newSession } = await import("./sessions");
+    const session = newSession(process.cwd(), []);
+    session.research = newCompany("Tokenizer comparison");
+    session.title = "Tokenizer comparison";
+    const room = ui["addStudyRoom"](session);
+    const chat = ui["rooms"].focused!;
+    const controller = new AbortController();
+    const answer = ui["askFor"](
+      room.agent,
+      { title: "Run script", preview: "bun run bench.ts", kind: "script" },
+      controller.signal,
+    );
+    expect(ui["approval"]).toBeNull();
+    expect(room.status).toBe("needs-you");
+    await testUI.renderOnce();
+    const frame = testUI.captureCharFrame();
+    expect(frame).toContain("Tokenizer comparison");
+    expect(frame).toContain("wants approval: Run script");
+    expect(ui.composer.placeholder).toContain("Build, fix");
+
+    ui["focusRoom"](room);
+    await Bun.sleep(5);
+    expect(ui["approval"]).not.toBeNull();
+    expect(ui.composer.placeholder).toContain("to director");
+    ui["approval"]!.finish(true);
+    expect(await answer).toBe(true);
+    expect(room.pending.length).toBe(0);
+
+    // Aborting a room rejects approvals it still has queued.
+    ui["focusRoom"](chat);
+    const aborted = ui["askFor"](
+      room.agent,
+      { title: "Edit file", preview: "x", kind: "file" },
+      controller.signal,
+    );
+    controller.abort();
+    expect(await aborted).toBe(false);
+    expect(room.pending.length).toBe(0);
   } finally {
     ui.close();
     await testUI.dispose();

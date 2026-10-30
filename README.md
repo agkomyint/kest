@@ -65,6 +65,8 @@ Inside Kest, run `/connect` and select a provider, or go directly:
 /connect nebius
 /connect baseten
 /connect modal
+/connect tavily
+/connect lsi
 ```
 
 Enter credentials in the masked connection prompt. Choose a model with `/model`, then type a request:
@@ -74,6 +76,31 @@ Read this project and explain how its pieces fit together.
 ```
 
 Credentials are stored in plaintext in your local Kest config, outside the repository. Environment variables are supported; see [.env.example](.env.example). Never enter keys into ordinary chat.
+
+### Publish to LSI
+
+Create an API key on the LSI account page, run `/connect lsi`, and paste it. Search, novelty checks and question listing are automatic. Claiming and posting questions are available only inside a `/research` run, and publishing unlocks only after the director completes the study (independent review done, final report saved); plain chat and workers can only read. Claiming, posting questions and publishing research follow `--permission`: `strict` and `minimal` ask first, `all` approves them automatically, so a full-auto run can publish under your account. LSI stores light text and links only: host heavy data yourself and link it as evidence. `LSI_KEY` and `LSI_BASE_URL` (https only) also work.
+
+### Add Tavily web research
+
+Run `/connect tavily`, paste your Tavily API key into the masked prompt, and press Enter. Kest saves it separately from your model connection and immediately shows the new tools. `/tools` lists them again. You can also set `TAVILY_API_KEY` before launching Kest; a saved key takes precedence.
+
+| Tool | What it adds |
+| --- | --- |
+| `tavily_search` | Web search with source URLs and snippets. |
+| `tavily_extract` | Readable content from selected URLs. |
+| `tavily_map` | Discover relevant pages within a website. |
+| `tavily_crawl` | Bounded exploration with page extraction. |
+| `tavily_research` | Start an asynchronous Tavily research task. |
+| `tavily_research_status` | Retrieve its status, report, and sources using the returned request ID. |
+
+Try: “Find primary sources comparing B-trees and learned indexes, then read the two most relevant papers.” Activity rows use readable labels; expand them for technical names, requests, outputs, and timing.
+
+These tools become available to the director and research-scoped workers when a key is configured. Local-only workers remain offline. `strict` and `minimal` permissions ask before new Tavily requests; `all` approves them automatically. Reading an existing research task does not start another job. Requests have timeouts, bounded result counts, and no automatic retries. Map/crawl stay on-site by default; use focused searches and selected URL extraction before broad crawling.
+
+**Tavily uses separate credits, outside `/research budget`.** Returned usage is shown when supplied by Tavily. Remote research tasks can continue after local cancellation; keep their request IDs and retrieve them rather than creating duplicates. Tavily reports are external generated analysis and do not replace independent review of local experiments. Keys live in `~/.kest/tavily.json` (or `KEST_CONFIG_DIR`); they are excluded from chat/tool definitions and inherited script environment variables.
+
+Implementation references: [Search](https://docs.tavily.com/documentation/api-reference/endpoint/search), [Extract](https://docs.tavily.com/documentation/api-reference/endpoint/extract), [Map](https://docs.tavily.com/documentation/api-reference/endpoint/map), [Crawl](https://docs.tavily.com/documentation/api-reference/endpoint/crawl), [Research](https://docs.tavily.com/documentation/api-reference/endpoint/research), [task retrieval](https://docs.tavily.com/documentation/api-reference/endpoint/research-get), and [credit pricing](https://docs.tavily.com/documentation/api-credits). Checked 2026-10-30.
 
 ## Research with a budget
 
@@ -120,6 +147,10 @@ Custom endpoints store an environment variable name, never its secret value. Pro
 
 </details>
 
+## Several studies at once
+
+Each study is a room with its own director, workers, browser and approvals. Studies run truly in parallel: start one, press `/chat` or Ctrl+K, start another, and keep chatting. A bar above the prompt shows every room (`● running`, `▲ needs you`, `⏸ paused`, `✓ done`); open a room to read its transcript, answer its approvals, or type direction to the director while it works. `/research resume|wrapup|budget <title words>` targets a study by fuzzy title or id. `/research total` caps combined spend (running studies pause when it is reached); `/research parallel` caps concurrency (default 3). Two studies in one Kest never claim the same LSI question. Closing Kest pauses running studies; they return as paused rooms next launch.
+
 ## Commands
 
 | Command | What it does |
@@ -128,8 +159,13 @@ Custom endpoints store an environment variable name, never its secret value. Pro
 | `/research prepare <objective>` | Save an objective without model calls. |
 | `/research budget 10$` | Set the total USD allowance. |
 | `/research start` | Launch the prepared study. |
-| `/research show` | Inspect saved research in this workspace. |
+| `/research` or `/rooms` (Ctrl+K) | Pick a study room; the picker shows status and spend. |
+| `/research show [study]` | List saved studies, or inspect one by fuzzy title or id. |
+| `/research open [report\|evidence\|reviews\|timeline] [study]` | Read a study's report, evidence files, independent reviews or event timeline. |
+| `/research total 30$`, `/research parallel 3` | One allowance across all studies (`off` removes it), and how many may run at once (1–10). Both persist. |
+| `/chat` | Leave a study room for chat. The study keeps running. |
 | `/research resume` | Continue without resetting consumption. |
+| `/research wrapup` | Stop new experiments, run independent review, write the final report, and publish to LSI if connected. |
 | `/agents [id-prefix]` | Inspect workers and transcripts. |
 | `/goal <text>`, `/tasks` | Set the objective and inspect its plan. |
 | `/browser [url]`, `/browser close` | Open or close Kest’s browser. |
@@ -140,6 +176,8 @@ Custom endpoints store an environment variable name, never its secret value. Pro
 | `/new`, `/help`, `/exit` | Start fresh, view help, or quit. |
 
 ## At the keyboard
+
+An idle tip row sits between the model tag and prompt. Click **‹ / ›** or press **Alt+Left / Alt+Right** to browse without changing your draft. Tips wrap around, stay still while you type, and hide during work, approvals, credential entry, and errors. The editable catalog is [tips.md](tips.md).
 
 **Enter** sends; **Shift+Enter / Ctrl+Enter** inserts a newline. **Tab** completes commands. **Up / Down** browses prompt history. **Esc / Ctrl+C** cancels active work and pauses research. Scroll with the wheel or **PgUp / PgDn**; click tool rows to expand. Drag to select, then **Ctrl+C / Ctrl+Y** to copy.
 

@@ -10,4 +10,4 @@ export function autoApprove(level: Permission, request: Approval): boolean {
   return level === "all" || (level === "minimal" && request.kind === "file");
 }
 export const permissionHelp =
-  "all: auto-approve edits, writes, Bun scripts, and browser actions\nminimal: auto-approve edits and writes; ask before Bun scripts and browser actions\nstrict: ask before every edit, write, Bun script, and browser action (default)";
+  "all: auto-approve edits, writes, Bun scripts, browser actions, and Tavily requests\nminimal: auto-approve edits and writes; ask before Bun scripts, browser actions, and Tavily requests\nstrict: ask before every edit, write, Bun script, browser action, and Tavily request (default). Tavily research status checks do not create paid tasks.";
