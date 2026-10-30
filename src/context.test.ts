@@ -10,6 +10,7 @@ import {
   contextReport,
   formatContext,
   MEMORY_PREFIX,
+  observationExcerpt,
 } from "./context";
 import { newSession, saveSession, listSessions } from "./sessions";
 
@@ -17,6 +18,21 @@ const credentials = {
   provider: "baseten" as const,
   apiKey: "test-only-no-network",
 };
+
+test("observation excerpts respect byte limits without splitting Unicode evidence", () => {
+  const output = "測定値🙂".repeat(1000);
+  const excerpt = observationExcerpt(
+    output,
+    1000,
+    "events.jsonl, toolCallId example",
+  );
+  expect(Buffer.byteLength(excerpt)).toBeLessThanOrEqual(1000);
+  expect(excerpt).not.toContain("\uFFFD");
+  expect(excerpt).toContain("Observation excerpt");
+  expect(observationExcerpt("Small complete result", 1000, "journal")).toBe(
+    "Small complete result",
+  );
+});
 const summary =
   "Objective: improve context management. Keep TypeScript. Completed src/example.ts; tests passed. Next: verify session persistence. Do not delete user changes.";
 function history(): Message[] {
@@ -97,19 +113,36 @@ test("oversized final completed tool batch can be archived without an extra mode
   const messages: Message[] = [
     { role: "system", content: "Keep evidence." },
     { role: "user", content: "Continue this research." },
-    { role: "assistant", content: null, tool_calls: ["read", "search"].map(id => ({
-      id, type: "function" as const, function: { name: "read_file", arguments: "{}" },
-    })) },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: ["read", "search"].map((id) => ({
+        id,
+        type: "function" as const,
+        function: { name: "read_file", arguments: "{}" },
+      })),
+    },
     { role: "tool", tool_call_id: "read", content: "log entry ".repeat(4000) },
-    { role: "tool", tool_call_id: "search", content: "search result ".repeat(3000) },
+    {
+      role: "tool",
+      tool_call_id: "search",
+      content: "search result ".repeat(3000),
+    },
   ];
   const state = newContext();
   const plan = planCompaction(messages, [], state)!;
   expect(plan).not.toBeNull();
-  const compacted = commitCompaction(plan, "Logs inspected; original evidence is archived. Continue reviewing the study.", [], state);
+  const compacted = commitCompaction(
+    plan,
+    "Logs inspected; original evidence is archived. Continue reviewing the study.",
+    [],
+    state,
+  );
   expect(compacted.at(-1)).toEqual(messages[1]);
-  expect(compacted.some(m => m.role === "tool")).toBe(false);
-  expect(contextReport(compacted, [], state).input + 4096).toBeLessThan(contextReport(compacted, [], state).budget);
+  expect(compacted.some((m) => m.role === "tool")).toBe(false);
+  expect(contextReport(compacted, [], state).input + 4096).toBeLessThan(
+    contextReport(compacted, [], state).budget,
+  );
   assertCompleteGroups(state.archive);
   expect(state.archive).toHaveLength(3);
 });

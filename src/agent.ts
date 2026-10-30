@@ -11,6 +11,7 @@ import {
   commitCompaction,
   MEMORY_PREFIX,
   OUTPUT_RESERVE,
+  observationExcerpt,
   type ContextState,
 } from "./context";
 import {
@@ -1367,6 +1368,7 @@ export class Agent {
           observed.push(durationMs);
           this.toolDurations.set(name, observed.slice(-20));
           await runtime.record("tool_result", {
+            toolCallId: call.id,
             agentId: this.agentId,
             depth: this.depth,
             name,
@@ -1416,11 +1418,22 @@ export class Agent {
             results.push(await runOne(toolCalls[index++]!));
           }
         }
+        const observationLimit = Math.min(
+          8000,
+          Math.max(256, Math.floor(16000 / Math.max(1, results.length))),
+        );
         for (const { call, output } of results)
           this.messages.push({
             role: "tool",
             tool_call_id: call.id,
-            content: output,
+            content:
+              this.activeCompanyRun && runtime.directory
+                ? observationExcerpt(
+                    output,
+                    observationLimit,
+                    `research/${runtime.state.id}/events.jsonl, toolCallId ${call.id}`,
+                  )
+                : output,
           });
         if (this.research && runtime.state.status === "completed") {
           const completion = `Research complete. Report: ${runtime.state.finalReportPath}\nRecorded estimated cost: ${formatUsd(runtime.usedCostMicros)} USD. Unused allowance is preserved.`;

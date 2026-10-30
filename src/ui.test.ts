@@ -88,20 +88,32 @@ test("research commands configure models and budgets without starting paid work"
     expect(preparedStats).toContain("Cost budget: not set");
     expect(preparedStats).toContain("Requests: 0");
     // A fresh UI has no active study, but can still inspect the saved session.
-    const reopenedRenderer = await createTestRenderer({ width: 130, height: 40 });
+    const reopenedRenderer = await createTestRenderer({
+      width: 130,
+      height: 40,
+    });
     const reopened = new KestUI(reopenedRenderer.renderer, process.cwd(), null);
     try {
+      await reopened.showSavedResearchHint();
+      expect(reopened["session"].entries.at(-1)?.text).toContain(
+        "Saved research",
+      );
+      expect(reopened["session"].entries.at(-1)?.text).toContain(
+        "New indexing study",
+      );
       await reopened["command"]("/research show");
       const savedStats = reopened["session"].entries.at(-1)!.text;
       expect(savedStats).toContain("New indexing study");
       expect(savedStats).toContain("prepared (not started)");
-      expect(savedStats).toContain(`/resume ${ui["session"].id}`);
+      expect(savedStats).toContain(`/resume ${ui["session"].id.slice(0, 8)}`);
       expect(reopened["session"].research).toBeUndefined();
       const savedId = ui["session"].research!.id;
       await reopened["command"]("/research budget 12$");
       expect(reopened["session"].id).toBe(ui["session"].id);
       expect(reopened["session"].research?.id).toBe(savedId);
-      expect(reopened["session"].research?.objective).toBe("New indexing study");
+      expect(reopened["session"].research?.objective).toBe(
+        "New indexing study",
+      );
       expect(reopened["agent"].research?.maxCostUsd).toBe(12);
       expect(reopened["agent"].research?.status).toBe("ready");
     } finally {
@@ -131,13 +143,17 @@ test("research commands configure models and budgets without starting paid work"
     ui["credentials"] = { provider: "baseten", apiKey: "not-used" };
     const originalSubmit = ui["submit"].bind(ui);
     const launched: string[] = [];
-    ui["submit"] = async () => { launched.push(ui.composer.plainText); };
+    ui["submit"] = async () => {
+      launched.push(ui.composer.plainText);
+    };
     try {
       await ui["command"]("/research start");
       expect(ui["session"].research).toBe(prepared);
       expect(ui["agent"].research).toBe(prepared);
       expect(prepared.maxCostUsd).toBe(10);
-      expect(launched[0]).toContain("Research objective: Prepared launch study");
+      expect(launched[0]).toContain(
+        "Research objective: Prepared launch study",
+      );
       prepared.status = "paused";
       prepared.spentCostMicros = 100;
       await ui["command"]("/research resume");
@@ -152,6 +168,73 @@ test("research commands configure models and budgets without starting paid work"
   } finally {
     ui.close();
     await testUI.dispose();
+    if (previous === undefined) delete process.env.KEST_CONFIG_DIR;
+    else process.env.KEST_CONFIG_DIR = previous;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("new studies preserve old sessions; off retains research and completed budgets stay closed", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "kest-study-lifecycle-"));
+  const previous = process.env.KEST_CONFIG_DIR;
+  process.env.KEST_CONFIG_DIR = directory;
+  const renderer = await createTestRenderer({ width: 100, height: 30 });
+  const ui = new KestUI(renderer.renderer, directory, {
+    provider: "baseten",
+    apiKey: "not-used",
+  });
+  try {
+    await ui["command"]("/research prepare First study");
+    await ui["command"]("/research budget 5$");
+    const first = ui["session"];
+    ui["agent"].messages.push({
+      role: "assistant",
+      content: "UNRELATED_FIRST_STUDY",
+    });
+    await ui["command"]("/research prepare Second study");
+    expect(ui["session"].id).not.toBe(first.id);
+    expect(JSON.stringify(ui["agent"].messages)).not.toContain(
+      "UNRELATED_FIRST_STUDY",
+    );
+    const { listSessions } = await import("./sessions");
+    expect(
+      (await listSessions(directory)).find((s) => s.id === first.id)?.research
+        ?.maxCostUsd,
+    ).toBe(5);
+    await ui["command"]("/research budget 10$");
+    const study = ui["session"].research!;
+    await ui["command"]("/research off");
+    expect(ui["agent"].research).toBeNull();
+    expect(ui["session"].research).toBe(study);
+    expect(ui["session"].researchEnabled).toBe(false);
+    ui["agent"].run = async () => {};
+    ui.composer.setText("An ordinary chat");
+    await ui["submit"]();
+    expect(ui["session"].research).toBe(study);
+    const originalSubmit = ui["submit"];
+    let continuation = "";
+    ui["submit"] = async () => {
+      continuation = ui.composer.plainText;
+    };
+    try {
+      study.status = "paused";
+      await ui["command"]("/research resume");
+      expect(ui["session"].researchEnabled).toBe(true);
+      expect(ui["agent"].research).toBe(study);
+      expect(continuation).toContain("saved checkpoint");
+      expect(continuation.length).toBeLessThan(650);
+    } finally {
+      ui["submit"] = originalSubmit;
+    }
+    study.status = "completed";
+    study.finalReportPath = `research/${study.id}/report.md`;
+    await ui["command"]("/research budget 20$");
+    expect(study.status).toBe("completed");
+    expect(study.maxCostUsd).toBe(10);
+    expect(ui["session"].entries.at(-1)?.text).toContain("study is complete");
+  } finally {
+    ui.close();
+    await renderer.dispose();
     if (previous === undefined) delete process.env.KEST_CONFIG_DIR;
     else process.env.KEST_CONFIG_DIR = previous;
     await rm(directory, { recursive: true, force: true });
@@ -191,7 +274,10 @@ test("research budget restores a paused funded study after restart and rejects a
     expect(study.estimatedCostMicros).toBe(100_000);
     expect(study.requests).toBe(8);
     expect(study.status).toBe("paused");
-    expect((await listSessions(directory)).find(s => s.research?.id === studyId)?.research?.maxCostUsd).toBe(10);
+    expect(
+      (await listSessions(directory)).find((s) => s.research?.id === studyId)
+        ?.research?.maxCostUsd,
+    ).toBe(10);
     const { newSession } = await import("./sessions");
     const { newCompany } = await import("./research-company");
     const another = newSession(directory, []);
@@ -200,7 +286,9 @@ test("research budget restores a paused funded study after restart and rejects a
     await second["command"]("/new");
     await second["command"]("/research budget 20$");
     expect(second["session"].research).toBeUndefined();
-    expect(second["session"].entries.at(-1)?.text).toContain("Multiple saved research studies");
+    expect(second["session"].entries.at(-1)?.text).toContain(
+      "Multiple saved research studies",
+    );
   } finally {
     second.close();
     await secondRenderer.dispose();
@@ -212,10 +300,16 @@ test("research budget restores a paused funded study after restart and rejects a
 
 test("failed turns clear summarizing status and leave no loading timer", async () => {
   const testUI = await createTestRenderer({ width: 100, height: 30 });
-  const ui = new KestUI(testUI.renderer, process.cwd(), { provider: "baseten", apiKey: "not-used" });
+  const ui = new KestUI(testUI.renderer, process.cwd(), {
+    provider: "baseten",
+    apiKey: "not-used",
+  });
   try {
     ui["agent"].run = async (_text, _credentials, _signal, emit) => {
-      emit({ type: "status", text: "Summarizing context · 18s · Esc to cancel" });
+      emit({
+        type: "status",
+        text: "Summarizing context · 18s · Esc to cancel",
+      });
       throw new Error("Context exceeds the local budget");
     };
     ui.composer.setText("Continue");

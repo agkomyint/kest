@@ -12,6 +12,126 @@ import {
   replaceCheckpoint,
 } from "./research-company";
 
+test("large research observations stay bounded for the model while full returned outputs remain journaled", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "kest-research-observations-"));
+  const state = newCompany(
+    "Inspect existing evidence without flooding context",
+  );
+  state.maxCostUsd = 10;
+  state.reviews = 1; // This fixture starts after an independent review.
+  state.costRates[costKey("fixture", "fixture")] = { input: 1, output: 1 };
+  const reportPath = `research/${state.id}/report.md`;
+  const runtime = new CompanyRuntime(state, cwd);
+  await runtime.record("fixture_started", {});
+  await writeFile(
+    join(cwd, reportPath),
+    "# Reviewed fixture report\nEvidence is retained locally.",
+  );
+  await writeFile(
+    join(cwd, "evidence.txt"),
+    "Measured evidence. ".repeat(3000),
+  );
+  const observations: string[] = [];
+  let requests = 0;
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const body = (await request.json()) as any;
+      requests++;
+      if (requests === 2)
+        observations.push(
+          ...body.messages
+            .filter((m: any) => m.role === "tool")
+            .map((m: any) => m.content),
+        );
+      const calls =
+        requests === 1
+          ? ["first", "second"].map((id) => ({
+              id,
+              type: "function",
+              function: {
+                name: "read_file",
+                arguments: JSON.stringify({ path: "evidence.txt" }),
+              },
+            }))
+          : [
+              {
+                id: "complete",
+                type: "function",
+                function: {
+                  name: "research_complete",
+                  arguments: JSON.stringify({ reportPath }),
+                },
+              },
+            ];
+      const chunk = {
+        id: "fixture",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "fixture",
+        usage: { prompt_tokens: 100, completion_tokens: 10 },
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: calls.map((call, index) => ({ ...call, index })),
+            },
+            finish_reason: "tool_calls",
+          },
+        ],
+      };
+      return new Response(
+        `data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`,
+        {
+          headers: { "Content-Type": "text/event-stream", Connection: "close" },
+        },
+      );
+    },
+  });
+  const agent = new Agent(cwd, async () => false);
+  agent.research = state;
+  agent.connectionOverride = {
+    provider: "fixture",
+    baseURL: `http://127.0.0.1:${server.port}/v1`,
+    apiKey: "unused",
+    model: "fixture",
+  };
+  try {
+    await agent.run(
+      "Inspect the evidence and complete the reviewed fixture.",
+      { provider: "baseten", apiKey: "unused" },
+      AbortSignal.timeout(5000),
+      () => {},
+    );
+    expect(requests).toBe(2);
+    expect(observations).toHaveLength(2);
+    expect(
+      observations.every((output) => output.includes("Observation excerpt")),
+    ).toBe(true);
+    expect(
+      observations.reduce((sum, output) => sum + Buffer.byteLength(output), 0),
+    ).toBeLessThanOrEqual(16000);
+    const journal = (
+      await readFile(join(runtime.directory!, "events.jsonl"), "utf8")
+    )
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    const original = journal.find(
+      (event) =>
+        event.kind === "tool_result" && event.data.toolCallId === "first",
+    );
+    expect(original.data.output.length).toBeGreaterThan(24000);
+    expect(original.data.output).not.toContain("Observation excerpt");
+    expect(agent.research.status).toBe("completed");
+  } finally {
+    server.stop(true);
+    await agent.browser.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("checkpoint replacement retries transient Windows denials without deleting the old state", async () => {
   let attempts = 0;
   await replaceCheckpoint("new", "old", async () => {

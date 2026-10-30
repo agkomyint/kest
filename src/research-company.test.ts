@@ -208,6 +208,11 @@ test("research checkpoints recover consumed budget without renewal, and reject u
     );
     expect(events).toContain("worker-a");
     expect(events).toContain("model_request");
+    state.finalReportPath = `research/${state.id}/report.md`;
+    await runtime.finish("completed");
+    await recoverCompany(cwd, stale);
+    expect(stale.status).toBe("completed");
+    expect(stale.finalReportPath).toBe(state.finalReportPath);
     expect(() => validateCompany({ ...state, id: "../../escape" })).toThrow();
     expect(() => validateCompany({ ...state, parallel: 0 })).toThrow();
     expect(() => validateCompany({ ...state, maxRequests: NaN })).toThrow();

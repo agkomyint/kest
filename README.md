@@ -87,6 +87,8 @@ Prepare an objective, choose a total allowance, and start:
 
 Preparation and budget configuration make no model calls. Starting research uses connected providers and can spend credits.
 
+Each new objective gets a separate saved session. The status line shows its state and money left; `/research show` gives the next action. `/research off` disables continuation while preserving the saved study.
+
 ![A prepared study showing its objective, ten-dollar budget, zero spending, and start command](docs/images/research.png)
 
 **Close Kest and come back later.** `/research show` lists saved studies for the current workspace, including prepared studies. With one unfinished study, `/research budget`, bare `/research start`, and `/research resume` restore it automatically. With several, use `/resume <session-id>` to select one from `/research show`.
@@ -163,5 +165,7 @@ bun run release:pack   # Archive + checksum in release/
 CI pins Bun 1.4.4, caches dependencies, and cancels superseded branch runs. Pushes and pull requests run type checks, tests, and a bundle build. Native Windows and Linux builds run in parallel for tags and manual runs. Tag releases publish archives after checks pass.
 
 Regenerate the UI images with `bun run scripts/readme-screenshots.ts`. This uses installed Chrome, an isolated temporary config, and no provider requests.
+
+See the [research workflow review](docs/research-review.md) for lifecycle fixes, context optimizations, validation, and remaining limits.
 
 For headless usage, context compaction, pricing, browser tools, storage, and live smoke tests, see the [technical reference](docs/reference.md). Live smoke scripts use provider credits; normal tests do not need provider credentials.

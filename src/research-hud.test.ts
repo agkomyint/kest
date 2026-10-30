@@ -40,6 +40,8 @@ test("budgetHud shows only the dollar allowance and cost pressure", () => {
   state.spentCostMicros = 3_000_000;
   state.estimatedCostMicros = 500_000;
   expect(budgetHud(state)).toContain("$3.5000/$10.00");
+  expect(budgetHud(state)).toContain("prepared");
+  expect(budgetHud(state)).toContain("$6.50 left");
   expect(budgetHud(state)).not.toContain("tok");
   expect(budgetHud(state)).not.toContain("⏱");
   expect(shouldOpenBudgetDecision(state)).toBe(false);

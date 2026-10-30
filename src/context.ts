@@ -62,6 +62,29 @@ export function contextBudget() {
 export function estimateTokens(value: unknown): number {
   return Math.ceil(Buffer.byteLength(JSON.stringify(value) ?? "", "utf8") / 4);
 }
+
+// Keep research observations proportional to the working context. Originals
+// are journaled before this is called; excerpts must never look like full data.
+export function observationExcerpt(
+  output: string,
+  maxBytes: number,
+  source: string,
+): string {
+  const bytes = Buffer.from(output, "utf8");
+  if (bytes.length <= maxBytes) return output;
+  const marker = `\n[Observation excerpt; middle omitted. Full output: ${source}. Inspect relevant evidence before drawing conclusions.]\n`;
+  const available = Math.max(0, maxBytes - Buffer.byteLength(marker));
+  const head = Math.floor(available * 0.75);
+  const tail = available - head;
+  let tailStart = bytes.length - tail;
+  while (tailStart < bytes.length && (bytes[tailStart]! & 0xc0) === 0x80)
+    tailStart++;
+  return (
+    new TextDecoder().decode(bytes.subarray(0, head), { stream: true }) +
+    marker +
+    (tail ? bytes.subarray(tailStart).toString("utf8") : "")
+  );
+}
 function isMemory(message: Message) {
   return (
     message.role === "assistant" &&
@@ -135,7 +158,8 @@ export function planCompaction(
       report.trigger * 0.7
   ) {
     const eligible = cuts.filter(
-      (i) => i > starts.at(-1)! &&
+      (i) =>
+        i > starts.at(-1)! &&
         (i < history.length || history.at(-1)?.role === "tool"),
     );
     const target = Math.floor(history.length * 0.65);

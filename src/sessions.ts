@@ -24,6 +24,7 @@ export type Session = {
   toolStats?: import("./stats").ToolTiming[];
   context?: import("./context").ContextState;
   research?: import("./research-company").CompanyState;
+  researchEnabled?: boolean;
 };
 export function sessionsDir() {
   return join(process.env.KEST_CONFIG_DIR?.trim() || configDir, "sessions");

@@ -73,6 +73,7 @@ import {
   formatCompany,
   parseCostBudget,
   recoverCompany,
+  researchStatus,
 } from "./research-company";
 import { listWorkerRecords, workerTranscript } from "./research-workers";
 import {
@@ -451,7 +452,10 @@ export class KestUI {
       context,
     );
     agent.modelOverride = this.effectiveModel();
-    agent.research = this.session?.research ?? null;
+    agent.research =
+      this.session?.researchEnabled === false
+        ? null
+        : (this.session?.research ?? null);
     agent.onBackground = () => {
       void this.wakeFromBackground();
     };
@@ -460,7 +464,11 @@ export class KestUI {
 
   private openSession(session: Session) {
     this.session = session;
-    this.agent = this.makeAgent(session.messages, session.goal, session.context);
+    this.agent = this.makeAgent(
+      session.messages,
+      session.goal,
+      session.context,
+    );
     session.context = this.agent.context;
     this.agent.tasks = session.tasks.map((task) => ({ ...task }));
     this.clearView();
@@ -468,23 +476,68 @@ export class KestUI {
     this.ready();
   }
 
+  private async prepareResearch(objective: string) {
+    // Each study owns a session: preserve the previous study and start with
+    // fresh model context instead of mixing unrelated experiments and goals.
+    await saveSession(this.session);
+    this.session = newSession(this.cwd, []);
+    this.session.research = newCompany(objective);
+    this.session.goal = objective;
+    this.session.title = objective.slice(0, 70);
+    this.agent = this.makeAgent(undefined, objective);
+    this.session.messages = this.agent.messages;
+    this.session.context = this.agent.context;
+    this.clearView();
+    await saveSession(this.session);
+    this.ready();
+  }
+
+  async showSavedResearchHint() {
+    const saved = (await listSessions(this.cwd)).filter(
+      (session) => session.research,
+    );
+    if (!saved.length || this.closed) return;
+    const latest = saved[0]!;
+    const state = latest.research!;
+    const status =
+      latest.researchEnabled === false
+        ? "off"
+        : state.status === "running"
+          ? "paused (previous session)"
+          : researchStatus(state);
+    this.info(
+      saved.length === 1
+        ? `Saved research · ${status}\n${state.objective.slice(0, 100)}\n/research show to inspect · /resume ${latest.id.slice(0, 8)} to open`
+        : `${saved.length} saved research studies in this workspace · /research show to inspect and choose`,
+    );
+  }
+
   private async restoreResearch() {
     if (this.session.research) return true;
     const studies = new Map<string, Session>();
     for (const saved of await listSessions(this.cwd)) {
-      if (saved.research && saved.research.status !== "completed" && !studies.has(saved.research.id))
+      if (
+        saved.research &&
+        saved.research.status !== "completed" &&
+        !studies.has(saved.research.id)
+      )
         studies.set(saved.research.id, saved);
     }
     if (studies.size > 1) {
-      this.info("Multiple saved research studies. Use /research show, then /resume <session-id> to choose before updating a budget or continuing.");
+      this.info(
+        "Multiple saved research studies. Use /research show, then /resume <session-id> to choose before updating a budget or continuing.",
+      );
       return false;
     }
     const saved = studies.values().next().value;
     if (saved) {
       await recoverCompany(this.cwd, saved.research!);
-      if (saved.research!.status === "running") saved.research!.status = "paused";
+      if (saved.research!.status === "running")
+        saved.research!.status = "paused";
       this.openSession(saved);
-      this.info(`Restored saved research: ${saved.research!.objective}. Progress and spending preserved.`);
+      this.info(
+        `Restored saved research: ${saved.research!.objective}. Progress and spending preserved.`,
+      );
     }
     return true;
   }
@@ -493,7 +546,11 @@ export class KestUI {
   // During a research run this is a PAUSE: state flips to paused, the
   // session is saved, and a decision sheet opens once the turn unwinds.
   private stopActiveWork() {
-    const study = this.agent.research ?? this.session.research;
+    const study =
+      this.agent.research ??
+      (this.session.researchEnabled === false
+        ? undefined
+        : this.session.research);
     if (study && this.active) {
       if (study.status !== "ready") study.status = "paused";
       this.session.research = study;
@@ -505,7 +562,11 @@ export class KestUI {
   }
 
   private stoppedMessage(): string {
-    const study = this.agent.research ?? this.session.research;
+    const study =
+      this.agent.research ??
+      (this.session.researchEnabled === false
+        ? undefined
+        : this.session.research);
     return study
       ? `Research paused · progress checkpointed in research/${study.id}/ · choose below or /research resume.`
       : "Stopped. Completed tool actions are kept.";
@@ -515,6 +576,8 @@ export class KestUI {
   private liveHud(): string {
     const study = this.agent.research ?? this.session.research;
     if (!study) return "";
+    if (this.session.researchEnabled === false)
+      return "Research off · /research show";
     const live =
       this.active && this.budgetSyncedAt
         ? study.elapsedMs + (performance.now() - this.budgetSyncedAt)
@@ -601,7 +664,9 @@ export class KestUI {
         this.info(
           error instanceof Error ? clean(error.message) : "Action failed.",
         );
-      this.status.content = this.active?.signal.aborted ? "Paused · progress saved" : "Stopped · see error above";
+      this.status.content = this.active?.signal.aborted
+        ? "Paused · progress saved"
+        : "Stopped · see error above";
       this.status.fg = theme.error;
     } finally {
       this.stopLoading();
@@ -609,7 +674,7 @@ export class KestUI {
       this.active = null;
       this.session.messages = this.agent.messages;
       this.session.context = this.agent.context;
-      this.session.research = this.agent.research ?? undefined;
+      if (this.agent.research) this.session.research = this.agent.research;
       this.session.tasks = this.agent.tasks;
       try {
         await saveSession(this.session);
@@ -704,9 +769,10 @@ export class KestUI {
   }
   private ready() {
     this.status.fg = theme.muted;
-    const goal = this.session.goal
-      ? `Goal: ${this.session.goal.length > 40 ? this.session.goal.slice(0, 40) + "…" : this.session.goal}`
-      : "";
+    const goal =
+      this.session.goal && !this.session.research
+        ? `Goal: ${this.session.goal.length > 40 ? this.session.goal.slice(0, 40) + "…" : this.session.goal}`
+        : "";
     const total = this.session.tasks.length;
     const done = this.session.tasks.filter((t) => t.status === "done").length;
     const tasks = total ? `Tasks ${done}/${total}` : "";
@@ -1932,7 +1998,13 @@ export class KestUI {
       if (!this.closed) {
         const study = this.agent.research ?? this.session.research;
         const hud = study ? ` │ ${this.liveHud()}` : "";
-        this.status.content = `${frames[frame++ % frames.length]} ${this.loadingLabel}${hud}`;
+        const label = hud
+          ? truncateMiddle(
+              this.loadingLabel,
+              Math.max(18, this.renderer.width - hud.length - 3),
+            )
+          : this.loadingLabel;
+        this.status.content = `${frames[frame++ % frames.length]} ${label}${hud}`;
         this.status.fg =
           study && shouldOpenBudgetDecision(study) ? theme.error : theme.tool;
       }
@@ -2012,7 +2084,7 @@ export class KestUI {
         this.active = null;
         this.session.messages = this.agent.messages;
         this.session.context = this.agent.context;
-        this.session.research = this.agent.research ?? undefined;
+        if (this.agent.research) this.session.research = this.agent.research;
         this.session.tasks = this.agent.tasks;
         try {
           await saveSession(this.session);
@@ -2081,19 +2153,29 @@ export class KestUI {
     }
     if (command === "/research") {
       const [action, ...parts] = value.split(/\s+/);
-      if ((action === "budget" || action === "resume" || (action === "start" && !parts.length)) &&
-          !(await this.restoreResearch())) return;
+      if (
+        (action === "budget" ||
+          action === "resume" ||
+          (action === "start" && !parts.length)) &&
+        !(await this.restoreResearch())
+      )
+        return;
       if (action === "show") {
         const sessions = await listSessions(this.cwd);
         const studies = [
           this.session,
           ...sessions.filter((saved) => saved.id !== this.session.id),
         ].filter((saved) => saved.research);
+        for (const saved of studies)
+          await recoverCompany(this.cwd, saved.research!);
         this.info(
           studies.length
-            ? studies.map((saved) =>
-                `${formatCompany(saved.research)}\nSession: ${saved.id}${saved.id === this.session.id ? " (current)" : ` — /resume ${saved.id} to open`}`,
-              ).join("\n\n")
+            ? studies
+                .map(
+                  (saved) =>
+                    `${formatCompany(saved.research)}${saved.researchEnabled === false ? "\nContinuation: off (saved study retained)" : ""}\nSession: ${saved.id.slice(0, 8)}${saved.id === this.session.id ? " (current)" : ` — /resume ${saved.id.slice(0, 8)} to open`}`,
+                )
+                .join("\n\n")
             : "No saved research in this workspace. /research prepare <objective> to prepare a study.",
         );
         return;
@@ -2112,17 +2194,7 @@ export class KestUI {
           this.info("/research prepare <objective>");
           return;
         }
-        this.session.research = newCompany(objective);
-        this.session.goal = objective;
-        this.agent = this.makeAgent(
-          this.agent.messages,
-          objective,
-          this.agent.context,
-        );
-        this.session.messages = this.agent.messages;
-        this.session.tasks = [];
-        this.agent.research = this.session.research;
-        await saveSession(this.session);
+        await this.prepareResearch(objective);
         this.info(
           formatCompany(this.session.research) +
             "\nPrepared without model calls. Set /research budget, then /research start.",
@@ -2155,10 +2227,11 @@ export class KestUI {
       }
       if (action === "off") {
         this.agent.research = null;
-        this.session.research = undefined;
+        this.session.researchEnabled = false;
         await saveSession(this.session);
+        this.ready();
         this.info(
-          "Research continuation is off. Existing artifacts are preserved.",
+          "Research is off. Saved objective, budget and artifacts are preserved. /research show to inspect; /research start or /research resume to enable again.",
         );
         return;
       }
@@ -2176,19 +2249,30 @@ export class KestUI {
           );
         const total = parseCostBudget(parts[0]!);
         await recoverCompany(this.cwd, study);
+        if (study.status === "completed") {
+          this.info(
+            "This study is complete; its budget and result are preserved. /research show to inspect, or /research prepare <objective> for a new study.",
+          );
+          return;
+        }
         const used = study.spentCostMicros + study.estimatedCostMicros;
         if (Math.round(total * 1_000_000) < used)
           throw new Error(
             `Budget cannot be below $${(used / 1_000_000).toFixed(4)} already spent or reserved.`,
           );
         study.maxCostUsd = total;
-        if (study.status !== "ready") study.status = "paused";
-        this.agent.research = study;
+        if (study.status !== "ready")
+          study.status =
+            Math.round(total * 1_000_000) > used
+              ? "paused"
+              : "budget_exhausted";
+        if (this.session.researchEnabled !== false) this.agent.research = study;
         await saveSession(this.session);
         this.info(
           formatCompany(study) +
-            `\nTotal allowance updated; consumption is preserved. /research ${study.status === "ready" ? "start to begin" : "resume to continue"}.`,
+            "\nTotal allowance updated; consumption is preserved.",
         );
+        this.ready();
         return;
       }
       const startPrepared = action === "start" && !parts.join(" ").trim();
@@ -2213,10 +2297,10 @@ export class KestUI {
           this.info("/research <objective>");
           return;
         }
-        this.session.research = newCompany(objective);
-        this.session.tasks = [];
+        await this.prepareResearch(objective);
       }
       const study = this.session.research!;
+      await recoverCompany(this.cwd, study);
       if (study.maxCostUsd === null) {
         this.session.goal = study.objective;
         this.agent.research = study;
@@ -2233,6 +2317,7 @@ export class KestUI {
         return;
       }
       this.session.goal = study.objective;
+      this.session.researchEnabled = true;
       this.agent = this.makeAgent(
         this.agent.messages,
         this.session.goal,
@@ -2243,10 +2328,12 @@ export class KestUI {
       this.agent.tasks = this.session.tasks.map((t) => ({ ...t }));
       await saveSession(this.session);
       this.info(
-        `Research company started · shared cost allowance: $${study.maxCostUsd.toFixed(2)} USD (estimated rates). Director manages delegation, model selection and experiments. Ctrl+C pauses. Logs: research/${study.id}/`,
+        `${study.status === "ready" ? "Starting" : "Resuming"} research · $${study.maxCostUsd.toFixed(2)} total allowance\nEsc to pause · /agents for workers · /research show for status`,
       );
       this.composer.setText(
-        `Research objective: ${study.objective}\nUse the company workflow, preserve reproducible evidence and negative findings, and reserve money for independent review. Persist source, raw logs, results and the paper in research/${study.id}/. Manage the shared $${study.maxCostUsd.toFixed(2)} USD allowance across your own calls, subagents, reviewers and summaries. Use research_status to check spending. Do useful research within this allowance, without wasting credits. When supported by reviewed artifacts, save a final report and call research_complete. If incomplete near exhaustion, write funding-proposal.md with evidence-backed progress, unresolved questions, next experiments, requested additional USD and a reasoned cost estimate; ask the user whether to increase the total. Never increase credits yourself; never fabricate results or claim unsupported novelty.`,
+        study.status === "ready"
+          ? `Research objective: ${study.objective}\nUse the research company workflow. Save reproducible evidence in research/${study.id}/. Check research_status for the shared allowance. Reserve funding for independent review; call research_complete only with a reviewed report.`
+          : `Resume research/${study.id}/ from the saved checkpoint. Objective: ${study.objective}\nUse research_status for spending. Read the saved report, worker findings and relevant evidence before choosing the next unresolved task. Do not repeat completed experiments or read the whole event journal for status. Keep the shared allowance and obtain independent review before research_complete.`,
       );
       await this.submit();
       return;
@@ -2565,7 +2652,13 @@ export class KestUI {
         this.info("Session not found or ID is ambiguous. Use /sessions.");
         return;
       }
-      this.openSession(matches[0]!);
+      const saved = matches[0]!;
+      if (saved.research) {
+        await recoverCompany(this.cwd, saved.research);
+        if (saved.research.status === "running")
+          saved.research.status = "paused";
+      }
+      this.openSession(saved);
       return;
     }
     if (command === "/new" || command === "/system") {
@@ -2649,6 +2742,7 @@ export async function start(cwd: string, permission: Permission = "strict") {
     keychain,
     permission ?? "strict",
   );
+  await ui.showSavedResearchHint();
   const exit = () => ui.close();
   process.once("SIGTERM", exit);
   try {

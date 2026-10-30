@@ -1,4 +1,4 @@
-import type { CompanyState } from "./research-company";
+import { researchStatus, type CompanyState } from "./research-company";
 
 // Human duration: no false precision (42848.05 ms -> 42.8s).
 export function formatDuration(ms: number): string {
@@ -47,7 +47,8 @@ export function budgetHud(
     return "Research budget not set · /research budget 10$";
   const used = (state.spentCostMicros + state.estimatedCostMicros) / 1_000_000;
   const level = budgetLevel(used, state.maxCostUsd);
-  return `USD $${used.toFixed(4)}/$${state.maxCostUsd.toFixed(2)} ${budgetBar(used, state.maxCostUsd)}${level === "healthy" ? "" : ` · budget ${level}`}`;
+  const status = state.status === "ready" ? "prepared" : researchStatus(state);
+  return `${status} · USD $${used.toFixed(4)}/$${state.maxCostUsd.toFixed(2)} · $${Math.max(0, state.maxCostUsd - used).toFixed(2)} left${level === "healthy" ? "" : ` · budget ${level}`}`;
 }
 export function shouldOpenBudgetDecision(state: CompanyState): boolean {
   return (

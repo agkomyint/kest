@@ -226,6 +226,12 @@ export async function recoverCompany(cwd: string, state: CompanyState) {
       state.costRevision = saved.costRevision;
       state.costRates = { ...state.costRates, ...saved.costRates };
     }
+    // A completion checkpoint may reach disk before the session is saved.
+    // Recover terminal state too, so restarting never repeats a finished study.
+    if (saved.status === "completed" && saved.finalReportPath) {
+      state.status = "completed";
+      state.finalReportPath = saved.finalReportPath;
+    }
   } catch (error: any) {
     if (error.code !== "ENOENT") throw error;
   }
@@ -486,5 +492,34 @@ export function formatCompany(state?: CompanyState | null) {
     return "No research run yet. /research start <objective> (or /research <objective>) starts a budgeted company workflow.";
   validateCompany(state);
   const used = state.spentCostMicros + state.estimatedCostMicros;
-  return `Kest Research · ${state.status === "ready" ? "prepared (not started)" : state.status}\nObjective: ${state.objective}\nCost budget: ${state.maxCostUsd === null ? "not set — /research budget 10$" : `$${state.maxCostUsd.toFixed(2)} USD`}\nUsed: ${formatUsd(used)} · reported ${formatUsd(state.spentCostMicros)} + estimated/in-flight ${formatUsd(state.estimatedCostMicros)}\nRequests: ${state.requests} · delegates: ${state.agents} · reviews returned: ${state.reviews}\nModel rates are estimates; provider discounts/credits may differ.${state.untrackedCostRequests ? `\n${state.untrackedCostRequests} earlier requests have unknown costs, excluded from this allowance.` : ""}\nArtifacts: research/${state.id}/\n/research ${state.status === "ready" ? "start" : "resume"} · /research budget <total USD, e.g. 10$> · /research models`;
+  const remaining =
+    state.maxCostUsd === null
+      ? null
+      : Math.max(0, Math.round(state.maxCostUsd * 1_000_000) - used);
+  return `Kest Research · ${researchStatus(state)}\nObjective: ${state.objective}\nCost budget: ${state.maxCostUsd === null ? "not set — /research budget 10$" : `$${state.maxCostUsd.toFixed(2)} USD`}\nUsed: ${formatUsd(used)}${remaining === null ? "" : ` · Remaining: ${formatUsd(remaining)}`}\nReported: ${formatUsd(state.spentCostMicros)} · reserved/unreported: ${formatUsd(state.estimatedCostMicros)}\nRequests: ${state.requests} · delegates: ${state.agents} · reviews returned: ${state.reviews}\nArtifacts: research/${state.id}/${state.finalReportPath ? `\nReport: ${state.finalReportPath}` : ""}\nNext: ${researchNextAction(state)}\nCosts use estimated model rates.${state.untrackedCostRequests ? ` ${state.untrackedCostRequests} earlier requests have unknown costs, excluded from this allowance.` : ""}`;
+}
+
+export function researchStatus(state: CompanyState): string {
+  return state.status === "ready"
+    ? "prepared (not started)"
+    : state.status === "budget_exhausted"
+      ? "needs funding"
+      : state.status;
+}
+
+export function researchNextAction(state: CompanyState): string {
+  if (state.status === "completed")
+    return state.finalReportPath
+      ? `read ${state.finalReportPath}`
+      : "read the saved report";
+  if (state.maxCostUsd === null) return "/research budget 10$";
+  if (
+    state.status === "budget_exhausted" ||
+    state.spentCostMicros + state.estimatedCostMicros >=
+      Math.round(state.maxCostUsd * 1_000_000)
+  )
+    return "/research budget <higher total USD>, then /research resume";
+  if (state.status === "running")
+    return "Esc to pause · /agents to inspect workers";
+  return state.status === "ready" ? "/research start" : "/research resume";
 }
