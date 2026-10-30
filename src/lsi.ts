@@ -1,6 +1,6 @@
 import type OpenAI from "openai";
 import { readFileSync } from "node:fs";
-import { mkdir, rename, rm } from "node:fs/promises";
+import { chmod, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { configDir } from "./config";
 import type { Approve } from "./tools";
@@ -37,7 +37,8 @@ export async function saveLsiKey(apiKey: string, baseUrl?: string) {
   await mkdir(join(file, ".."), { recursive: true, mode: 0o700 });
   const temporary = `${file}.${crypto.randomUUID()}.tmp`;
   try {
-    await Bun.write(temporary, JSON.stringify({ apiKey: key, ...(baseUrl ? { baseUrl } : {}) }), { mode: 0o600 });
+    await writeFile(temporary, JSON.stringify({ apiKey: key, ...(baseUrl ? { baseUrl } : {}) }), { mode: 0o600 });
+    await chmod(temporary, 0o600);
     await rename(temporary, file);
   } finally { await rm(temporary, { force: true }); }
 }
