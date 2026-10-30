@@ -1,6 +1,74 @@
 import { StyledText, fg } from "@opentui/core";
 import { theme } from "./theme";
 
+export function actionLabel(name: string, raw: string): string {
+  let args: Record<string, unknown> = {};
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
+      args = parsed;
+  } catch {
+    /* Preserve raw input in details. */
+  }
+  const path = typeof args.path === "string" ? args.path : "";
+  const labels: Record<string, string> = {
+    read_file: "Read file",
+    search: "Search files",
+    list_files: "Inspect workspace",
+    write_file: "Save file",
+    edit_file: "Edit file",
+    shell: "Run script",
+    browser: "Browse sources",
+    research_status: "Check research progress",
+    list_models: "Check available models",
+    set_plan: "Plan research",
+    update_task: "Update plan",
+    research_team: "Coordinate research team",
+    research_review: "Review evidence",
+    research_complete: "Complete study",
+    spawn_subagent: "Delegate task",
+    background_status: "Check background work",
+    background_cancel: "Stop background work",
+  };
+  if (
+    (name === "shell" || name === "browser") &&
+    typeof args.title === "string" &&
+    args.title.trim()
+  )
+    return args.title
+      .trim()
+      .split(/[\r\n]/)[0]!
+      .slice(0, 100);
+  const label = labels[name] ?? "Perform action";
+  return path ? `${label} · ${path}` : label;
+}
+
+export function connectionFailure(error: unknown): boolean {
+  // Fetch may throw a Bun socket error directly or an SDK error with a cause.
+  let current = error;
+  for (
+    let depth = 0;
+    depth < 4 && current && typeof current === "object";
+    depth++
+  ) {
+    const value = current as {
+      name?: string;
+      code?: string;
+      message?: string;
+      cause?: unknown;
+    };
+    if (
+      /APIConnection|APITimeout/.test(value.name ?? "") ||
+      /ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|ENOTFOUND|socket connection|connection (?:was )?(?:closed|reset)|fetch failed/i.test(
+        `${value.code ?? ""} ${value.message ?? ""}`,
+      )
+    )
+      return true;
+    current = value.cause;
+  }
+  return false;
+}
+
 export const toolColors = {
   muted: theme.muted,
   text: theme.fg,

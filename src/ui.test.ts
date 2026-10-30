@@ -1011,7 +1011,7 @@ test("parallel worker rows stream separate activity without overwriting the dire
     // Expanded head: worker rows appear, each with its own activity.
     expect(testUI.captureCharFrame()).toContain("aaaaaaaa");
     expect(ui["toolEntry"]).toBe(director);
-    expect(director!.text).toContain("research_team");
+    expect(director!.detail?.toolName).toBe("research_team");
     ui["event"]({
       ...worker("bbbbbbbb-2222", "model-b"),
       state: "error",
@@ -1186,7 +1186,7 @@ test("tool output expands and collapses by click, and Markdown renders", async (
     const head = ui["toolGroup"]!.view.node;
     await testUI.mockMouse.click(head.x + 2, head.y);
     await testUI.flush();
-    expect(testUI.captureCharFrame()).toContain("read_file  example.ts");
+    expect(testUI.captureCharFrame()).toContain("Read file · example.ts");
     await testUI.mockMouse.click(toolNode.x + 2, toolNode.y);
     await testUI.flush();
     expect(testUI.captureCharFrame()).toContain("Output");
@@ -1377,6 +1377,141 @@ test("new activity preserves reading position and clicking its indicator jumps t
   }
 });
 
+test("parallel actions retain their own output and timing, and groups expand after completion and reopening", async () => {
+  const renderer = await createTestRenderer({ width: 120, height: 42 });
+  const ui = new KestUI(renderer.renderer, process.cwd(), null);
+  const args = JSON.stringify({ path: "results.json" });
+  try {
+    for (const callId of ["slow", "fast"])
+      ui["event"]({
+        type: "tool",
+        callId,
+        name: "read_file",
+        args,
+        state: "running",
+      });
+    ui["event"]({
+      type: "tool",
+      callId: "fast",
+      name: "read_file",
+      args,
+      state: "done",
+      durationMs: 20,
+      output: "FAST output",
+    });
+    ui["event"]({
+      type: "tool",
+      callId: "slow",
+      name: "read_file",
+      args,
+      state: "done",
+      durationMs: 100,
+      output: "SLOW output",
+    });
+    const group = ui["toolGroup"]!;
+    expect(group.children[0]!.entry.detail?.output).toBe("SLOW output");
+    expect(group.children[0]!.entry.text).toContain("100ms");
+    expect(group.children[1]!.entry.detail?.output).toBe("FAST output");
+    expect(group.children[1]!.entry.text).toContain("20ms");
+    ui["flushResponse"]();
+    await renderer.renderOnce();
+    expect(renderer.captureCharFrame()).toContain(
+      "2 actions · 120ms total action time",
+    );
+    expect(renderer.captureCharFrame()).not.toContain("read_file");
+    await renderer.mockMouse.click(group.view.node.x + 2, group.view.node.y);
+    await renderer.flush();
+    expect(renderer.captureCharFrame()).toContain("Read file · results.json");
+    const saved = JSON.parse(JSON.stringify(ui["session"]));
+    ui["openSession"](saved);
+    await renderer.renderOnce();
+    const restored = [...ui["activityGroups"].values()][0]!;
+    expect(restored.children).toHaveLength(2);
+    expect(restored.children[0]!.block?.visible).toBe(false);
+    await renderer.mockMouse.click(
+      restored.head.node.x + 2,
+      restored.head.node.y,
+    );
+    await renderer.flush();
+    expect(restored.children[0]!.block?.visible).toBe(true);
+    const action = restored.children[0]!;
+    await renderer.mockMouse.click(action.node.x + 2, action.node.y);
+    await renderer.flush();
+    expect(renderer.captureCharFrame()).toContain("Input · read_file");
+    expect(action.outputText?.plainText).toBe("SLOW output");
+    // Groups saved by older versions also remain inspectable.
+    const legacy = JSON.parse(JSON.stringify(saved));
+    for (const entry of legacy.entries) {
+      if (entry.activityGroup) entry.text = "✓ Tools (2) · read_file · 120ms";
+      delete entry.activityGroup;
+      delete entry.parentActivityGroup;
+    }
+    ui["openSession"](legacy);
+    await renderer.renderOnce();
+    const oldGroup = [...ui["activityGroups"].values()][0]!;
+    expect(oldGroup.children).toHaveLength(2);
+    await renderer.mockMouse.click(
+      oldGroup.head.node.x + 2,
+      oldGroup.head.node.y,
+    );
+    await renderer.flush();
+    expect(oldGroup.children.every((child) => child.block?.visible)).toBe(true);
+  } finally {
+    ui.close();
+    await renderer.dispose();
+  }
+});
+
+test("connection reset offers research recovery with expandable original error and retained instructions", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "kest-reset-ui-"));
+  const previous = process.env.KEST_CONFIG_DIR;
+  process.env.KEST_CONFIG_DIR = directory;
+  const renderer = await createTestRenderer({ width: 120, height: 42 });
+  const ui = new KestUI(renderer.renderer, directory, {
+    provider: "nebius",
+    apiKey: "not-used",
+  });
+  try {
+    await ui["command"]("/research prepare Test reset recovery");
+    await ui["command"]("/research budget 5$");
+    ui["agent"].run = async () => {
+      throw Object.assign(
+        new Error("The socket connection was closed unexpectedly."),
+        { code: "ECONNRESET" },
+      );
+    };
+    ui.composer.setText("Retain these exact research instructions");
+    await ui["submit"]("Research instructions · expand to inspect");
+    expect(ui["status"].plainText).toContain("/research resume");
+    expect(ui["loadingTimer"]).toBeNull();
+    expect(ui["session"].research?.objective).toBe("Test reset recovery");
+    const instruction = ui["session"].entries.find((e) =>
+      e.text.startsWith("Research instructions"),
+    )!;
+    expect(instruction.detail?.input).toBe(
+      "Retain these exact research instructions",
+    );
+    const failure = ui["lastTool"]!;
+    expect(failure.entry.text).toContain("Connection interrupted");
+    expect(failure.entry.detail?.output).toContain("socket connection");
+    expect(failure.entry.detail?.output).toContain("ECONNRESET");
+    await renderer.renderOnce();
+    expect(renderer.captureCharFrame()).not.toContain(
+      "The socket connection was closed unexpectedly",
+    );
+    await renderer.mockMouse.click(failure.node.x + 2, failure.node.y);
+    await renderer.flush();
+    expect(failure.expanded).toBe(true);
+    expect(failure.outputText?.plainText).toContain("socket connection");
+  } finally {
+    ui.close();
+    await renderer.dispose();
+    if (previous === undefined) delete process.env.KEST_CONFIG_DIR;
+    else process.env.KEST_CONFIG_DIR = previous;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("sequential tools across model rounds collapse into one group row", async () => {
   const testUI = await createTestRenderer({ width: 120, height: 30 });
   const ui = new KestUI(testUI.renderer, process.cwd(), null);
@@ -1396,15 +1531,15 @@ test("sequential tools across model rounds collapse into one group row", async (
     const toolEntries = ui["session"].entries.filter((e) => e.role === "tool");
     // 1 group head + 3 individual rows (rows hidden until head expands).
     expect(toolEntries).toHaveLength(4);
-    expect(toolEntries[0]!.text).toContain("Tools (3)");
+    expect(toolEntries[0]!.text).toContain("Activity · 3 actions");
     await testUI.renderOnce();
     const collapsed = testUI.captureCharFrame();
-    expect(collapsed).toContain("Tools (3)");
-    expect(collapsed).not.toContain("✓ set_plan");
+    expect(collapsed).toContain("Activity · 3 actions");
+    expect(collapsed).not.toContain("✓ Plan research");
     const head = ui["toolGroup"]!.view.node;
     await testUI.mockMouse.click(head.x + 2, head.y);
     await testUI.flush();
-    expect(testUI.captureCharFrame()).toContain("✓ set_plan");
+    expect(testUI.captureCharFrame()).toContain("✓ Plan research");
   } finally {
     ui.close();
     await testUI.dispose();
@@ -1441,7 +1576,9 @@ test("tool timing appears on rows and /stats aggregates all saved sessions", asy
       });
     }
     await testUI.renderOnce();
-    expect(testUI.captureCharFrame()).toContain("Tools (2) · read_file · 40ms");
+    expect(testUI.captureCharFrame()).toContain(
+      "Activity · 2 actions · 40ms total action time",
+    );
     ui.composer.setText("/stats");
     ui.composer.submit();
     await ui.settled;
@@ -1537,8 +1674,8 @@ test("shell rows hide code until expanded and display action timing", async () =
     ui["event"]({ type: "tool", name: "shell", args, state: "running" });
     await testUI.renderOnce();
     // Collapsed by default: only the group head shows.
-    expect(testUI.captureCharFrame()).toContain("Tools ·");
-    expect(testUI.captureCharFrame()).not.toContain(
+    expect(testUI.captureCharFrame()).toContain("Activity ·");
+    expect(testUI.captureCharFrame()).toContain(
       "Inspect machine specifications",
     );
     expect(testUI.captureCharFrame()).not.toContain("console.log");
@@ -1569,7 +1706,7 @@ test("shell rows hide code until expanded and display action timing", async () =
     expect(frame).toContain("Output");
     expect(frame).toContain("machine-details");
     // The individual row keeps its own panels/detail (old UI behavior).
-    expect(frame).toContain("Input · TypeScript");
+    expect(frame).toContain("Input · shell · TypeScript");
     expect(ui["lastTool"]!.entry.detail?.input).toBe(
       "console.log('machine-details')",
     );

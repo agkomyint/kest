@@ -143,6 +143,12 @@ Custom endpoints store an environment variable name, never its secret value. Pro
 
 **Enter** sends; **Shift+Enter / Ctrl+Enter** inserts a newline. **Tab** completes commands. **Up / Down** browses prompt history. **Esc / Ctrl+C** cancels active work and pauses research. Scroll with the wheel or **PgUp / PgDn**; click tool rows to expand. Drag to select, then **Ctrl+C / Ctrl+Y** to copy.
 
+Activity groups show readable action labels and total action time. Expand a group to see every action and its duration, then expand an action for its technical tool name, input, and retained output. Concurrent action times overlap; the total is their sum, not elapsed wall time. Groups remain expandable after completion and session reopening. Research setup, generated instructions, and connection errors also keep their details behind expandable rows.
+
+![An expanded activity group and a file-reading action with timing, technical input, and scrollable output](docs/images/activity.png)
+
+If a model connection is interrupted, Kest preserves completed actions and the research checkpoint. Inspect the error row for technical details, then use `/research resume`. Kest does not automatically replay a failed streaming request.
+
 ## Permissions and local data
 
 Kest defaults to `strict`: edits, writes, and scripts require approval. `minimal` approves edits and writes automatically but asks before scripts. `all` approves these actions automatically. Scripts run with your permissions; this is not a sandbox. Headless mode denies operations needing interactive approval.

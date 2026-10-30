@@ -125,6 +125,7 @@ export type AgentEvent =
   | { type: "response" }
   | {
       type: "tool";
+      callId?: string;
       name: string;
       args: string;
       state: "running" | "done" | "error";
@@ -1322,7 +1323,14 @@ export class Agent {
             name,
             this.toolDurations.get(name) ?? [],
           );
-          emit({ type: "tool", name, args, state: "running", estimatedMs });
+          emit({
+            type: "tool",
+            callId: call.id,
+            name,
+            args,
+            state: "running",
+            estimatedMs,
+          });
           try {
             if (
               !this.toolDefs().some(
@@ -1378,7 +1386,15 @@ export class Agent {
             durationMs,
             estimatedMs,
           });
-          emit({ type: "tool", name, args, state, output, durationMs });
+          emit({
+            type: "tool",
+            callId: call.id,
+            name,
+            args,
+            state,
+            output,
+            durationMs,
+          });
           return { call, output };
         };
         // Independent read-only calls overlap, so a slow one does not block

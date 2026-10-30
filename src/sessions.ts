@@ -6,10 +6,13 @@ import type { Message, PlanTask } from "./agent";
 export type Entry = {
   role: "you" | "kest" | "tool" | "info";
   text: string;
+  activityGroup?: string;
+  parentActivityGroup?: string;
   detail?: {
     input: string;
     output: string;
     language: "TypeScript" | "JSON" | "text";
+    toolName?: string;
   };
 };
 export type Session = {

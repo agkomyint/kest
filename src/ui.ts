@@ -1,6 +1,11 @@
 import { responseText } from "./response-text";
 import { BrowserSession, browserRequest } from "./browser";
-import { toolPanel, toolColors } from "./tool-display";
+import {
+  toolPanel,
+  toolColors,
+  actionLabel,
+  connectionFailure,
+} from "./tool-display";
 import { savePermission } from "./config";
 import {
   autoApprove,
@@ -111,15 +116,6 @@ const idleVerbs = [
   "Diving",
 ];
 const workVerb = "Gathering";
-const toolVerbs: Record<string, string> = {
-  read_file: "Perusing",
-  list_files: "Surveying",
-  search: "Sniffing",
-  edit_file: "Preening",
-  write_file: "Weaving",
-  shell: "Unleashing",
-  browser: "Browsing",
-};
 const nestLines = [
   "The nest is warm.",
   "Wings checked. Talons sharp.",
@@ -135,6 +131,9 @@ function revealText(node: Renderable): Renderable {
 }
 
 type ToolView = {
+  callId?: string;
+  toolName?: string;
+  rawArgs?: string;
   entry: Entry;
   node: TextRenderable;
   block?: BoxRenderable;
@@ -222,6 +221,10 @@ export class KestUI {
     names: string[];
   } | null = null;
   private groupHeads = new Set<ToolView>();
+  private activityGroups = new Map<
+    string,
+    { head: ToolView; children: ToolView[] }
+  >();
   private pendingTools: ToolView[] = [];
   private tabCycle: {
     prefix: string;
@@ -472,7 +475,22 @@ export class KestUI {
     session.context = this.agent.context;
     this.agent.tasks = session.tasks.map((task) => ({ ...task }));
     this.clearView();
-    for (const entry of session.entries.slice(-180)) this.display(entry);
+    let legacyGroup: string | undefined;
+    for (const entry of session.entries.slice(-180)) {
+      // Older saved groups had no membership metadata. Reconstruct it without
+      // dropping their original action labels, outputs, or timings.
+      if (
+        entry.role === "tool" &&
+        /^[✓✕→] Tools(?: \(| ·|$)/.test(entry.text) &&
+        !entry.activityGroup
+      )
+        entry.activityGroup = crypto.randomUUID();
+      if (entry.activityGroup) legacyGroup = entry.activityGroup;
+      else if (entry.role !== "tool") legacyGroup = undefined;
+      else if (legacyGroup && !entry.parentActivityGroup)
+        entry.parentActivityGroup = legacyGroup;
+      this.display(entry);
+    }
     this.ready();
   }
 
@@ -660,14 +678,14 @@ export class KestUI {
       this.flushResponse();
       this.status.content = `Landed · ${((performance.now() - start) / 1000).toFixed(1)}s`;
     } catch (error) {
-      if (!this.active?.signal.aborted)
-        this.info(
-          error instanceof Error ? clean(error.message) : "Action failed.",
-        );
       this.status.content = this.active?.signal.aborted
         ? "Paused · progress saved"
         : "Stopped · see error above";
       this.status.fg = theme.error;
+      if (!this.active?.signal.aborted && !this.showConnectionFailure(error))
+        this.info(
+          error instanceof Error ? clean(error.message) : "Action failed.",
+        );
     } finally {
       this.stopLoading();
       this.pendingText = "";
@@ -793,12 +811,13 @@ export class KestUI {
     this.modelTag.visible = true;
   }
   private display(entry: Entry) {
+    const expandable = entry.role === "tool" || Boolean(entry.detail);
     const block = new BoxRenderable(this.renderer, {
       flexDirection: "row",
       flexShrink: 0,
       width: "100%",
     });
-    if (entry.role !== "info")
+    if (entry.role !== "info" && entry.role !== "tool")
       block.add(
         new TextRenderable(this.renderer, {
           content:
@@ -809,7 +828,7 @@ export class KestUI {
               : entry.role === "kest"
                 ? theme.accent
                 : theme.tool,
-          width: entry.role === "tool" ? 5 : 2,
+          width: 2,
           height: 1,
           flexShrink: 0,
           selectable: false,
@@ -852,21 +871,20 @@ export class KestUI {
             selectionBg: theme.accent,
             selectionFg: theme.bg,
           });
-    const column =
-      entry.role === "tool"
-        ? new BoxRenderable(this.renderer, {
-            width: "100%",
-            flexGrow: 1,
-            flexShrink: 1,
-            minWidth: 0,
-            flexDirection: "column",
-          })
-        : null;
+    const column = expandable
+      ? new BoxRenderable(this.renderer, {
+          width: "100%",
+          flexGrow: 1,
+          flexShrink: 1,
+          minWidth: 0,
+          flexDirection: "column",
+        })
+      : null;
     if (column) {
       column.add(node);
       block.add(column);
     } else block.add(node);
-    if (entry.role === "tool") {
+    if (expandable) {
       const panels = new BoxRenderable(this.renderer, {
         width: "100%",
         flexDirection: "column",
@@ -883,6 +901,18 @@ export class KestUI {
         panels,
       };
       this.toolViews.set(tool.node, tool);
+      if (entry.activityGroup) {
+        this.activityGroups.set(entry.activityGroup, {
+          head: tool,
+          children: [],
+        });
+        this.groupHeads.add(tool);
+      }
+      if (entry.parentActivityGroup) {
+        const group = this.activityGroups.get(entry.parentActivityGroup);
+        group?.children.push(tool);
+        block.visible = group?.head.expanded ?? true;
+      }
       this.lastTool = tool;
       this.renderTool(tool);
       let pressed = false;
@@ -916,9 +946,19 @@ export class KestUI {
       children[0]!.destroyRecursively();
     return node;
   }
-  private add(role: Entry["role"], text: string, detail?: Entry["detail"]) {
+  private add(
+    role: Entry["role"],
+    text: string,
+    detail?: Entry["detail"],
+    metadata: Pick<Entry, "activityGroup" | "parentActivityGroup"> = {},
+  ) {
     this.markActivity();
-    const entry: Entry = { role, text, ...(detail ? { detail } : {}) };
+    const entry: Entry = {
+      role,
+      text,
+      ...(detail ? { detail } : {}),
+      ...metadata,
+    };
     this.session.entries.push(entry);
     return { entry, node: this.display(entry) };
   }
@@ -993,7 +1033,7 @@ export class KestUI {
         return { scroll, text };
       };
       const input = addSection(
-        `↓ Input · ${detail.language}  · scroll to inspect`,
+        `↓ Input${detail.toolName ? ` · ${detail.toolName}` : ""} · ${detail.language}  · scroll to inspect`,
         toolColors.input,
         toolColors.inputBg,
       );
@@ -1035,6 +1075,34 @@ export class KestUI {
   }
   private info(text: string) {
     this.add("info", text);
+  }
+
+  private showConnectionFailure(error: unknown): boolean {
+    if (
+      !(error instanceof OpenAI.APIConnectionError) &&
+      !connectionFailure(error)
+    )
+      return false;
+    const research = Boolean(this.agent.research);
+    const recovery = research ? "/research resume" : "Send your request again";
+    const value = error as Error & {
+      code?: string;
+      cause?: { code?: string; message?: string };
+    };
+    this.add(
+      "info",
+      `✕ Connection interrupted · ${research ? "research paused" : "request stopped"}\nThe model connection closed unexpectedly. Completed actions are kept.\nNext: ${recovery}. Expand for technical details.`,
+      {
+        input: `Provider: ${this.credentials?.provider ?? "unknown"}\nRecovery: ${recovery}\nNo automatic retry: completed actions will not be replayed by the client.`,
+        output: clean(
+          `${value.code ?? value.name ?? "Error"}: ${value.message ?? String(error)}${value.cause ? `\nCause: ${value.cause.code ?? ""} ${value.cause.message ?? ""}` : ""}`,
+        ),
+        language: "text",
+      },
+    );
+    this.status.content = `Connection interrupted · ${recovery}`;
+    this.status.fg = theme.error;
+    return true;
   }
   private awayFromBottom() {
     return (
@@ -1241,6 +1309,8 @@ export class KestUI {
       const tool = this.lastTool;
       tool.expanded = !tool.expanded;
       this.renderTool(tool);
+      this.applyGroupVisibility();
+      this.applyTeamVisibility();
       return;
     }
     if (this.active) {
@@ -1677,19 +1747,25 @@ export class KestUI {
       // (old UI) hidden under the head until the head is expanded.
       // Every worker row individually expands to its own live activity log.
       if (!this.teamGroup) {
-        const head = this.add("tool", "→ Research team", {
-          input:
-            "Research team — expand the head for per-worker rows, then expand a worker for its live tool activity. /agents <id> inspects a saved transcript.",
-          output: "Starting…",
-          language: "text",
-        });
+        const head = this.add(
+          "tool",
+          "→ Research team",
+          {
+            input:
+              "Research team — expand the head for per-worker rows, then expand a worker for its live tool activity. /agents <id> inspects a saved transcript.",
+            output: "Starting…",
+            language: "text",
+          },
+          { activityGroup: crypto.randomUUID() },
+        );
         const view = this.toolViews.get(head.node as TextRenderable)!;
         this.groupHeads.add(view);
         this.teamGroup = {
           entry: head.entry,
           node: head.node as TextRenderable,
           view,
-          children: [],
+          children: this.activityGroups.get(head.entry.activityGroup!)!
+            .children,
         };
       }
       const team = this.teamGroup;
@@ -1701,9 +1777,9 @@ export class KestUI {
           output: "Starting…",
           language: "text",
         },
+        { parentActivityGroup: team.entry.activityGroup },
       );
       const childView = this.toolViews.get(added.node as TextRenderable)!;
-      team.children.push(childView);
       if (childView.block) childView.block.visible = team.view.expanded;
       worker = {
         meta: event,
@@ -1718,7 +1794,7 @@ export class KestUI {
     worker.meta = event;
     const activity = event.event;
     if (activity?.type === "tool") {
-      worker.latest = `${activity.name} · ${activity.state}`;
+      worker.latest = `${actionLabel(activity.name, activity.args)} · ${activity.state}`;
       worker.log += `\n[${activity.state}] ${activity.name}${activity.durationMs === undefined ? "" : ` · ${formatDuration(activity.durationMs)}`}\n${activity.state === "running" ? activity.args : (activity.output ?? "")}\n`;
       if (activity.state !== "running" && activity.durationMs !== undefined)
         (this.session.toolStats ??= []).push({
@@ -1849,24 +1925,7 @@ export class KestUI {
     }
     this.pendingText = "";
     if (event.state === "running") {
-      let summary = "";
-      try {
-        const args = JSON.parse(event.args);
-        summary =
-          event.name === "shell" || event.name === "browser"
-            ? typeof args.title === "string" && args.title.trim()
-              ? args.title.trim().split(/[\r\n]/)[0]
-              : event.name === "browser"
-                ? `Browser: ${args.action ?? "open"}`
-                : "Run Bun script"
-            : (args.path ?? args.command ?? args.query ?? args.task ?? "");
-      } catch {
-        /* Show name only. */
-      }
-      const heading =
-        event.name === "shell" || event.name === "browser"
-          ? `→ ${brief(summary, 100)}`
-          : `→ ${event.name}  ${brief(summary, 180)}`;
+      const heading = `→ ${brief(actionLabel(event.name, event.args), 180)}`;
       let input = event.args;
       if (event.name === "shell") {
         try {
@@ -1879,14 +1938,17 @@ export class KestUI {
       // OWN row (old UI) hidden under the head until the head is expanded.
       // Every row individually expands to its own Input/Output panels.
       if (!this.toolGroup) {
-        const head = this.add("tool", "→ Tools");
+        const head = this.add("tool", "→ Activity", undefined, {
+          activityGroup: crypto.randomUUID(),
+        });
         const view = this.toolViews.get(head.node as TextRenderable)!;
         this.groupHeads.add(view);
         this.toolGroup = {
           entry: head.entry,
           node: head.node as TextRenderable,
           view,
-          children: [],
+          children: this.activityGroups.get(head.entry.activityGroup!)!
+            .children,
           count: 0,
           failures: 0,
           totalMs: 0,
@@ -1907,17 +1969,20 @@ export class KestUI {
           input,
           output: "Running…",
           language: event.name === "shell" ? "TypeScript" : "JSON",
+          toolName: event.name,
         },
+        { parentActivityGroup: group.entry.activityGroup },
       );
       const childView = this.toolViews.get(tool.node as TextRenderable)!;
-      group.children.push(childView);
+      childView.callId = event.callId;
+      childView.toolName = event.name;
+      childView.rawArgs = event.args;
       this.pendingTools.push(childView);
       if (childView.block) childView.block.visible = group.view.expanded;
       this.renderToolGroup();
       this.toolNode = tool.node as TextRenderable;
       this.toolEntry = tool.entry;
-      const verb = toolVerbs[event.name];
-      this.showLoading(verb ? `${event.name} · ${verb}…` : event.name);
+      this.showLoading(actionLabel(event.name, event.args));
     } else {
       if (event.durationMs !== undefined) {
         (this.session.toolStats ??= []).push({
@@ -1927,7 +1992,19 @@ export class KestUI {
         });
       }
       const group = this.toolGroup;
-      const child = this.pendingTools.shift();
+      let pendingIndex = this.pendingTools.findIndex((tool) =>
+        event.callId
+          ? tool.callId === event.callId
+          : tool.toolName === event.name && tool.rawArgs === event.args,
+      );
+      if (pendingIndex < 0 && !event.callId)
+        pendingIndex = this.pendingTools.findIndex(
+          (tool) => tool.toolName === event.name,
+        );
+      const child =
+        pendingIndex < 0
+          ? undefined
+          : this.pendingTools.splice(pendingIndex, 1)[0];
       if (child) {
         // Old per-tool rendering: this row's own title, detail and panels.
         const title = `${event.state === "error" ? "✕" : "✓"} ${child.entry.text.split("\n")[0]!.slice(2)}${event.durationMs === undefined ? "" : ` · ${formatDuration(event.durationMs)}`}`;
@@ -1947,6 +2024,7 @@ export class KestUI {
           input,
           output: event.output ?? "",
           language: event.name === "shell" ? "TypeScript" : "JSON",
+          toolName: event.name,
         };
         this.renderTool(child);
       }
@@ -1961,10 +2039,10 @@ export class KestUI {
     }
   }
   private applyGroupVisibility() {
-    const group = this.toolGroup;
-    if (!group) return;
-    for (const child of group.children)
-      if (child.block) child.block.visible = group.view.expanded;
+    for (const group of this.activityGroups.values())
+      for (const child of group.children)
+        if (child.block && !child.block.isDestroyed)
+          child.block.visible = group.head.expanded;
   }
 
   private renderToolGroup() {
@@ -1973,8 +2051,9 @@ export class KestUI {
     const done = group.count - group.running;
     group.entry.text =
       group.running > 0
-        ? `→ Tools · ${done}/${group.count} done · ${group.names.join(", ")}`
-        : `${group.failures ? "✕" : "✓"} Tools (${group.count}) · ${group.names.join(", ")} · ${formatDuration(group.totalMs)}${group.failures ? ` · ${group.failures} failed` : ""}`;
+        ? `→ Activity · ${done}/${group.count} done · ${brief(group.children.at(-1)?.entry.text.split("\n")[0]?.slice(2) ?? "Working", 70)}`
+        : `${group.failures ? "✕" : "✓"} Activity · ${group.count} ${group.count === 1 ? "action" : "actions"} · ${formatDuration(group.totalMs)} total action time${group.failures ? ` · ${group.failures} failed` : ""}`;
+    group.entry.text += `\nTechnical tools: ${group.names.join(", ")}\nExpand each action for its input, output and timing. Concurrent action times overlap.`;
     // Failures auto-expand the head so the failed row is visible.
     if (group.failures > 0 && group.running === 0) group.view.expanded = true;
     this.renderTool(group.view);
@@ -2018,7 +2097,7 @@ export class KestUI {
     this.loadingTimer = null;
   }
 
-  private async submit() {
+  private async submit(displayLabel?: string) {
     if (this.active || this.connectStep || this.listPicker || this.closed)
       return;
     this.tabCycle = null;
@@ -2046,7 +2125,14 @@ export class KestUI {
         );
         return;
       }
-      this.add("you", text);
+      if (displayLabel)
+        this.add("info", displayLabel, {
+          input: text,
+          output:
+            "Generated instructions sent to the research director. The exact text is retained here for inspection.",
+          language: "text",
+        });
+      else this.add("you", text);
       if (this.session.title === "New session")
         this.session.title = text.replace(/\s+/g, " ").slice(0, 70);
       this.active = new AbortController();
@@ -2069,7 +2155,9 @@ export class KestUI {
         : "Stopped · see error above";
       this.status.fg = theme.error;
       if (this.active?.signal.aborted) this.info(this.stoppedMessage());
-      else if (error instanceof OpenAI.APIError)
+      else if (this.showConnectionFailure(error)) {
+        // Keep the recovery message and expandable original error together.
+      } else if (error instanceof OpenAI.APIError)
         this.info(
           `Endpoint error ${error.status ?? "network"}. ${error.status === 401 || error.status === 403 ? "Use /connect to update credentials." : "Try again; /new clears context."}`,
         );
@@ -2079,6 +2167,7 @@ export class KestUI {
         );
     } finally {
       this.stopLoading();
+      this.toolGroup = null;
       this.pendingText = "";
       if (this.active) {
         this.active = null;
@@ -2195,9 +2284,14 @@ export class KestUI {
           return;
         }
         await this.prepareResearch(objective);
-        this.info(
-          formatCompany(this.session.research) +
-            "\nPrepared without model calls. Set /research budget, then /research start.",
+        this.add(
+          "info",
+          "Research prepared · set a budget with /research budget 10$",
+          {
+            input: objective,
+            output: formatCompany(this.session.research),
+            language: "text",
+          },
         );
         return;
       }
@@ -2268,9 +2362,14 @@ export class KestUI {
               : "budget_exhausted";
         if (this.session.researchEnabled !== false) this.agent.research = study;
         await saveSession(this.session);
-        this.info(
-          formatCompany(study) +
-            "\nTotal allowance updated; consumption is preserved.",
+        this.add(
+          "info",
+          `Budget set · $${total.toFixed(2)} total · ${study.status === "ready" ? "/research start" : "/research show for next steps"}`,
+          {
+            input: `Total allowance: $${total.toFixed(2)} USD. Existing consumption is preserved.`,
+            output: formatCompany(study),
+            language: "text",
+          },
         );
         this.ready();
         return;
@@ -2335,7 +2434,7 @@ export class KestUI {
           ? `Research objective: ${study.objective}\nUse the research company workflow. Save reproducible evidence in research/${study.id}/. Check research_status for the shared allowance. Reserve funding for independent review; call research_complete only with a reviewed report.`
           : `Resume research/${study.id}/ from the saved checkpoint. Objective: ${study.objective}\nUse research_status for spending. Read the saved report, worker findings and relevant evidence before choosing the next unresolved task. Do not repeat completed experiments or read the whole event journal for status. Keep the shared allowance and obtain independent review before research_complete.`,
       );
-      await this.submit();
+      await this.submit("Research instructions · expand to inspect");
       return;
     }
     if (command === "/browser") {
@@ -2692,6 +2791,11 @@ export class KestUI {
     this.teamGroup = null;
     this.toolGroup = null;
     this.groupHeads.clear();
+    this.activityGroups.clear();
+    this.toolViews = new WeakMap<TextRenderable, ToolView>();
+    this.lastTool = null;
+    this.toolNode = null;
+    this.toolEntry = null;
     this.pendingTools = [];
     this.unseenActivity = false;
     this.activity.visible = false;
