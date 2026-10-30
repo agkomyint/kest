@@ -4,6 +4,7 @@ import { chromium } from "playwright-core";
 import { mkdtemp, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { version } from "../package.json";
 
 // Render real Kest UI states with an isolated config and no provider calls.
 // These are native-renderer captures, not desktop screenshots.
@@ -38,7 +39,7 @@ async function capture(name: string, title: string) {
     )
     .join("\n");
   await page.setContent(
-    `<html><style>*{box-sizing:border-box}body{margin:0;padding:36px;background:#101923;font-family:Consolas,monospace}.window{border:1px solid #304052;border-radius:12px;overflow:hidden;box-shadow:0 20px 50px #0006;background:#0c111b}.bar{height:46px;background:#182230;display:flex;align-items:center;padding:0 20px;gap:9px;color:#a8b5c9;font:13px 'Segoe UI',sans-serif}.dot{width:10px;height:10px;border-radius:50%;background:#50dca0}.title{margin-left:12px}pre{margin:0;padding:22px;font:16px/23px Consolas,monospace;white-space:pre}.note{color:#75869b;font:12px 'Segoe UI',sans-serif;text-align:right;margin-top:14px}</style><div class="window"><div class="bar"><i class="dot"></i><span class="title">${escape(title)}</span></div><pre>${lines}</pre></div><div class="note">Kest v0.1.0 · native UI renderer capture · no model calls</div></html>`,
+    `<html><style>*{box-sizing:border-box}body{margin:0;padding:36px;background:#101923;font-family:Consolas,monospace}.window{border:1px solid #304052;border-radius:12px;overflow:hidden;box-shadow:0 20px 50px #0006;background:#0c111b}.bar{height:46px;background:#182230;display:flex;align-items:center;padding:0 20px;gap:9px;color:#a8b5c9;font:13px 'Segoe UI',sans-serif}.dot{width:10px;height:10px;border-radius:50%;background:#50dca0}.title{margin-left:12px}pre{margin:0;padding:22px;font:16px/23px Consolas,monospace;white-space:pre}.note{color:#75869b;font:12px 'Segoe UI',sans-serif;text-align:right;margin-top:14px}</style><div class="window"><div class="bar"><i class="dot"></i><span class="title">${escape(title)}</span></div><pre>${lines}</pre></div><div class="note">Kest v${version} · native UI renderer capture · no model calls</div></html>`,
   );
   await page.screenshot({ path: `docs/images/${name}.png`, fullPage: true });
 }
