@@ -205,11 +205,11 @@ test("budget exhaustion saves a funding proposal without granting more money", a
     const proposal = await runtime.saveFundingProposal(
       "The next experiment does not fit.",
     );
-    expect(proposal).toContain("/research budget 15.00$");
-    expect(proposal).toContain("Would you like to increase");
+    expect(proposal).toContain("Add $5.00 (new total $15.00)");
+    expect(proposal).toContain("yes / no");
     expect(
       await readFile(join(runtime.directory!, "funding-proposal.md"), "utf8"),
-    ).toContain("Status: incomplete");
+    ).toContain("Study incomplete");
     expect(state.maxCostUsd).toBe(10);
   } finally {
     await rm(cwd, { recursive: true, force: true });

@@ -165,7 +165,9 @@ test("a failed journal write does not poison later checkpoints", async () => {
     )
       .trim()
       .split("\n");
-    expect(lines).toHaveLength(100);
+    // The event from the failed write is kept and retried with the next one.
+    expect(lines).toHaveLength(101);
+    expect(JSON.parse(lines[0]!).kind).toBe("failed");
     expect(
       JSON.parse(await readFile(join(runtime.directory!, "state.json"), "utf8"))
         .id,

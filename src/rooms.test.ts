@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import type { AgentEvent } from "./agent";
 import { newCompany } from "./research-company";
 import { newSession } from "./sessions";
-import { companyBar, EventBuffer, Room, RoomManager } from "./rooms";
+import { companyBar, EventBuffer, Room, RoomManager, roomList, roomOrder } from "./rooms";
 
 const room = (kind: "chat" | "study", objective = "Compare indexing algorithms") => {
   const session = newSession(process.cwd(), []);
@@ -91,9 +91,41 @@ test("company bar brackets the focused room and flags rooms that need you", () =
   a.question = "continue?";
   const bar = companyBar(manager, 200);
   expect(bar).toContain("[▣ chat]");
-  expect(bar).toContain("▲ Indexing $0.0/10 needs you");
+  expect(bar).toContain("▲ Indexing $0.00/10 needs you");
   manager.focus(a.id);
   expect(companyBar(manager, 200)).toContain("[▲ Indexing");
   expect(companyBar(manager, 20).length).toBeLessThanOrEqual(20);
   expect(() => manager.focus("nope")).toThrow();
+});
+
+test("room list is quiet when idle, windows around the focused room when crowded", () => {
+  const manager = new RoomManager();
+  manager.add(room("chat"));
+  expect(roomList(manager, 80).lines).toEqual([]);
+  const studies = Array.from({ length: 12 }, (_, i) => {
+    const r = manager.add(room("study", `Study ${i}`));
+    r.study!.maxCostUsd = 10;
+    return r;
+  });
+  const idle = roomList(manager, 80);
+  expect(idle.lines[0]).toContain("12 studies");
+  expect(idle.lines.at(-1)).toContain("12 ready");
+  expect(idle.lines.length).toBeLessThanOrEqual(5);
+  studies[8]!.controller = new AbortController();
+  studies[3]!.study!.status = "completed";
+  manager.focus(studies[8]!.id);
+  const busy = roomList(manager, 80, 5);
+  expect(busy.lines).toHaveLength(4);
+  expect(busy.lines[0]).toContain("●1");
+  expect(busy.lines.at(-1)).toContain("^K all");
+  expect(busy.lines.some((l) => l.startsWith("▸") && l.includes("Study 8"))).toBe(true);
+  expect(busy.targets.at(-1)).toBeNull();
+  expect(busy.lines.every((l) => l.length <= 80)).toBe(true);
+  expect(roomList(manager, 30, 5).lines.every((l) => l.length <= 30)).toBe(true);
+  const crowded = roomList(manager, 80, 3);
+  expect(crowded.lines).toHaveLength(3);
+  expect(crowded.lines.some((l) => l.includes("Study 8"))).toBe(true);
+  const order = roomOrder(manager);
+  expect(order[0]!.kind).toBe("chat");
+  expect(order.at(-1)).toBe(studies[3]!);
 });

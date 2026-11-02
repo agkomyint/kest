@@ -157,7 +157,8 @@ Each study is a room with its own director, workers, browser and approvals. Stud
 | --- | --- |
 | `/connect`, `/model`, `/provider` | Configure connections and select a model. |
 | `/research prepare <objective>` | Save an objective without model calls. |
-| `/research budget 10$` | Set the total USD allowance. |
+| `/research budget set 10$` | Set the total USD allowance (`/research budget 10$` also works). |
+| `/research budget add 5$` / `remove 5$` | Raise or lower the allowance without recomputing the total. |
 | `/research start` | Launch the prepared study. |
 | `/research` or `/rooms` (Ctrl+K) | Pick a study room; the picker shows status and spend. |
 | `/research show [study]` | List saved studies, or inspect one by fuzzy title or id. |

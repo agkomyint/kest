@@ -5,11 +5,12 @@ import { resolve, relative, isAbsolute, dirname, join } from "node:path";
 import { createPatch } from "diff";
 import { TavilyTools, isTavilyTool } from "./tavily";
 import { LsiTools, isLsiTool } from "./lsi";
+import { kestGuide } from "./kest-guide";
 
 export type Approval = {
   title: string;
   preview: string;
-  kind?: "file" | "script" | "browser" | "web" | "lsi";
+  kind?: "file" | "script" | "browser" | "web" | "lsi" | "study";
 };
 export type Approve = (
   request: Approval,
@@ -311,6 +312,7 @@ export class WorkspaceTools {
     const args = JSON.parse(raw) as Record<string, unknown>;
     if (!args || typeof args !== "object" || Array.isArray(args))
       throw new Error("Tool arguments must be an object.");
+    if (name === "kest_guide") return kestGuide(args.topic);
     if (isLsiTool(name))
       return (this.lsi ??= new LsiTools(this.approve)).execute(name, args, signal);
     if (isTavilyTool(name))

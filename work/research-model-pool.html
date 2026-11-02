@@ -1,0 +1,77 @@
+<div id="kest-pool-preview" class="viz-dotted-background">
+<style>
+#kest-pool-preview{padding:18px 0;color-scheme:light dark}
+#kest-pool-preview .kp{--kp-bg:light-dark(#faf9f6,#171918);--kp-fg:light-dark(#242b25,#e5e8df);--kp-muted:light-dark(#62695f,#a6afa2);--kp-line:light-dark(#d9ddd2,#363d34);--kp-field:light-dark(#fff,#222720);--kp-active:light-dark(#315b3a,#c3d6a1);--kp-on:light-dark(#fff,#182016);background:var(--kp-bg);color:var(--kp-fg);font:14px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace;border:1px solid var(--kp-line);border-radius:10px;max-width:760px;margin:auto;overflow-wrap:anywhere}
+#kest-pool-preview .kp header{padding:16px 22px;border-bottom:1px solid var(--kp-line);display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+#kest-pool-preview .kp .wordmark{font-weight:600;letter-spacing:2px}
+#kest-pool-preview .kp .muted{color:var(--kp-muted)}
+#kest-pool-preview .kp main{padding:22px;display:grid;gap:22px}
+#kest-pool-preview .kp h2,#kest-pool-preview .kp p{margin:0}
+#kest-pool-preview .kp h2{font-size:18px;font-weight:500;line-height:1.4;margin-bottom:6px}
+#kest-pool-preview .kp .section-label{font-size:12px;letter-spacing:1px;text-transform:uppercase;color:var(--kp-muted);margin-bottom:10px}
+#kest-pool-preview .kp button,#kest-pool-preview .kp input,#kest-pool-preview .kp select{font:inherit;color:var(--kp-fg);background:var(--kp-field);border:1px solid var(--kp-line);border-radius:5px;padding:8px}
+#kest-pool-preview .kp input[type=checkbox]{accent-color:var(--kp-active);width:18px;height:18px}
+#kest-pool-preview .kp button{padding:9px 14px}
+#kest-pool-preview .kp button.primary{background:var(--kp-active);color:var(--kp-on);border-color:var(--kp-active)}
+#kest-pool-preview .kp .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+#kest-pool-preview .kp .between{justify-content:space-between}
+#kest-pool-preview .kp .models{display:grid;gap:0;border-top:1px solid var(--kp-line)}
+#kest-pool-preview .kp .model{padding:14px 0;border-bottom:1px solid var(--kp-line);display:grid;grid-template-columns:24px minmax(0,1fr) 85px;gap:10px;align-items:center}
+#kest-pool-preview .kp .model small{display:block;font-size:12px;color:var(--kp-muted)}
+#kest-pool-preview .kp .model input[type=number]{width:100%;box-sizing:border-box}
+#kest-pool-preview .kp .fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+#kest-pool-preview .kp .fields label{display:grid;gap:6px;color:var(--kp-muted);font-size:12px}
+#kest-pool-preview .kp .fields input{min-width:0;width:100%;box-sizing:border-box;font-size:14px}
+#kest-pool-preview .kp .ledger{background:var(--kp-field);padding:14px;border-radius:5px;display:grid;gap:7px}
+#kest-pool-preview .kp .meter{height:6px;background:var(--kp-line);border-radius:4px;overflow:hidden}
+#kest-pool-preview .kp .meter span{display:block;height:100%;background:var(--kp-active);width:0}
+#kest-pool-preview .kp .status{min-height:44px;color:var(--kp-muted)}
+#kest-pool-preview .kp footer{padding:14px 22px;border-top:1px solid var(--kp-line);color:var(--kp-muted);font-size:12px}
+@media(max-width:480px){#kest-pool-preview .kp main{padding:16px}#kest-pool-preview .kp .fields{grid-template-columns:1fr}#kest-pool-preview .kp .model{grid-template-columns:24px minmax(0,1fr) 68px}}
+</style>
+<section class="kp" aria-label="Kest research model pool prototype">
+<header><span class="wordmark">kest</span><span class="muted">/research model pool</span></header>
+<main>
+<div><div class="section-label">Prepare research</div><h2>Choose who can work on this study.</h2><p class="muted">Compare indexing approaches and review the evidence.</p></div>
+<div><div class="row between"><div class="section-label">Allowed models · <span id="kp-count">1</span></div><span class="muted">Call ceiling</span></div>
+<div class="models">
+<div class="model"><input type="checkbox" checked disabled aria-label="Current director model is always included"><div>Muse Spark Open<small>Baseten · current director · workers + review</small></div><input type="number" min="1" max="1000" value="40" data-cap="baseten" aria-label="Baseten model call ceiling"></div>
+<div class="model"><input type="checkbox" data-model="nebius" aria-label="Allow Nebius Nemotron"><div>Nemotron 3.5 Super VL<small>Nebius · configured · excluded by default</small></div><input type="number" min="1" max="1000" value="10" data-cap="nebius" aria-label="Nebius model call ceiling" disabled></div>
+<div class="model"><input type="checkbox" data-model="modal" aria-label="Allow Modal Muse Spark"><div>Muse Spark Open<small>Modal · configured · excluded by default</small></div><input type="number" min="1" max="1000" value="10" data-cap="modal" aria-label="Modal model call ceiling" disabled></div>
+</div></div>
+<div class="fields"><label>Total model calls<input id="kp-calls" type="number" min="2" max="1000" value="40"></label><label>Total tokens<input id="kp-tokens" type="number" min="1000" step="1000" value="200000"></label><label>Calls reserved for review<input id="kp-reserve" type="number" min="1" max="999" value="4"></label></div>
+<div class="row between"><label for="kp-review">Preferred reviewer</label><select id="kp-review" aria-label="Preferred reviewer"></select></div>
+<div class="ledger"><div class="row between"><span id="kp-phase">Prepared · no calls made</span><span id="kp-usage">0 / 40 calls</span></div><div class="meter"><span id="kp-fill"></span></div><div id="kp-policy" class="muted">Current model only. Subagents share the same limits.</div></div>
+<div class="row"><button id="kp-save" class="primary cursor-interaction" type="button">Save pool for this study</button><button id="kp-simulate" class="cursor-interaction" type="button">Simulate worker call</button><button id="kp-reset" class="cursor-interaction" type="button">Reset demo</button></div>
+<div id="kp-status" class="status" aria-live="polite">Prototype · configured models are sample connection states. No paid requests.</div>
+</main>
+<footer>Director, workers, reviewers, retries and summaries all count. Pool changes apply only to this study.</footer>
+</section>
+<script>
+(()=>{
+const root=document.getElementById('kest-pool-preview');
+const q=s=>root.querySelector(s);
+const names={baseten:'Baseten · Muse Spark Open',nebius:'Nebius · Nemotron',modal:'Modal · Muse Spark Open'};
+let used=0,usedTokens=0,perModel={baseten:0,nebius:0,modal:0};
+const allowed=()=>['baseten',...Array.from(root.querySelectorAll('[data-model]:checked'),x=>x.dataset.model)];
+function config(){return {allowedModels:allowed(),maxCalls:Number(q('#kp-calls').value),maxTokens:Number(q('#kp-tokens').value),reviewCalls:Number(q('#kp-reserve').value),reviewer:q('#kp-review').value,modelCaps:Object.fromEntries(allowed().map(id=>[id,Number(q('[data-cap="'+id+'"]').value)]))}}
+function valid(c){return Number.isInteger(c.maxCalls)&&c.maxCalls>=2&&Number.isInteger(c.maxTokens)&&c.maxTokens>=1000&&Number.isInteger(c.reviewCalls)&&c.reviewCalls>=1&&c.reviewCalls<c.maxCalls&&c.modelCaps[c.reviewer]>=c.reviewCalls&&Object.values(c.modelCaps).every(n=>Number.isInteger(n)&&n>=1)}
+function persist(){if(window.openai?.setWidgetState)window.openai.setWidgetState({modelContent:config(),privateContent:null}).catch(()=>{})}
+function render(){
+const ids=allowed();const previous=q('#kp-review').value;
+q('#kp-review').replaceChildren(...ids.map(id=>{const o=document.createElement('option');o.value=id;o.textContent=names[id];return o}));
+if(ids.includes(previous))q('#kp-review').value=previous;
+for(const input of root.querySelectorAll('[data-model]'))q('[data-cap="'+input.dataset.model+'"]').disabled=!input.checked;
+const c=config();q('#kp-count').textContent=ids.length;q('#kp-usage').textContent=used+' / '+c.maxCalls+' calls';q('#kp-fill').style.width=Math.min(100,used/Math.max(1,c.maxCalls)*100)+'%';
+q('#kp-policy').textContent=(ids.length===1?'Current model only. ':'Only '+ids.length+' selected models. ')+Math.max(0,c.maxCalls-c.reviewCalls-used)+' worker calls left · '+c.reviewCalls+' calls reserved for review · '+usedTokens.toLocaleString()+' tokens used.';
+q('#kp-save').disabled=!valid(c);
+}
+function restore(saved){const c=saved?.modelContent;if(!c||!Array.isArray(c.allowedModels))return;for(const el of root.querySelectorAll('[data-model]'))el.checked=c.allowedModels.includes(el.dataset.model);for(const [id,n]of Object.entries(c.modelCaps||{})){const el=q('[data-cap="'+id+'"]');if(el&&Number.isInteger(n))el.value=n}for(const [selector,key]of [['#kp-calls','maxCalls'],['#kp-tokens','maxTokens'],['#kp-reserve','reviewCalls']])if(Number.isInteger(c[key]))q(selector).value=c[key];render();if(allowed().includes(c.reviewer))q('#kp-review').value=c.reviewer}
+root.addEventListener('change',()=>{render();persist();q('#kp-phase').textContent='Pool edited · save changes'});
+q('#kp-save').onclick=()=>{render();persist();q('#kp-phase').textContent='Pool saved · ready';q('#kp-status').textContent='Study allowlist saved in this preview. Unlisted model and provider requests would be rejected before dispatch.'};
+q('#kp-simulate').onclick=()=>{const c=config();if(!valid(c)){q('#kp-status').textContent='Enter valid limits; review reserve must be smaller than total calls.';return}if(used>=c.maxCalls-c.reviewCalls){q('#kp-phase').textContent='Workers paused · review reserve';q('#kp-status').textContent='No new worker calls. Reserved capacity remains for review and reconciliation.';return}if(usedTokens+4000>c.maxTokens){q('#kp-phase').textContent='Paused · token ceiling';q('#kp-status').textContent='Next call blocked: estimated token reservation would exceed the remaining allowance.';return}const reviewer=c.reviewer;const model=allowed().find(id=>perModel[id]<c.modelCaps[id]-(id===reviewer?c.reviewCalls:0));if(!model){q('#kp-status').textContent='Worker call blocked: all allowed models reached their worker allowance, preserving reviewer capacity.';return}used++;usedTokens+=4000;perModel[model]++;render();q('#kp-phase').textContent='Demo running';q('#kp-status').textContent='Simulated call → '+names[model]+'. '+perModel[model]+' / '+c.modelCaps[model]+' model calls; assumed 4,000 tokens per demo call.'};
+q('#kp-reset').onclick=()=>{used=0;usedTokens=0;perModel={baseten:0,nebius:0,modal:0};render();q('#kp-phase').textContent='Prepared · no calls made';q('#kp-status').textContent='Demo counters reset. No paid requests.'};
+render();restore(window.openai?.widgetState);window.addEventListener('openai:set_globals',e=>{if(e.detail?.globals?.widgetState)restore(e.detail.globals.widgetState)});
+})();
+</script>
+</div>

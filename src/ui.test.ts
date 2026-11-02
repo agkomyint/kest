@@ -1380,7 +1380,7 @@ test("mouse selection copies exactly selected text with Ctrl+C without quitting"
     expect(copied).toBe(selected!);
     expect(ui["closed"]).toBe(false);
     expect(testUI.renderer.hasSelection).toBe(false);
-    expect(testUI.captureCharFrame()).toContain("Copied");
+    expect(testUI.captureCharFrame()).toContain("copied");
   } finally {
     ui.close();
     await testUI.dispose();
@@ -1942,7 +1942,7 @@ test("slash menu lists descriptions, arrows select, Enter fills before sending",
     ui.composer.setText("/research budget");
     ui["inputChanged"]();
     await testUI.renderOnce();
-    expect(testUI.captureCharFrame()).toContain("<amount>$ · e.g. 10$");
+    expect(testUI.captureCharFrame()).toContain("set 10$ · add 5$ · remove 5$");
   } finally {
     ui.close();
     await testUI.dispose();
@@ -2112,4 +2112,20 @@ test("a background study queues approvals, shows needs-you, and presents them wh
     ui.close();
     await testUI.dispose();
   }
+});
+
+test("stop-and-publish phrasing is detected", async () => {
+  const { wantsStopAndPublish } = await import("./ui");
+  expect(wantsStopAndPublish("stop and publish it to lsi")).toBe(true);
+  expect(wantsStopAndPublish("publish now")).toBe(true);
+  expect(wantsStopAndPublish("keep going, don't publish yet")).toBe(false);
+  expect(wantsStopAndPublish("run another experiment")).toBe(false);
+});
+
+test("generated wrapup/publish prompts are not mistaken for a user's stop-and-publish request", async () => {
+  // They match the phrase detector, so submit() must skip detection when it has a display label.
+  const { wantsStopAndPublish } = await import("./ui");
+  expect(wantsStopAndPublish("Wrap up now: stop new experiments … publish the reviewed findings to LSI")).toBe(true);
+  const src = await Bun.file(new URL("./ui.ts", import.meta.url)).text();
+  expect(src).toContain("!displayLabel && !text.startsWith");
 });

@@ -1,5 +1,9 @@
+import { rm } from "node:fs/promises";
+import { join } from "node:path";
+import { homedir } from "node:os";
 import { responseText } from "./response-text";
 import { tipsFor, type Tip } from "./tips";
+import { loadTipsEnabled, saveTipsEnabled } from "./ui-settings";
 import { tavilyKey, saveTavilyKey, tavilyConnectionMessage } from "./tavily";
 import { lsiKey, saveLsiKey, lsiConnectionMessage, lsiBaseUrl } from "./lsi";
 import { BrowserSession, browserRequest } from "./browser";
@@ -36,6 +40,7 @@ import {
 } from "@opentui/core";
 import OpenAI from "openai";
 import { version } from "../package.json";
+import { Inbox, type FormField, type InboxItem } from "./inbox";
 import { Agent, formatTasks, systemPrompt, type AgentEvent } from "./agent";
 import {
   activeKey,
@@ -66,8 +71,10 @@ import {
   saveSession,
   type Entry,
   type Session,
+  deleteSession,
+  loadLocalChat,
 } from "./sessions";
-import { Room, RoomManager, companyBar, statusSymbol, studySpentUsd } from "./rooms";
+import { Room, RoomManager, roomList, roomOrder, statusSymbol, studySpentUsd } from "./rooms";
 import { loadCompanyLimits, saveCompanyLimits } from "./company-settings";
 import { formatStudyTab, loadStudyArtifacts, studyTabs, type StudyTab } from "./study-view";
 import {
@@ -83,6 +90,7 @@ import {
   newCompany,
   formatCompany,
   parseCostBudget,
+  proposedFunding,
   recoverCompany,
   researchStatus,
 } from "./research-company";
@@ -108,6 +116,7 @@ import {
   formatDuration,
   shouldOpenBudgetDecision,
   truncateMiddle,
+  compactHud,
 } from "./research-hud";
 
 const clean = (s: string) => s.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
@@ -164,14 +173,21 @@ const runningSafeCommand =
 
 /** Fastest path: the study is done, so publish its saved report in one tool call. */
 function publishPrompt(study: { id: string; finalReportPath?: string }, domain: string) {
-  return `Publish this completed study to LSI now, in as few steps as possible. Read ${study.finalReportPath ?? `research/${study.id}/`} once, then ${domain ? `use domain "${domain}"` : "call lsi_domains and pick the best domain id"}, and call lsi_publish a single time. Summarize the report into the URS: findings as short strings, honest limitations, conclusion, method. For evidence use inline text excerpts (key result tables, numbers, review verdicts copied from research/${study.id}/ files, up to 6000 chars each) when nothing is hosted publicly, or uri for real public links; never invent links. If you claimed an LSI question set answers_question. Add provenance {tool: "kest"}. Then reply with the LSI id and stop. Do not run new experiments.`;
+  return `Publish this completed study to LSI now, in as few steps as possible. Read ${study.finalReportPath ?? `research/${study.id}/`} once, then ${domain ? `use domain "${domain}"` : "call lsi_domains and pick the best domain id"}, and call lsi_publish a single time. Summarize the report into the URS: findings as short strings, honest limitations, conclusion, method. For evidence use inline text excerpts (key result tables, numbers, review verdicts copied from research/${study.id}/ files, up to 6000 chars each) when nothing is hosted publicly, or uri for real public links; never invent links. Link it to its question: if the study's objective or report names an LSI question id (LSI-Q-…), claim it with lsi_claim and set answers_question to it; if none is named, find the match with lsi_questions/lsi_novelty, or post the study's question with lsi_post_question and claim it. Add provenance {tool: "kest"}. Then reply with the LSI id and stop. Do not run new experiments.`;
 }
 
-function wrapupPrompt() {
+/** "stop and publish", "publish it to lsi now", "wrap up and publish" … typed while a study runs. */
+export function wantsStopAndPublish(text: string) {
+  return /\bpublish\b/i.test(text) && /\b(stop|now|enough|wrap|finish|done|lsi)\b/i.test(text) && !/\b(don't|do not|dont|never)\s+publish\b/i.test(text);
+}
+
+function wrapupPrompt(now = false) {
   return (
-    "Wrap up now: stop new experiments, run independent review of existing evidence, and write the final report with limitations and the evidence chain. Then call research_complete." +
+    (now
+      ? "Stop and publish now: do NOT start reviewers, workers or experiments. Write the final report from the evidence that exists, say plainly in limitations that it was not independently reviewed, then call research_complete."
+      : "Wrap up now: stop new experiments, run independent review of existing evidence, and write the final report with limitations and the evidence chain. Then call research_complete.") +
     (lsiKey()
-      ? " After it succeeds, publish the reviewed findings to LSI with lsi_publish: a short URS summarizing the report, evidence as links (repository evidence needs a full commit), honest limitations, and answers_question if you claimed a question. If publishing fails, report the error instead of retrying blindly."
+      ? " After it succeeds, publish the reviewed findings to LSI with lsi_publish: a short URS summarizing the report, evidence as stable public file links (repository evidence needs a full commit; Kest hashes each linked file so LSI can mark it verified, inline text is never verified), honest limitations, and answers_question set to the LSI question this study answers (claim the question named in the objective first; if none exists, post it with lsi_post_question and claim it). Publishing without answers_question is refused. If publishing fails, report the error instead of retrying blindly."
       : "")
   );
 }
@@ -181,6 +197,10 @@ export class KestUI {
   readonly scroll: ScrollBoxRenderable;
   private status: TextRenderable;
   private footer: TextRenderable;
+  private roomTargets: (Room | null)[] = [];
+  private toastText = "";
+  private toastWarn = false;
+  private toastTimer: ReturnType<typeof setTimeout> | null = null;
   private secretText: TextRenderable;
   private hints: TextRenderable;
   private roomBar: TextRenderable;
@@ -189,6 +209,8 @@ export class KestUI {
   private tipPrevious: TextRenderable;
   private tipNext: TextRenderable;
   private tipCounter: TextRenderable;
+  private tipClose: TextRenderable;
+  private tipsEnabled = loadTipsEnabled();
   private availableTips: Tip[] = [];
   private tipIndex = 0;
   private tipContextKey = "";
@@ -264,6 +286,8 @@ export class KestUI {
   private approval: { finish: (value: boolean) => void } | null = null;
   private pauseDecisionPending = false;
   private budgetSyncedAt = 0;
+  /** Newest worker tool calls, shown on the team head without expanding workers. */
+  private teamFeed: string[] = [];
   private teamGroup: {
     entry: Entry;
     node: TextRenderable;
@@ -389,6 +413,13 @@ export class KestUI {
       height: 1,
       flexShrink: 0,
       wrapMode: "none",
+      onMouseDown: (event) => {
+        const room = this.roomTargets[event.y - this.roomBar.y];
+        if (!room) return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (this.focusRoom(room)) this.composer.focus();
+      },
     });
     this.promptBox = new BoxRenderable(renderer, {
       border: false,
@@ -487,10 +518,25 @@ export class KestUI {
       fg: theme.muted,
       selectable: false,
     });
+    this.tipClose = new TextRenderable(renderer, {
+      content: "×",
+      width: 3,
+      height: 1,
+      flexShrink: 0,
+      fg: theme.muted,
+      textAlign: "center",
+      selectable: false,
+      onMouseDown: (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        void this.setTips(false);
+      },
+    });
     this.tipRow.add(this.tipPrevious);
     this.tipRow.add(this.tipText);
     this.tipRow.add(this.tipNext);
     this.tipRow.add(this.tipCounter);
+    this.tipRow.add(this.tipClose);
     this.footer = new TextRenderable(renderer, {
       content: cwd,
       fg: theme.muted,
@@ -517,10 +563,10 @@ export class KestUI {
     root.add(this.activity);
     root.add(this.status);
     root.add(this.hints);
-    root.add(this.roomBar);
     root.add(this.modelTag);
     root.add(this.tipRow);
     root.add(this.promptBox);
+    root.add(this.roomBar);
     root.add(this.footer);
     renderer.root.add(root);
     renderer.keyInput.on("keypress", (key) => this.key(key));
@@ -544,6 +590,7 @@ export class KestUI {
       this.drawSecret();
     });
     renderer.on("resize", () => {
+      this.drawFooter();
       this.inputChanged();
       for (const block of this.scroll.getChildren()) {
         for (const child of block.getChildren()) {
@@ -586,6 +633,120 @@ export class KestUI {
       this.session?.researchEnabled === false
         ? null
         : (this.session?.research ?? null);
+    agent.onPrepareResearch = async (objective, opts) => {
+      // Never create a second study for an idea that is already prepared: update it.
+      await this.loadSavedStudies();
+      const words = (t: string) => new Set(t.toLowerCase().match(/[a-z0-9]{3,}/g) ?? []);
+      const similar = (a: string, b: string) => {
+        const x = words(a), y = words(b);
+        if (!x.size || !y.size) return false;
+        let shared = 0;
+        for (const w of x) if (y.has(w)) shared++;
+        return shared / (x.size + y.size - shared) >= 0.6;
+      };
+      const unstarted = this.rooms.studies().filter((r) => r.study && r.study.status === "ready" && !r.running && studySpentUsd(r.study) === 0);
+      let existing = opts?.studyId
+        ? this.rooms.studies().find((r) => r.study && (r.study.id === opts.studyId || r.study.id.startsWith(opts.studyId!)))
+        : unstarted.find((r) => similar(r.study!.objective, objective));
+      if (opts?.studyId && !existing) return `No prepared study with id "${opts.studyId}". Call research_list for ids, or prepare a new one with an objective.`;
+      if (existing && (existing.running || existing.study!.status !== "ready" || studySpentUsd(existing.study) > 0))
+        return `Study ${existing.study!.id} already ran or is running, so it cannot be changed here. Prepare a new study with a different objective if the user wants another.`;
+      const reused = !!existing;
+      let room: Room;
+      let session: Session;
+      if (existing) {
+        room = existing;
+        session = existing.session;
+      } else {
+        session = newSession(this.cwd, []);
+        session.research = newCompany(objective);
+        session.goal = objective;
+        session.title = objective.slice(0, 70);
+        if (opts?.budgetUsd !== undefined) {
+          session.research.maxCostUsd = opts.budgetUsd;
+          session.research.strictBudget = true;
+          if (opts.autoPublish) session.research.autoPublish = true;
+        }
+        await saveSession(session);
+        room = this.addStudyRoom(session);
+      }
+      if (reused) {
+        const study = existing!.study!;
+        if (opts?.budgetUsd !== undefined) {
+          study.maxCostUsd = opts.budgetUsd;
+          study.strictBudget = true;
+        }
+        if (opts?.autoPublish) study.autoPublish = true;
+        session.research = study;
+        await saveSession(session);
+      }
+      const studyRef = session.research!.id;
+      if (opts?.budgetUsd === undefined) {
+        this.toast(reused ? "study already prepared · reused" : "study prepared · Alt+↑↓ to open");
+        return `${reused ? "That study was already prepared, so no duplicate was created" : "Prepared a study room"} "${session.title}" (id ${studyRef}). Nothing has run and nothing was spent. To set its budget or start it, call research_prepare again with study_id "${studyRef}" and budget_usd (never a new objective), or tell the user to open it (Alt+Up/Down or Ctrl+K), /research budget 10$, then /research start.`;
+      }
+      const budget = `$${opts.budgetUsd.toFixed(2)}${opts.autoPublish ? " (auto-publish to LSI)" : ""}`;
+      if (!opts.start) {
+        this.toast(`study prepared · ${budget} budget`);
+        return `Prepared a study room "${session.title}" with a ${budget} total allowance. Nothing has run. The user starts it with /research start.`;
+      }
+      if (!this.credentials)
+        return `Prepared "${session.title}" with a ${budget} allowance but could not start: no model provider is connected. Tell the user to run /connect, then /research start in the study room.`;
+      // Run in the background: the chat stays in front, the study shows in the room bar.
+      const blocker = this.rooms.startBlocker(room);
+      if (blocker) return `Prepared "${session.title}" with a ${budget} allowance but did not start it: ${blocker} The user can start it later from its room with /research start.`;
+      void this.runStudyInBackground(room);
+      return `Prepared "${session.title}" with a ${budget} total allowance and started it in the background in its own room. The screen stays on this chat. Tell the user briefly that it is running (strict budget: it will conclude and publish within the allowance, no extra funding) and that they can keep chatting or prepare another idea; do not repeat the setup steps.`;
+    };
+    agent.onStartPrepared = async () => this.startAllPrepared();
+    agent.onListResearch = async () => this.listStudies();
+    agent.onDeleteResearch = async (id) => this.deleteStudy(id);
+    agent.onNotifyControl = (kind, title, body) => {
+      const room = this.agentRooms.get(agent);
+      if (!room?.study) return "Not inside a study; nothing posted.";
+      this.inbox.notify(room.study.id, room.title, kind, title, body);
+      return "Posted to the control inbox. Keep working; there is no reply.";
+    };
+    agent.onAskControl = async (title, rawFields, signal) => {
+      const room = this.agentRooms.get(agent);
+      if (!room?.study) throw new Error("ask_control only works inside a study.");
+      const fields = this.parseFormFields(rawFields);
+      room.question = `form: ${title}`;
+      this.drawBar();
+      try {
+        return (await this.inbox.ask(room.study.id, room.title, title, fields, signal)).text;
+      } finally {
+        if (room.question?.startsWith("form: ")) room.question = null;
+        if (!this.closed) this.drawBar();
+      }
+    };
+    agent.inboxState = () => {
+      const read = this.inbox.items.filter((i) => i.kind === "form" && i.status === "read");
+      return read.length ? (read.some((i) => i.draft) ? "send" : "draft") : "none";
+    };
+    agent.onInboxDraft = (id, answers) => {
+      const item = this.inbox.setDraft(id, answers);
+      const miss = this.inbox.missing(item);
+      return `Draft for #${id} (NOT sent):\n${this.inbox.describeAnswers(item)}\n${miss.length ? `Still unanswered: ${miss.join(", ")}.` : "Complete. Show it to the user and wait for them to say send."}`;
+    };
+    agent.onInboxSend = (id) => {
+      const item = this.inbox.get(id);
+      if (!item || item.kind !== "form") throw new Error(`No form #${id}.`);
+      if (item.status !== "read") throw new Error(`Form #${id} is ${item.status}; it can only be sent while it is read and open.`);
+      const miss = this.inbox.missing(item);
+      if (miss.length) throw new Error(`Still unanswered: ${miss.join(", ")}.`);
+      return {
+        preview: `${item.studyTitle}: ${item.title}\n${this.inbox.describeAnswers(item)}`,
+        send: () => {
+          try {
+            this.inbox.send(id);
+            return `Sent to ${item.studyTitle}. It continues with these answers.`;
+          } catch (error) {
+            return error instanceof Error ? error.message : "Could not send.";
+          }
+        },
+      };
+    };
     agent.onBackground = () => {
       const room = this.agentRooms.get(agent);
       if (room) void this.wakeFromBackground(room);
@@ -658,6 +819,18 @@ export class KestUI {
       if (this.rooms.studies().length >= 8) break;
     }
     return added;
+  }
+
+  /** Reopening Kest in a folder continues that folder's main chat instead of starting blank. */
+  async restoreLastChat() {
+    if (this.closed || this.rooms.focused?.kind !== "chat") return;
+    if (this.session.messages.some((m) => m.role === "user")) return;
+    const saved =
+      (await loadLocalChat(this.cwd)) ??
+      (await listSessions(this.cwd)).find((s) => !s.research && s.messages.some((m) => m.role === "user"));
+    if (!saved || this.closed) return;
+    this.openSession(saved);
+    this.info(`Continued your last chat in this folder: ${saved.title.slice(0, 60)}. /new starts a fresh one.`);
   }
 
   async showSavedResearchHint() {
@@ -734,6 +907,13 @@ export class KestUI {
   }
 
   // Live HUD: snapshot elapsed + local clock since last budget sync.
+  private compactHudText(): string {
+    const study = this.agent.research ?? this.session.research;
+    if (!study) return "";
+    if (this.session.researchEnabled === false) return "Research off · /research show";
+    return compactHud(study);
+  }
+
   private liveHud(): string {
     const study = this.agent.research ?? this.session.research;
     if (!study) return "";
@@ -746,10 +926,57 @@ export class KestUI {
     return budgetHud(study, live);
   }
 
+  // Budget reached: one yes/no. Yes adds the proposed funding and resumes;
+  // no wraps up and publishes what exists to LSI.
+  private async answerFunding(yes: boolean) {
+    const study = this.session.research;
+    if (!study || this.closed) return;
+    const current = study.maxCostUsd ?? 0;
+    const { additional, total } = proposedFunding(current);
+    if (yes) {
+      study.maxCostUsd = total;
+      study.status = "running";
+      void saveSession(this.session).catch(() => {});
+      this.info(`Budget raised by $${additional.toFixed(2)} to $${total.toFixed(2)}. Resuming.`);
+      this.composer.setText(
+        "Resume the research from the last checkpoint. Continue within budget; do not repeat completed work.",
+      );
+      this.settled = this.submit();
+      return;
+    }
+    // A spent budget cannot fund even the closing model calls: grant a small, disclosed wrap-up reserve.
+    const spent = (study.spentCostMicros + study.estimatedCostMicros) / 1_000_000;
+    const reserve = Math.min(0.5, Math.max(0.1, Math.round(current * 0.02 * 100) / 100));
+    if (current - spent < reserve) {
+      study.maxCostUsd = Math.round((spent + reserve) * 100) / 100;
+      this.info(`No extra funding. A $${reserve.toFixed(2)} wrap-up reserve is allowed just to write the report and publish.`);
+    }
+    study.status = "paused";
+    void saveSession(this.session).catch(() => {});
+    await this.command("/research wrapup now");
+  }
+
   // Decision sheet after a research pause: resume, extend, wrap up, stay.
   private openPauseDecision() {
     const study = this.session.research;
     if (!study || this.closed || this.listPicker) return;
+    if (study.strictBudget && study.status === "budget_exhausted") {
+      void this.strictConclude(this.rooms.focused!);
+      return;
+    }
+    if (study.status === "budget_exhausted") {
+      const { additional, total } = proposedFunding(study.maxCostUsd ?? 0);
+      this.info(`Budget reached · ${this.liveHud()}`);
+      this.openListPicker(
+        `? Add $${additional.toFixed(2)} (total $${total.toFixed(2)}) and continue?`,
+        ["Yes — add funds and continue", "No — wrap up and publish to LSI"],
+        ["yes", "no"],
+        (value) => {
+          this.settled = this.answerFunding(value === "yes");
+        },
+      );
+      return;
+    }
     const over = shouldOpenBudgetDecision(study);
     this.info(
       `⏸ Research paused at checkpoint · ${this.liveHud()}${over ? " · budget watch/critical" : ""}`,
@@ -773,7 +1000,7 @@ export class KestUI {
           this.composer.setText("/research budget ");
           this.composer.focus();
           this.info(
-            "Enter a new total USD allowance, e.g. /research budget 15$. Nothing has been increased.",
+            "Enter a new total USD allowance, e.g. /research budget set 15$, or top up with /research budget add 5$. Nothing has been increased.",
           );
           return;
         }
@@ -787,6 +1014,270 @@ export class KestUI {
         this.settled = this.submit();
       },
     );
+  }
+
+  /** Start a prepared study in its own room without focusing it. */
+  private async runStudyInBackground(room: Room) {
+    const study = room.session.research;
+    if (!study || !this.credentials || room.controller) return;
+    try {
+      await recoverCompany(this.cwd, study);
+      room.session.goal = study.objective;
+      room.session.researchEnabled = true;
+      room.agent.research = study;
+      room.agent.publishNow = false;
+      room.agent.wrappingUp = false;
+      await saveSession(room.session);
+      this.toast(`study started in background · $${(study.maxCostUsd ?? 0).toFixed(2)} strict budget`);
+      const strict = study.strictBudget
+        ? "\nSTRICT BUDGET: the allowance is final. Never propose or request extra funding. Plan to finish inside it and conclude with research_complete (limitations and unanswered questions stated honestly) even if the result is partial."
+        : "";
+      await this.runTurn(
+        room,
+        `Research objective: ${study.objective}\nUse the research company workflow. Save reproducible evidence in research/${study.id}/. Check research_status for the shared allowance. Reserve funding for independent review; call research_complete only with a reviewed report.${strict}${lsiKey() ? " Publish the reviewed findings to LSI with lsi_publish when complete, answering the LSI question named in the objective." : ""}`,
+      );
+    } catch (error) {
+      room.buffer.push({ type: "note", text: this.errorText(error) });
+    }
+  }
+
+  /** Prepared studies waiting for a free run slot (filled by start-all). */
+  private startQueue: Room[] = [];
+
+  /** Notices and forms from studies. UI state only: the chat model sees an item only after the user reads it. */
+  private inbox = (() => {
+    const inbox = new Inbox();
+    inbox.onChange = () => {
+      if (!this.closed) this.drawBar();
+    };
+    inbox.onEvent = (item, what) => this.inboxNotice(item, what);
+    return inbox;
+  })();
+  private notifiedStates = new Set<string>();
+
+  private chatRoom() {
+    return this.rooms.list().find((room) => room.kind === "chat");
+  }
+
+  /** A one-line card in the main chat's transcript. Never added to the model's messages. */
+  private inboxNotice(item: InboxItem, what: "added" | "answered" | "expired") {
+    const chat = this.chatRoom();
+    if (!chat || this.closed) return;
+    const minutes = Math.max(1, Math.round(this.inbox.timeoutMs / 60_000));
+    const text =
+      what === "answered"
+        ? `✓ #${item.id} answers sent to ${item.studyTitle}; it continues.`
+        : what === "expired"
+          ? `⏱ #${item.id} no reply in ${minutes} min: the ${item.studyTitle} director decided and continued.`
+          : item.kind === "form"
+            ? `▲ #${item.id} ${item.studyTitle} asks: ${item.title} · ${item.fields.length} question(s) · reply within ${minutes} min or the director decides · /inbox read ${item.id}`
+            : `${item.kind === "done" ? "✓" : item.kind === "blocked" ? "!" : "•"} #${item.id} ${item.studyTitle}: ${item.title}${item.body ? ` · ${item.body.replace(/\s+/g, " ").slice(0, 120)}` : ""} · /inbox read ${item.id}`;
+    if (this.rooms.focused === chat) this.info(text);
+    else chat.session.entries.push({ role: "info", text });
+    this.drawBar();
+  }
+
+  private inboxLine(item: InboxItem) {
+    const mark = item.status === "new" ? "●" : item.status === "read" ? "○" : item.status === "answered" ? "✓" : item.status === "expired" ? "⏱" : "–";
+    return `${mark} #${item.id} [${item.kind}] ${item.studyTitle}: ${item.title} (${item.status}${item.draft && item.status === "read" ? ", draft ready" : ""})`;
+  }
+
+  /** What the chat model is told when the user reads an item. This is the only way inbox content reaches it. */
+  private inboxContext(item: InboxItem) {
+    if (item.kind !== "form")
+      return `[Control inbox #${item.id}, ${item.kind} from study "${item.studyTitle}"] ${item.title}${item.body ? `\n${item.body}` : ""}\nThe user read this and may give you direction about it.`;
+    const fields = item.fields
+      .map((f) => `- ${f.id} (${f.type}${f.options ? `: ${f.options.join(" | ")}` : ""}${f.default !== undefined ? `; default ${f.default}` : ""}) ${f.label}${f.why ? ` — ${f.why}` : ""}`)
+      .join("\n");
+    return `[Control inbox #${item.id}, form from study "${item.studyTitle}"] ${item.title}\n${fields}\nThe study is waiting; if there is no answer in ${Math.max(1, Math.round(this.inbox.timeoutMs / 60_000))} minutes its director decides alone. The user will now give you direction in their own words. Draft answers with inbox_draft and show them. Do not send anything until the user tells you to; sending asks them to confirm.`;
+  }
+
+  private async inboxCommand(value: string) {
+    const [action = "list", rest = ""] = [value.trim().split(/\s+/)[0] ?? "", value.trim().split(/\s+/).slice(1).join(" ")];
+    const num = Number(rest.split(/\s+/)[0]?.replace("#", ""));
+    const item = Number.isInteger(num) ? this.inbox.get(num) : undefined;
+    const need = () => {
+      if (!item) this.info(`Give an inbox number, for example /inbox ${action || "read"} 1. /inbox lists them.`);
+      return item;
+    };
+    if (!action || action === "list") {
+      const items = this.inbox.items.slice(-20);
+      this.info(
+        items.length
+          ? `Inbox (${this.inbox.unread()} unread, forms wait ${Math.round(this.inbox.timeoutMs / 60_000)} min):\n${items.map((i) => this.inboxLine(i)).join("\n")}\n/inbox read N · open N · dismiss N · answer N id=value; id=value · send N · timeout MINUTES`
+          : "Inbox is empty. Studies post progress and questions here; nothing reaches the chat until you read it.",
+      );
+      return;
+    }
+    if (action === "timeout") {
+      const minutes = Number(rest);
+      if (!Number.isFinite(minutes) || minutes < 1 || minutes > 30) return this.info("Use /inbox timeout MINUTES, from 1 to 30. It applies to forms posted from now on.");
+      this.inbox.timeoutMs = Math.round(minutes * 60_000);
+      return this.info(`Forms now wait ${minutes} min for you before the director decides.`);
+    }
+    const target = need();
+    if (!target) return;
+    try {
+      if (action === "read") {
+        const chat = this.chatRoom();
+        if (!chat) return;
+        this.inbox.markRead(target.id);
+        if (this.rooms.focused !== chat) this.focusRoom(chat);
+        chat.agent.messages.push({ role: "user", content: this.inboxContext(target) });
+        chat.session.messages = chat.agent.messages;
+        this.info(`Read #${target.id}: now in the chat's context.\n${target.title}${target.body ? `\n${target.body}` : ""}${target.kind === "form" ? "\nGive your direction in your own words; the chat drafts the answers, you confirm the send." : ""}`);
+      } else if (action === "open") {
+        const room = this.rooms.list().find((r) => r.study?.id === target.studyId);
+        if (!room) return this.info("That study's room is not open.");
+        this.focusRoom(room);
+      } else if (action === "dismiss") {
+        this.inbox.dismiss(target.id);
+        this.info(target.kind === "form" ? `Form #${target.id} stays open until it times out; the director decides if you do not answer.` : `Dismissed #${target.id}.`);
+      } else if (action === "answer") {
+        if (target.status === "new") this.inbox.markRead(target.id);
+        const values: Record<string, string> = {};
+        for (const part of rest.split(/\s+/).slice(1).join(" ").split(";")) {
+          const at = part.indexOf("=");
+          if (at > 0) values[part.slice(0, at).trim()] = part.slice(at + 1).trim();
+        }
+        const updated = this.inbox.setDraft(target.id, values);
+        const miss = this.inbox.missing(updated);
+        this.info(`Draft for #${target.id} (not sent):\n${this.inbox.describeAnswers(updated)}${miss.length ? `\nStill needed: ${miss.join(", ")}` : `\nReady. /inbox send ${target.id}`}`);
+      } else if (action === "send") {
+        this.inbox.send(target.id);
+      } else this.info("Usage: /inbox [list] | read N | open N | dismiss N | answer N id=value; … | send N | timeout MINUTES");
+    } catch (error) {
+      this.info(error instanceof Error ? error.message : "Inbox action failed.");
+    }
+  }
+
+  private parseFormFields(raw: unknown[]): FormField[] {
+    const types = ["choice", "yesno", "number", "text"];
+    return raw.map((entry, index) => {
+      const f = (entry && typeof entry === "object" ? entry : {}) as Record<string, unknown>;
+      if (typeof f.id !== "string" || typeof f.label !== "string" || !types.includes(String(f.type))) throw new Error(`Field ${index + 1}: needs id, label and a type of choice, yesno, number or text.`);
+      return {
+        id: f.id.trim().slice(0, 40),
+        label: f.label.trim().slice(0, 300),
+        type: f.type as FormField["type"],
+        ...(Array.isArray(f.options) ? { options: f.options.map(String).slice(0, 8) } : {}),
+        ...(typeof f.default === "string" ? { default: f.default.slice(0, 300) } : {}),
+        ...(typeof f.why === "string" ? { why: f.why.slice(0, 200) } : {}),
+      };
+    });
+  }
+
+  /** Start queued studies while there are free slots. */
+  private drainStartQueue() {
+    if (this.closed || !this.credentials) return;
+    const cap = this.rooms.limits.totalUsd;
+    if (cap !== null && this.rooms.totalSpentUsd() >= cap) return;
+    while (this.startQueue.length) {
+      const free = this.rooms.limits.maxRunning - this.rooms.running().length - this.pendingStarts;
+      if (free <= 0) return;
+      const next = this.startQueue.shift()!;
+      if (next.study?.status !== "ready" || next.running) continue;
+      this.pendingStarts++;
+      void this.runStudyInBackground(next).finally(() => (this.pendingStarts = Math.max(0, this.pendingStarts - 1)));
+    }
+  }
+  /** Studies launched but not yet counted as running (their turn has not begun). */
+  private pendingStarts = 0;
+
+  /** Start every prepared study that has a budget, in the background, up to the concurrent-run limit. */
+  private async startAllPrepared(): Promise<string> {
+    if (!this.credentials) return "No model provider is connected: tell the user to run /connect, then start the studies.";
+    await this.loadSavedStudies();
+    const ready = this.rooms.studies().filter((r) => r.study?.status === "ready" && !r.running);
+    if (!ready.length) return "No prepared studies are waiting. Prepare some with research_prepare first.";
+    const withBudget = ready.filter((r) => r.study!.maxCostUsd !== null);
+    const noBudget = ready.filter((r) => r.study!.maxCostUsd === null);
+    let slots = Math.max(0, this.rooms.limits.maxRunning - this.rooms.running().length - this.pendingStarts);
+    const cap = this.rooms.limits.totalUsd;
+    const allowanceUsed = cap !== null && this.rooms.totalSpentUsd() >= cap;
+    if (allowanceUsed) slots = 0;
+    const started = withBudget.slice(0, slots);
+    const queued = allowanceUsed ? [] : withBudget.slice(slots);
+    for (const room of started) {
+      this.pendingStarts++;
+      void this.runStudyInBackground(room).finally(() => (this.pendingStarts = Math.max(0, this.pendingStarts - 1)));
+    }
+    for (const room of queued) if (!this.startQueue.includes(room)) this.startQueue.push(room);
+    if (started.length) this.toast(`${started.length} stud${started.length === 1 ? "y" : "ies"} started in background`);
+    const label = (r: Room) => `"${r.title.slice(0, 50)}" ($${r.study!.maxCostUsd?.toFixed(2) ?? "?"})`;
+    return [
+      started.length ? `Started in the background: ${started.map(label).join("; ")}.` : "Nothing was started.",
+      queued.length ? `Queued (only ${this.rooms.limits.maxRunning} studies run at once; these start automatically as others finish, or raise /research parallel up to 10): ${queued.map(label).join("; ")}.` : "",
+      allowanceUsed ? `Not started: the total allowance is used up; raise /research total.` : "",
+      noBudget.length ? `Skipped, no budget set: ${noBudget.map((r) => `"${r.title.slice(0, 50)}"`).join("; ")}.` : "",
+      "Tell the user briefly; do not repeat setup steps.",
+    ].filter(Boolean).join("\n");
+  }
+
+  /** Every study in this workspace (live rooms win over saved copies). */
+  private async allStudies() {
+    const byId = new Map<string, { study: NonNullable<Room["study"]>; sessionId: string; running: boolean }>();
+    for (const saved of await listSessions(this.cwd)) {
+      if (saved.research) byId.set(saved.research.id, { study: saved.research, sessionId: saved.id, running: false });
+    }
+    for (const room of this.rooms.studies()) {
+      if (room.study) byId.set(room.study.id, { study: room.study, sessionId: room.session.id, running: room.running });
+    }
+    return [...byId.values()];
+  }
+
+  private async listStudies(): Promise<string> {
+    const all = await this.allStudies();
+    if (!all.length) return "No research studies in this workspace yet.";
+    const state = (e: (typeof all)[number]) => (e.running ? "running" : e.study.status === "running" ? "paused" : e.study.status);
+    const names: Record<string, string> = { running: "running", ready: "prepared (not started)", paused: "paused", budget_exhausted: "out of budget", completed: "completed" };
+    const counts = new Map<string, number>();
+    for (const e of all) counts.set(state(e), (counts.get(state(e)) ?? 0) + 1);
+    const summary = [...counts].map(([k, n]) => `${n} ${names[k] ?? k}`).join(" · ");
+    const rows = all.map((e) => {
+      const s = e.study;
+      const budget = s.maxCostUsd === null ? "no budget" : `$${s.maxCostUsd.toFixed(2)}`;
+      return `- ${s.id} [${names[state(e)] ?? state(e)}] $${studySpentUsd(s).toFixed(2)}/${budget}${s.autoPublish ? " · auto-publish" : ""} · ${e.running ? "cannot delete while running" : "deletable"} · ${s.objective.slice(0, 90)}`;
+    });
+    const total = all.reduce((n, e) => n + studySpentUsd(e.study), 0).toFixed(2);
+    return `${all.length} studies: ${summary}\n${rows.join("\n")}\nTotal spent $${total}. Deleting removes local files only; findings already on LSI stay (unpublish with lsi_set_published).`;
+  }
+
+  private async deleteStudy(query: string): Promise<string> {
+    const all = await this.allStudies();
+    const hits = all.filter((e) => e.study.id === query || e.study.id.startsWith(query));
+    if (hits.length !== 1) return hits.length ? `"${query}" matches ${hits.length} studies; give a longer id.` : `No study matches "${query}". Call research_list for ids.`;
+    const hit = hits[0]!;
+    if (hit.running) return "That study is running. Pause it first (Esc in its room), then delete.";
+    if (!/^[\w-]+$/.test(hit.study.id)) return "Refusing to delete: unexpected study id.";
+    const room = this.rooms.list().find((r) => r.study?.id === hit.study.id);
+    if (room && this.rooms.focused?.id === room.id) return "That study's room is focused. Switch to another room (Ctrl+K), then delete.";
+    this.startQueue = this.startQueue.filter((r) => r.study?.id !== hit.study.id);
+    if (room) this.rooms.remove(room.id);
+    await deleteSession(hit.sessionId);
+    await rm(join(this.cwd, "research", hit.study.id), { recursive: true, force: true });
+    return `Deleted ${hit.study.id} (${hit.study.status}). Local files only; anything it published to LSI is unchanged.`;
+  }
+
+  /** Strict budget ran out: one automatic conclude-and-publish turn within what is left, never a funding request. */
+  private async strictConclude(room: Room) {
+    const study = room.session.research;
+    if (!study?.strictBudget || study.strictWrapUp || study.status === "completed" || this.closed) return;
+    study.strictWrapUp = true;
+    const left = (study.maxCostUsd ?? 0) - (study.spentCostMicros + study.estimatedCostMicros) / 1_000_000;
+    if (left < 0.01) {
+      study.status = "budget_exhausted";
+      await saveSession(room.session).catch(() => {});
+      this.toast("strict budget used up · study stopped without a final report", true);
+      return;
+    }
+    study.status = "paused";
+    room.agent.research = study;
+    room.agent.publishNow = true;
+    room.agent.wrappingUp = true;
+    await saveSession(room.session).catch(() => {});
+    this.toast("strict budget reached · concluding with what exists");
+    await this.runTurn(room, wrapupPrompt(true));
   }
 
   // A finished background task wakes the agent in its own turn. If a turn
@@ -926,6 +1417,28 @@ export class KestUI {
         } else void this.wakeFromBackground(room);
         this.refreshTipRow();
       } else if (!this.closed) void this.wakeFromBackground(room);
+      if (!this.closed && !controller.signal.aborted && room.kind === "study") this.drainStartQueue();
+      if (!this.closed && !controller.signal.aborted && room.kind === "study" && room.study) {
+        const status = room.study.status;
+        const key = `${room.study.id}:${status}`;
+        if ((status === "completed" || status === "budget_exhausted") && !this.notifiedStates.has(key)) {
+          this.notifiedStates.add(key);
+          this.inbox.notify(
+            room.study.id,
+            room.title,
+            status === "completed" ? "done" : "blocked",
+            status === "completed" ? `Finished · $${studySpentUsd(room.study).toFixed(2)} spent` : "Out of budget: needs your decision in the room",
+          );
+        }
+      }
+      if (
+        !this.closed &&
+        !controller.signal.aborted &&
+        room.kind === "study" &&
+        room.session.research?.strictBudget &&
+        room.session.research.status === "budget_exhausted"
+      )
+        void this.strictConclude(room);
     }
   }
 
@@ -950,25 +1463,58 @@ export class KestUI {
       this.roomBar.visible = false;
       return;
     }
-    const lines = [
-      companyBar(this.rooms, Math.max(20, this.renderer.width - 2)),
-    ];
-    for (const room of this.rooms
-      .needingYou()
-      .filter((r) => r !== focused)
-      .slice(0, 2)) {
-      const ask = room.pending[0]?.request.title
-        ? `wants approval: ${brief(room.pending[0].request.title, 60)}`
-        : `says: ${brief(room.question ?? "", 80)}`;
-      lines.push(`▲ ${room.title} ${ask} · Ctrl+K to open`);
-    }
-    if (focused?.kind === "study")
-      lines.push(
-        `↳ You are in "${focused.title}" · typing directs this study · /chat leaves · Ctrl+K rooms`,
-      );
+    const { lines, targets } = roomList(
+      this.rooms,
+      Math.max(20, this.renderer.width - 4),
+      Math.max(3, Math.min(10, Math.floor((this.renderer.height - 14) / 2))),
+      performance.now(),
+      this.inbox.unread() ? `✉${this.inbox.unread()} unread · /inbox` : "",
+    );
+    this.roomTargets = targets;
     this.roomBar.content = lines.join("\n");
-    this.roomBar.height = lines.length;
+    this.roomBar.height = Math.max(1, lines.length);
     this.roomBar.visible = true;
+    this.drawFooter();
+  }
+
+  // Left: workspace. Right: a short-lived toast, else room shortcuts.
+  private drawFooter() {
+    if (this.closed || !this.footer) return;
+    const width = Math.max(10, this.renderer.width - 4);
+    const home = homedir();
+    let left = this.cwd.startsWith(home) ? `~${this.cwd.slice(home.length)}` : this.cwd;
+    const focused = this.rooms.focused;
+    const right = this.toastText
+      ? this.toastText
+      : focused?.kind === "study"
+        ? "Alt+↑↓ rooms · /chat leaves"
+        : this.rooms.list().length > 1
+          ? "Alt+↑↓ rooms"
+          : "";
+    if (right && left.length + right.length + 2 > width) {
+      if (this.toastText) left = truncateMiddle(left, Math.max(8, width - right.length - 2));
+      else {
+        this.footer.content = truncateMiddle(left, width);
+        this.footer.fg = theme.muted;
+        return;
+      }
+    }
+    const gap = Math.max(1, width - left.length - right.length);
+    this.footer.content = right ? `${left}${" ".repeat(gap)}${right}` : left;
+    this.footer.fg = this.toastText && this.toastWarn ? theme.error : theme.muted;
+  }
+
+  private toast(text: string, warn = false) {
+    if (this.toastTimer) clearTimeout(this.toastTimer);
+    this.toastText = text;
+    this.toastWarn = warn;
+    this.drawFooter();
+    this.toastTimer = setTimeout(() => {
+      this.toastText = "";
+      this.toastTimer = null;
+      this.drawFooter();
+    }, warn ? 5_000 : 2_000);
+    this.toastTimer.unref();
   }
 
   // Bring a room on screen. Its transcript is rebuilt from saved entries and
@@ -1007,6 +1553,8 @@ export class KestUI {
     target.question = null;
     if (target.running) this.showLoading("Working");
     else {
+      // Replayed "working" events start the spinner timer; a room that is not running must not keep it.
+      this.stopLoading();
       this.flushResponse();
       this.ready();
     }
@@ -1137,6 +1685,7 @@ export class KestUI {
   private refreshTipRow() {
     if (!this.tipRow) return;
     this.tipRow.visible =
+      this.tipsEnabled &&
       !this.closed &&
       !this.active &&
       !this.loadingTimer &&
@@ -1175,13 +1724,20 @@ export class KestUI {
       this.tipRow.visible = false;
       return;
     }
-    const width = Math.max(8, this.renderer.width - 17);
+    const width = Math.max(8, this.renderer.width - 20);
     const text = `Tip: ${tip.text}`;
     const rows = Math.min(2, Math.max(1, Math.ceil(text.length / width)));
     this.tipRow.height = rows;
     this.tipText.content =
       text.length > width * 2 ? text.slice(0, width * 2 - 1) + "…" : text;
     this.tipCounter.content = `${this.tipIndex + 1}/${this.availableTips.length}`;
+  }
+
+  private async setTips(enabled: boolean) {
+    this.tipsEnabled = enabled;
+    this.refreshTipRow();
+    if (!enabled) this.composer.focus();
+    await saveTipsEnabled(enabled).catch(() => {});
   }
 
   private changeTip(direction: number) {
@@ -1204,7 +1760,7 @@ export class KestUI {
     const total = this.session.tasks.length;
     const done = this.session.tasks.filter((t) => t.status === "done").length;
     const tasks = total ? `Tasks ${done}/${total}` : "";
-    const hud = this.session.research ? this.liveHud() : "";
+    const hud = this.session.research ? this.compactHudText() : "";
     this.status.content = [goal, tasks, hud].filter(Boolean).join(" · ");
     if (!this.credentials) {
       this.modelTag.visible = true;
@@ -1373,6 +1929,8 @@ export class KestUI {
     return { entry, node: this.display(entry) };
   }
   private renderTool(tool: ToolView) {
+    // Old rows are destroyed once the transcript passes 180 entries; a late update must not touch them.
+    if (tool.node.isDestroyed) return;
     const heading = clean(tool.entry.text.split("\n")[0] ?? "");
     tool.node.fg = heading.startsWith("✕")
       ? theme.error
@@ -1755,6 +2313,20 @@ export class KestUI {
       else tool.outputScroll?.focus();
       return;
     }
+    if (
+      (key.meta || key.option) &&
+      !key.ctrl &&
+      ["up", "down"].includes(key.name) &&
+      this.rooms.list().length > 1
+    ) {
+      key.preventDefault();
+      key.stopPropagation();
+      const order = roomOrder(this.rooms);
+      const at = order.indexOf(this.rooms.focused as Room);
+      const next = order[(at + (key.name === "up" ? -1 : 1) + order.length) % order.length];
+      if (next && this.focusRoom(next)) this.composer.focus();
+      return;
+    }
     if (key.ctrl && key.name === "k" && this.rooms.list().length > 1) {
       key.preventDefault();
       this.openRoomPicker();
@@ -1857,8 +2429,7 @@ export class KestUI {
   private async copySelected() {
     const text = this.renderer.getSelection()?.getSelectedText();
     if (!text) {
-      this.status.content =
-        "Drag across text to select, then Ctrl+C or Ctrl+Y to copy.";
+      this.toast("Drag across text to select, then Ctrl+C");
       return;
     }
     try {
@@ -1871,18 +2442,16 @@ export class KestUI {
       });
       if (this.closed) return;
       if (result.host.status === "written") {
-        this.status.content = `Copied ${text.length} characters.`;
+        this.toast(`✓ copied ${text.length} chars`);
         this.renderer.clearSelection();
       } else if (result.terminal.status === "attempted") {
-        this.status.content = "Copy sent to terminal clipboard.";
+        this.toast("copy sent to terminal");
         this.renderer.clearSelection();
       } else
-        this.status.content =
-          "Clipboard unavailable. Try Shift+drag and your terminal's Copy command.";
+        this.toast("clipboard unavailable · try Shift+drag", true);
     } catch {
       if (!this.closed)
-        this.status.content =
-          "Copy failed. Try Shift+drag and your terminal's Copy command.";
+        this.toast("copy failed · try Shift+drag", true);
     }
   }
 
@@ -2310,6 +2879,7 @@ export class KestUI {
       // (old UI) hidden under the head until the head is expanded.
       // Every worker row individually expands to its own live activity log.
       if (!this.teamGroup) {
+        this.teamFeed = [];
         const head = this.add(
           "tool",
           "→ Research team",
@@ -2343,7 +2913,7 @@ export class KestUI {
         { parentActivityGroup: team.entry.activityGroup },
       );
       const childView = this.toolViews.get(added.node as TextRenderable)!;
-      if (childView.block) childView.block.visible = team.view.expanded;
+      if (childView.block && !childView.block.isDestroyed) childView.block.visible = team.view.expanded;
       worker = {
         meta: event,
         entry: added.entry,
@@ -2358,6 +2928,12 @@ export class KestUI {
     const activity = event.event;
     if (activity?.type === "tool") {
       worker.latest = `${actionLabel(activity.name, activity.args)} · ${activity.state}`;
+      if (activity.state !== "running") {
+        this.teamFeed.push(
+          `${activity.state === "error" ? "✕" : "✓"} ${event.role} ${event.workerId.slice(0, 6)} · ${brief(actionLabel(activity.name, activity.args), 70)}${activity.durationMs === undefined ? "" : ` · ${formatDuration(activity.durationMs)}`}`,
+        );
+        if (this.teamFeed.length > 8) this.teamFeed.shift();
+      }
       worker.log += `\n[${activity.state}] ${activity.name}${activity.durationMs === undefined ? "" : ` · ${formatDuration(activity.durationMs)}`}\n${activity.state === "running" ? activity.args : (activity.output ?? "")}\n`;
       if (activity.state !== "running" && activity.durationMs !== undefined)
         (this.session.toolStats ??= []).push({
@@ -2397,7 +2973,7 @@ export class KestUI {
     const team = this.teamGroup;
     if (!team) return;
     for (const child of team.children)
-      if (child.block) child.block.visible = team.view.expanded;
+      if (child.block && !child.block.isDestroyed) child.block.visible = team.view.expanded;
   }
 
   private renderTeamGroup() {
@@ -2408,17 +2984,20 @@ export class KestUI {
     const done = workers.filter((w) => w.meta.state === "done").length;
     const failed = workers.filter((w) => w.meta.state === "error").length;
     const roles = [...new Set(workers.map((w) => w.meta.role))].join(", ");
+    const live = workers.find((w) => w.meta.state === "running");
     team.entry.text =
       running > 0
-        ? `→ Research team · ${workers.length} ${roles} · ${running} running${done ? ` · ${done} done` : ""}${failed ? ` · ${failed} failed` : ""}`
+        ? `→ Research team · ${workers.length} ${roles} · ${running} running${done ? ` · ${done} done` : ""}${failed ? ` · ${failed} failed` : ""}${live ? ` · ${truncateMiddle(live.latest, 48)}` : ""}`
         : `${failed ? "✕" : "✓"} Research team · ${done}/${workers.length} done${failed ? ` · ${failed} failed` : ""}`;
     // Head detail stays a thin index; per-tool logs live on worker rows.
-    team.entry.detail!.output = workers
+    team.entry.detail!.output = [
+      ...(this.teamFeed.length ? ["Recent tool calls:", ...this.teamFeed.map((l) => `  ${l}`), ""] : []),
+      ...workers
       .map(
         (w) =>
           `${w.meta.state === "done" ? "✓" : w.meta.state === "error" ? "✕" : "→"} ${w.meta.role} ${w.meta.workerId.slice(0, 8)} · ${truncateMiddle(w.meta.model, 36)} · ${w.latest}`,
-      )
-      .join("\n");
+      ),
+    ].join("\n");
     if (failed > 0 && running === 0) team.view.expanded = true;
     if (!team.view.node.isDestroyed) this.renderTool(team.view);
     this.applyTeamVisibility();
@@ -2433,10 +3012,9 @@ export class KestUI {
     if (event.type === "checkpoint") {
       this.toolGroup = null;
       this.teamGroup = null;
-      this.add(
-        "info",
-        `Research checkpoint ${event.cycle} · continuing\n${brief(event.text, 6000)}`,
-      );
+      // The checkpoint body is the director's own write-up: render it as Markdown.
+      if (event.text.trim()) this.add("kest", brief(event.text, 6000));
+      this.add("info", `Research checkpoint ${event.cycle} · continuing`);
       this.pendingText = "";
       return;
     }
@@ -2640,7 +3218,7 @@ export class KestUI {
     const draw = () => {
       if (!this.closed) {
         const study = this.agent.research ?? this.session.research;
-        const hud = study ? ` │ ${this.liveHud()}` : "";
+        const hud = study ? ` │ ${this.compactHudText()}` : "";
         const label = hud
           ? truncateMiddle(
               this.loadingLabel,
@@ -2706,14 +3284,40 @@ export class KestUI {
       // A study is running: slash commands that only read are fine; anything
       // else is direction for the director, delivered before its next step.
       if (text.startsWith("/")) {
+        if (/^\/research\s+(wrapup|publish)(\s+now)?\s*$/i.test(text)) {
+          // Typed while the study runs: switch the live director to stop-and-publish instead of refusing.
+          room.agent.publishNow = true;
+          room.agent.pendingNotes.push("Stop and publish now.");
+          this.info("Stop and publish · no new reviews or experiments; the director will write the report and publish to LSI.");
+          return;
+        }
         if (!runningSafeCommand.test(text))
           this.info("Press Esc to pause this study before running that command.");
         else await this.command(text);
         return;
       }
+      if (!displayLabel && wantsStopAndPublish(text)) room.agent.publishNow = true;
       room.agent.pendingNotes.push(text);
       this.add("you", text);
-      this.info("Direction queued · the director reads it before its next step.");
+      this.info(
+        room.agent.publishNow
+          ? "Stop and publish · no more reviews or experiments; the director will write the report and publish to LSI."
+          : "Direction queued · the director reads it before its next step.",
+      );
+      return;
+    }
+    if (
+      !displayLabel &&
+      this.session.research?.status === "budget_exhausted" &&
+      /^(y|yes|yep|ok|okay|n|no|nope)$/i.test(text)
+    ) {
+      this.add("you", text);
+      await this.answerFunding(/^(y|yes|yep|ok|okay)$/i.test(text));
+      return;
+    }
+    if (!displayLabel && !text.startsWith("/") && room.kind === "study" && wantsStopAndPublish(text)) {
+      this.info("Stop and publish · finishing the study without another review round.");
+      await this.command("/research wrapup now");
       return;
     }
     let turn = false;
@@ -2740,13 +3344,24 @@ export class KestUI {
         this.session.title = text.replace(/\s+/g, " ").slice(0, 70);
       turn = true;
     } catch (error) {
+      // Keep the real error even when the window is already gone (it would otherwise vanish with the screen).
+      void import("node:fs/promises")
+        .then(async (fs) => {
+          const dir = process.env.KEST_CONFIG_DIR?.trim() || (await import("./config")).configDir;
+          await fs.mkdir(dir, { recursive: true });
+          await fs.appendFile(`${dir}/last-error.log`, `${new Date().toISOString()} submit: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}
+
+`);
+        })
+        .catch(() => {});
+      if (this.closed) return; // the window was closed mid-command; nothing left to draw on
       this.stopLoading();
       this.tipsBlockedByError = true;
       this.status.content = "Stopped · see error above";
       this.status.fg = theme.error;
       if (!this.showConnectionFailure(error)) this.info(this.errorText(error));
     } finally {
-      if (!turn) {
+      if (!turn && !this.closed) {
         this.stopLoading();
         this.toolGroup = null;
         this.pendingText = "";
@@ -2812,9 +3427,21 @@ export class KestUI {
       this.close();
       return;
     }
+    if (command === "/inbox") {
+      await this.inboxCommand(value);
+      return;
+    }
     if (command === "/research") {
       const [action, ...rest] = value.split(/\s+/);
       let parts = rest;
+      let budgetOp: "set" | "add" | "remove" = "set";
+      // "/research wrapup now" (or `publish now`): finish and publish without another review round.
+      const wrapNow = action === "wrapup" && rest.at(-1) === "now";
+      if (wrapNow) parts = rest.slice(0, -1);
+      if (action === "budget" && ["set", "add", "remove"].includes(parts[0] ?? "")) {
+        budgetOp = parts[0] as typeof budgetOp;
+        parts = parts.slice(1);
+      }
       if (action === "budget" && parts.length > 1) {
         const amount = parts.at(-1)!;
         const room = await this.resolveStudy(parts.slice(0, -1).join(" "));
@@ -2877,11 +3504,19 @@ export class KestUI {
         const words = [...parts];
         const domainAt = words.findIndex((w) => /^domain=/.test(w));
         const domain = domainAt >= 0 ? words.splice(domainAt, 1)[0]!.slice(7) : "";
+        const ready = (r: Room | null | undefined) => r?.kind === "study" && r.study?.status === "completed" && !!r.study.finalReportPath;
+        const focusedStudy = this.rooms.focused?.kind === "study" ? this.rooms.focused : null;
+        // With no name, prefer the focused study; if it isn't finished, use the one completed study that is.
+        if (!words.length && !ready(focusedStudy)) await this.loadSavedStudies();
+        const finished = this.rooms.studies().filter(ready);
         const room = words.length
           ? await this.resolveStudy(words.join(" "))
-          : this.rooms.focused?.kind === "study"
-            ? this.rooms.focused
-            : null;
+          : ready(focusedStudy)
+            ? focusedStudy
+            : finished.length === 1
+              ? finished[0]!
+              : focusedStudy;
+        if (!words.length && room && room !== focusedStudy && ready(room)) this.info(`Publishing the completed study "${room.title.slice(0, 40)}".`);
         if (!room || !this.focusRoom(room)) {
           if (!room && !words.length) this.info("/research publish [domain=<id>] [study]  (open a study or name one)");
           return;
@@ -2896,7 +3531,8 @@ export class KestUI {
           this.info(blocker);
           return;
         }
-        this.info("Publishing to LSI… (one model call, then one lsi_publish)");
+        this.info("Publishing to LSI… (domains, question link, then lsi_publish)");
+        room.agent.publishRequested = true;
         this.composer.setText(publishPrompt(study, domain));
         await this.submit("Publish instructions · expand to inspect");
         return;
@@ -2970,6 +3606,21 @@ export class KestUI {
         this.info(`Up to ${n} studies may run at once.`);
         return;
       }
+      if (action === "autopublish") {
+        const study = this.rooms.focused?.session.research;
+        if (!study) {
+          this.info("Open a study room first, then /research autopublish on|off.");
+          return;
+        }
+        study.autoPublish = parts[0] !== "off";
+        await saveSession(this.rooms.focused!.session);
+        this.info(study.autoPublish ? "Auto-publish on: this study claims the best-fit LSI question and publishes without asking each time." : "Auto-publish off: LSI claim/post/publish will ask for approval.");
+        return;
+      }
+      if (action === "startall") {
+        this.info(await this.startAllPrepared());
+        return;
+      }
       if (action === "models") {
         this.info(JSON.stringify(await listResearchModels(), null, 2));
         return;
@@ -3036,10 +3687,24 @@ export class KestUI {
         const study = this.session.research;
         if (!study || parts.length !== 1)
           throw new Error(
-            "Prepare a research objective first, then /research budget 10$.",
+            "Prepare a research objective first, then /research budget set 10$ (or add 5$ / remove 5$).",
           );
-        const total = parseCostBudget(parts[0]!);
+        const amount = parseCostBudget(parts[0]!);
         await recoverCompany(this.cwd, study);
+        if (budgetOp !== "set" && study.maxCostUsd === null)
+          throw new Error(
+            `No budget is set yet. Use /research budget set ${parts[0]} first.`,
+          );
+        const total =
+          budgetOp === "set"
+            ? amount
+            : Math.round(
+                (study.maxCostUsd! + (budgetOp === "add" ? amount : -amount)) * 100,
+              ) / 100;
+        if (total < 0.01)
+          throw new Error(
+            `Cannot remove $${amount.toFixed(2)}: the budget is only $${study.maxCostUsd!.toFixed(2)}.`,
+          );
         if (study.status === "completed") {
           this.info(
             "This study is complete; its budget and result are preserved. /research show to inspect, or /research prepare <objective> for a new study.",
@@ -3061,7 +3726,7 @@ export class KestUI {
         await saveSession(this.session);
         this.add(
           "info",
-          `Budget set · $${total.toFixed(2)} total · ${study.status === "ready" ? "/research start" : "/research show for next steps"}`,
+          `Budget ${budgetOp === "set" ? "set" : budgetOp === "add" ? `raised by $${amount.toFixed(2)}` : `lowered by $${amount.toFixed(2)}`} · $${total.toFixed(2)} total · ${study.status === "ready" ? "/research start" : "/research show for next steps"}`,
           {
             input: `Total allowance: $${total.toFixed(2)} USD. Existing consumption is preserved.`,
             output: formatCompany(study),
@@ -3106,6 +3771,11 @@ export class KestUI {
         );
         return;
       }
+      if (study.status === "completed" && action === "wrapup" && study.finalReportPath) {
+        this.info("Study already complete · publishing the report to LSI.");
+        await this.command("/research publish");
+        return;
+      }
       if (study.status === "completed") {
         this.info(
           "This research study is complete. Start a new objective with /research prepare <objective>.",
@@ -3132,6 +3802,8 @@ export class KestUI {
       );
       this.session.messages = this.agent.messages;
       this.agent.research = study;
+      this.agent.publishNow = wrapNow;
+      this.agent.wrappingUp = action === "wrapup";
       this.agent.tasks = this.session.tasks.map((t) => ({ ...t }));
       await saveSession(this.session);
       this.info(
@@ -3143,7 +3815,7 @@ export class KestUI {
         );
       this.composer.setText(
         action === "wrapup"
-          ? wrapupPrompt()
+          ? wrapupPrompt(wrapNow)
           : study.status === "ready"
             ? `Research objective: ${study.objective}\nUse the research company workflow. Save reproducible evidence in research/${study.id}/. Check research_status for the shared allowance. Reserve funding for independent review; call research_complete only with a reviewed report.`
             : `Resume research/${study.id}/ from the saved checkpoint. Objective: ${study.objective}\nUse research_status for spending. Read the saved report, worker findings and relevant evidence before choosing the next unresolved task. Do not repeat completed experiments or read the whole event journal for status. Keep the shared allowance and obtain independent review before research_complete.`,
@@ -3295,6 +3967,21 @@ export class KestUI {
         return;
       }
       await this.selectModel(value);
+      return;
+    }
+    if (command === "/tips") {
+      if (value === "on" || value === "off") {
+        await this.setTips(value === "on");
+        this.info(
+          value === "on"
+            ? "Tips are on."
+            : "Tips are hidden. /tips on brings them back.",
+        );
+      } else {
+        this.info(
+          `Tips are ${this.tipsEnabled ? "on" : "off"}. /tips on|off  (or click × on the tip row)`,
+        );
+      }
       return;
     }
     if (command === "/rooms") {
@@ -3645,10 +4332,12 @@ export class KestUI {
   close() {
     if (this.closed) return;
     this.closed = true;
+    this.inbox.closeAll();
     this.stopAllRooms();
     this.approval?.finish(false);
     this.secretValue = this.tokenId = "";
     this.stopLoading();
+    if (this.toastTimer) clearTimeout(this.toastTimer);
     for (const room of this.rooms.list()) void room.browser.close();
     this.renderer.destroy();
   }
@@ -3685,6 +4374,7 @@ export async function start(cwd: string, permission: Permission = "strict") {
     keychain,
     permission ?? "strict",
   );
+  await ui.restoreLastChat();
   await ui.showSavedResearchHint();
   const exit = () => ui.close();
   process.once("SIGTERM", exit);

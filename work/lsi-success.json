@@ -1,0 +1,20 @@
+[
+  {
+    "name": "old description",
+    "runs": 8,
+    "calls": 8,
+    "accepted": 8,
+    "preflight": 8,
+    "reasons": []
+  },
+  {
+    "name": "new description",
+    "runs": 8,
+    "calls": 8,
+    "accepted": 7,
+    "preflight": 7,
+    "reasons": [
+      "evidence.1.uri: Invalid URL"
+    ]
+  }
+]

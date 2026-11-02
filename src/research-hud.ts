@@ -50,6 +50,18 @@ export function budgetHud(
   const status = state.status === "ready" ? "prepared" : researchStatus(state);
   return `${status} · USD $${used.toFixed(4)}/$${state.maxCostUsd.toFixed(2)} · $${Math.max(0, state.maxCostUsd - used).toFixed(2)} left${level === "healthy" ? "" : ` · budget ${level}`}`;
 }
+/** Money to the cent, so a live counter visibly moves: $0.03, $1.24, $12.40. */
+export function money(usd: number): string {
+  return `$${usd.toFixed(2)}`;
+}
+/** Status plus pressure only; spend lives once, in the room chip. */
+export function compactHud(state: CompanyState): string {
+  if (state.maxCostUsd === null) return "budget not set · /research budget 10$";
+  const used = (state.spentCostMicros + state.estimatedCostMicros) / 1_000_000;
+  const level = budgetLevel(used, state.maxCostUsd);
+  const status = state.status === "ready" ? "prepared" : researchStatus(state);
+  return level === "healthy" ? status : `${status} · budget ${level}`;
+}
 export function shouldOpenBudgetDecision(state: CompanyState): boolean {
   return (
     state.maxCostUsd === null ||

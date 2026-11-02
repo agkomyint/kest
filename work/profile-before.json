@@ -1,0 +1,18 @@
+{
+  "startup: import UI (cold process)": 121,
+  "sessions: list 120 saved sessions": 21.29,
+  "sessions: save one 3 MB session": 4.52,
+  "sessions: startup scan (first call)": 23,
+  "context: estimateTokens (300 messages)": 0.17,
+  "context: report + plan compaction": 0.88,
+  "research: journal 200 concurrent events": 333,
+  "research: journal 100 sequential events": 177,
+  "research: open study (20k events, 40 workers)": 14.93,
+  "research: recover checkpoint": 0.18,
+  "prompt: chat system+tools (tokens est.)": 4061,
+  "prompt: research system (tokens est.)": 4159,
+  "ui: draw room list (12 rooms)": 0.07,
+  "ui: render 400-entry transcript": 21.78,
+  "ui: one frame with long transcript": 0.22,
+  "ui: keystroke (input change)": 17.38
+}

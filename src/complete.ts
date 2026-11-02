@@ -4,6 +4,7 @@ export const slashCommands = [
   "/model",
   "/context",
   "/research",
+  "/inbox",
   "/agents",
   "/usage",
   "/stats",
@@ -18,6 +19,7 @@ export const slashCommands = [
   "/status",
   "/chat",
   "/rooms",
+  "/tips",
   "/system",
   "/help",
   "/exit",
@@ -42,9 +44,11 @@ export const slashSubcommands: Record<string, string[]> = {
     "endpoint",
     "off",
   ],
+  "/inbox": ["read", "open", "dismiss", "answer", "send", "timeout"],
   "/context": ["summary", "messages", "archive", "show", "archived", "compact"],
   "/connect": ["modal", "baseten", "nebius", "tavily", "lsi"],
   "/permission": ["all", "minimal", "strict"],
+  "/tips": ["on", "off"],
   "/browser": ["open", "tabs", "close"],
   "/goal": ["clear"],
 };
@@ -118,6 +122,7 @@ export const slashDescriptions: Record<string, string> = {
   "/model": "choose a model",
   "/context": "inspect or compact conversation context",
   "/research": "budgeted research team",
+  "/inbox": "study notices and forms",
   "/agents": "show research workers",
   "/usage": "token usage and spend",
   "/stats": "tool and session statistics",
@@ -132,6 +137,7 @@ export const slashDescriptions: Record<string, string> = {
   "/status": "connection and model status",
   "/chat": "leave this study and return to chat",
   "/rooms": "switch between chat and studies",
+  "/tips": "show or hide the tip row",
   "/system": "show the system prompt",
   "/help": "commands and shortcuts",
   "/exit": "quit Kest",
@@ -139,11 +145,13 @@ export const slashDescriptions: Record<string, string> = {
 
 export const subDescriptions: Record<string, string> = {
   "/research start": "begin the prepared study",
+  "/research autopublish": "on | off · publish to LSI without per-step approval",
+  "/research startall": "start every prepared study with a budget, in the background",
   "/research show": "show the current study",
   "/research prepare": "draft a study from an objective",
   "/research resume": "continue a paused study",
-  "/research wrapup": "review, finish and publish now",
-  "/research budget": "set a total USD allowance",
+  "/research wrapup": "review, finish and publish (add `now` to skip review)",
+  "/research budget": "set | add | remove USD allowance",
   "/research open": "report, evidence, reviews or timeline",
   "/research publish": "publish a finished study to LSI in one step",
   "/research total": "one allowance across all studies",
@@ -167,7 +175,7 @@ export function describeCandidate(candidate: string): string {
 }
 
 const argHints: Record<string, string> = {
-  "/research budget": "<amount>$ · e.g. 10$",
+  "/research budget": "set 10$ · add 5$ · remove 5$",
   "/research prepare": "<objective> · what to study",
   "/research model": "<model id>",
   "/research endpoint": "<url>",

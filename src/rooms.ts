@@ -3,6 +3,7 @@ import type { Approval } from "./tools";
 import type { Session } from "./sessions";
 import type { BrowserSession } from "./browser";
 import type { CompanyState } from "./research-company";
+import { money } from "./research-hud";
 
 export type RoomKind = "chat" | "study";
 export type RoomStatus =
@@ -235,7 +236,7 @@ export function companyBar(manager: RoomManager, width: number): string {
     const study = room.study;
     const spend =
       study && study.maxCostUsd !== null
-        ? ` $${studySpentUsd(study).toFixed(1)}/${study.maxCostUsd}`
+        ? ` ${money(studySpentUsd(study))}/${study.maxCostUsd}`
         : "";
     const flag = room.status === "needs-you" ? " needs you" : "";
     const label = `${statusSymbol(room.status)} ${room.title}${spend}${flag}`;
@@ -243,4 +244,142 @@ export function companyBar(manager: RoomManager, width: number): string {
   });
   const line = parts.join("│");
   return line.length > width ? `${line.slice(0, Math.max(0, width - 1))}…` : line;
+}
+
+const rank: Record<RoomStatus, number> = {
+  chat: 0,
+  "needs-you": 1,
+  budget: 2,
+  running: 3,
+  paused: 4,
+  ready: 5,
+  done: 6,
+};
+/** Rooms in display order: chat first, then what needs you most, down to finished studies. */
+export function roomOrder(manager: RoomManager): Room[] {
+  return manager
+    .list()
+    .map((room, index) => ({ room, index }))
+    .sort((a, b) => rank[a.room.status] - rank[b.room.status] || a.index - b.index)
+    .map((entry) => entry.room);
+}
+
+const clip = (text: string, width: number) =>
+  text.length <= width ? text.padEnd(width) : `${text.slice(0, Math.max(0, width - 1))}…`;
+
+const stateSymbols: [RoomStatus, string][] = [
+  ["needs-you", "▲"],
+  ["budget", "$"],
+  ["running", "●"],
+  ["paused", "⏸"],
+  ["ready", "○"],
+  ["done", "✓"],
+];
+const clock = (ms: number) => {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  return seconds >= 3600
+    ? `${Math.floor(seconds / 3600)}h${String(Math.floor((seconds % 3600) / 60)).padStart(2, "0")}`
+    : `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, "0")}`;
+};
+const meter = (spent: number, budget: number, cells = 5) => {
+  const filled = Math.min(cells, Math.max(0, Math.round((spent / budget) * cells)));
+  return "█".repeat(filled) + "░".repeat(cells - filled);
+};
+const fullTitle = (room: Room) =>
+  room.kind === "chat" ? "chat" : (room.study?.objective ?? room.session.title).replace(/\s+/g, " ");
+
+/**
+ * The room list drawn under the prompt: a header with live counts and total spend, then one
+ * row per room, most urgent first (needs you, out of budget, running, paused, ready, done).
+ * Finished and idle rows fold into one summary line when space is short; a window around the
+ * focused room is the last resort. `targets[i]` is the room a click on line i opens.
+ */
+export function roomList(
+  manager: RoomManager,
+  width: number,
+  maxRows = 5,
+  now = performance.now(),
+  note = "",
+): { lines: string[]; targets: (Room | null)[] } {
+  const ordered = roomOrder(manager);
+  if (ordered.length < 2) return { lines: [], targets: [] };
+  const studies = ordered.filter((room) => room.kind === "study");
+  const count = (status: RoomStatus) => studies.filter((room) => room.status === status).length;
+  const counts = stateSymbols.filter(([status]) => count(status)).map(([status, symbol]) => `${symbol}${count(status)}`);
+  const spent = manager.totalSpentUsd();
+  const cap = manager.limits.totalUsd;
+  const header = `${counts.join(" ")}${note ? ` · ${note}` : ""} · ${studies.length} stud${studies.length === 1 ? "y" : "ies"} · ${money(spent)}${cap !== null ? `/${cap}` : ""}`;
+  const hint = "Alt+↑↓ rooms · ^K list";
+  const headerLine = width >= header.length + hint.length + 6 ? `  ${header}${" ".repeat(width - header.length - hint.length - 2)}${hint}` : `  ${header}`;
+  const lines: string[] = [clip(headerLine, width).trimEnd()];
+  const targets: (Room | null)[] = [null];
+  if (studies.every((room) => room.status === "done")) return { lines, targets };
+
+  const rows = Math.max(1, maxRows - 1);
+  let shown = ordered;
+  let tail: Room[] = [];
+  if (shown.length > rows) {
+    // Fold idle and finished studies (never the focused room) into one summary line.
+    const foldable = (room: Room) => (room.status === "ready" || room.status === "done") && room !== manager.focused;
+    tail = shown.filter(foldable);
+    if (tail.length) shown = shown.filter((room) => !foldable(room));
+  }
+  let summaryRows = tail.length ? 1 : 0;
+  let more = 0;
+  if (shown.length > rows - summaryRows) {
+    // Still too many: drop the summary and window over everything instead.
+    if (tail.length) {
+      shown = ordered;
+      tail = [];
+      summaryRows = 0;
+    }
+  }
+  if (shown.length > rows - summaryRows) {
+    const size = Math.max(1, rows - summaryRows - 1);
+    const focusedAt = Math.max(0, shown.indexOf(manager.focused as Room));
+    const start = Math.min(Math.max(0, focusedAt - Math.floor(size / 2)), shown.length - size);
+    more = shown.length - size;
+    shown = shown.slice(start, start + size);
+  }
+  for (const room of shown) {
+    const study = room.study;
+    const spentUsd = studySpentUsd(study);
+    const budget = study && study.maxCostUsd !== null ? study.maxCostUsd : null;
+    const money_ = budget !== null ? `${money(spentUsd)}/${budget}` : "";
+    const status = room.status === "needs-you" ? "needs you" : room.status === "budget" ? "out of budget" : room.status;
+    const marker = room === manager.focused ? "▸" : " ";
+    const live = room.status === "running" && room.startedAt ? ` ${clock(now - room.startedAt)}` : "";
+    const bar = budget !== null && width >= 70 && room.kind === "study" ? `${meter(spentUsd, budget)} ` : "";
+    const tailText =
+      room.kind === "chat"
+        ? ""
+        : width >= 52
+          ? `  ${status}${live}  ${bar}${money_}`.trimEnd()
+          : money_
+            ? ` ${money_}`
+            : "";
+    const titleWidth = Math.max(8, width - 6 - tailText.length);
+    const ask =
+      room.status === "needs-you" && room !== manager.focused
+        ? room.pending[0]?.request.title
+          ? ` · wants approval: ${room.pending[0].request.title}`
+          : room.question
+            ? ` · says: ${room.question.replace(/\s+/g, " ")}`
+            : ""
+        : "";
+    lines.push(`${marker} ${statusSymbol(room.status)} ${clip(`${fullTitle(room)}${ask}`, titleWidth)}${tailText}`.trimEnd());
+    targets.push(room);
+  }
+  if (tail.length) {
+    const ready = tail.filter((room) => room.status === "ready").length;
+    const done = tail.length - ready;
+    const bits = [ready ? `○ ${ready} ready` : "", done ? `✓ ${done} done` : ""].filter(Boolean).join("  ·  ");
+    lines.push(clip(`  ${bits}  ·  ^K all`, width).trimEnd());
+    targets.push(null);
+  }
+  if (more) {
+    lines.push(`  … +${more} more · ^K`);
+    targets.push(null);
+  }
+  return { lines, targets };
 }

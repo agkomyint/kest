@@ -114,7 +114,7 @@ test("tool definitions expose planning and spawning only to the parent", () => {
   const childNames = parent
     .toolDefs()
     .map((t) => (t.type === "function" ? t.function.name : t.type));
-  expect(childNames).toEqual(["list_files", "read_file", "search"]);
+  expect(childNames).toEqual(["list_files", "read_file", "search", "kest_guide"]);
 });
 
 test("executeSpawn delegates to runChild and clips long findings", async () => {

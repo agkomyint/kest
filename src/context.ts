@@ -50,14 +50,14 @@ export function normalizeContext(value?: ContextState): ContextState {
   };
 }
 // A configurable local operating budget, NOT a claim about the model's actual window.
-// 20k default (trigger ~13.5k input/request): the full history is resent on
+// 42k default (trigger ~32k input/request): the full history is resent on
 // every call, so a 40k budget meant cruising at 20-30k input per request and
 // burning millions of tokens in ~100 requests. KEST_CONTEXT_BUDGET overrides.
 export function contextBudget() {
   const value = Number(process.env.KEST_CONTEXT_BUDGET);
   return Number.isSafeInteger(value) && value >= 12000 && value <= 200000
     ? value
-    : 20000;
+    : 42000;
 }
 export function estimateTokens(value: unknown): number {
   return Math.ceil(Buffer.byteLength(JSON.stringify(value) ?? "", "utf8") / 4);
@@ -239,4 +239,58 @@ export function describeMessages(messages: Message[]): string {
           .slice(0, 180)}`,
     )
     .join("\n");
+}
+
+/**
+ * Last resort when summarizing cannot make the request fit (huge tool result,
+ * many small messages with a large fixed prompt, no safe cut point). Shrinks
+ * the largest messages to excerpts, then drops the oldest complete steps into
+ * the archive. The latest user request is always kept. Never throws; returns
+ * whether the request now fits.
+ */
+export function shrinkToBudget(
+  messages: Message[],
+  tools: unknown,
+  state: ContextState,
+): boolean {
+  const fits = () => {
+    const r = contextReport(messages, tools, state);
+    return r.input + OUTPUT_RESERVE <= r.budget;
+  };
+  for (const floor of [1500, 600, 250]) {
+    for (let pass = 0; pass < 60 && !fits(); pass++) {
+      let target = -1;
+      let size = floor;
+      messages.forEach((m, i) => {
+        if (pinned(m) || isMemory(m) || typeof m.content !== "string") return;
+        if (m.content.length > size) {
+          size = m.content.length;
+          target = i;
+        }
+      });
+      if (target < 0) break;
+      const message = messages[target]!;
+      const original = message.content as string;
+      if (!original.includes("[Observation excerpt")) state.archive.push({ ...message } as Message);
+      messages[target] = {
+        ...message,
+        content: observationExcerpt(
+          original,
+          Math.max(floor, Math.floor(original.length / 2)),
+          "archived locally, see /context archive",
+        ),
+      } as Message;
+    }
+  }
+  // Still too big: archive the oldest complete steps (never the latest user turn).
+  while (!fits()) {
+    const body = messages.filter((m) => !pinned(m));
+    const offset = messages.length - body.length;
+    const lastUser = body.findLastIndex((m) => m.role === "user");
+    const cut = safeCuts(body).find((c) => c > 0 && c <= lastUser);
+    if (!cut) break;
+    const dropped = messages.splice(offset, cut).filter((m) => !isMemory(m));
+    state.archive.push(...dropped);
+  }
+  return fits();
 }

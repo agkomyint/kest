@@ -67,3 +67,9 @@ test("descriptions, argument hints and typo suggestions", async () => {
   expect(c.suggestCommand("/permision")).toBe("/permission");
   expect(c.suggestCommand("/zzzzzzzz")).toBeNull();
 });
+
+test("budget hint advertises set, add and remove", async () => {
+  const c = await import("./complete");
+  expect(c.argumentHint("/research budget")).toContain("add 5$");
+  expect(c.argumentHint("/research budget")).toContain("remove 5$");
+});

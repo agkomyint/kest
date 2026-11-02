@@ -13,6 +13,32 @@ import type { Approve, Approval } from "./tools";
 import companyInstructions from "../prompts/research-company.md" with { type: "text" };
 export const researchCompanyPrompt = `<kest-research-company>\n${companyInstructions}\n</kest-research-company>`;
 
+const promptSections = new Map<string, string>();
+for (const part of companyInstructions.split(/^## /m).slice(1)) {
+  const [title = "", ...body] = part.split("\n");
+  promptSections.set(title.trim(), `## ${title.trim()}\n${body.join("\n").trim()}`);
+}
+const childSections: Record<string, string[]> = {
+  lead: ["WORKERS", "RESEARCH LEADS", "EVIDENCE"],
+  researcher: ["WORKERS", "EVIDENCE"],
+  reviewer: ["WORKERS", "EVIDENCE", "REVIEW BOARD"],
+};
+/**
+ * Instructions for one research role. The director gets everything; delegates
+ * get only what they can act on (no budget, completion or delegation rules
+ * they have no tools for), which is shorter on every request they make.
+ */
+export function researchPromptFor(role: string, canSpawn = false): string {
+  const sections = childSections[role];
+  if (role === "director" || !sections) return researchCompanyPrompt;
+  const parts = sections
+    .filter((name) => canSpawn || name !== "RESEARCH LEADS")
+    .map((name) => promptSections.get(name))
+    .filter(Boolean);
+  const intro = `You are a ${role} in Kest Research, working for the director. The director owns the shared USD allowance, experiments, file edits and the final report; you investigate and return evidence. Never fabricate numbers, sources or citations. research_status shows remaining money; spend sparingly.`;
+  return `<kest-research-company>\n${intro}\n\n${parts.join("\n\n")}\n</kest-research-company>`;
+}
+
 export type CompanyState = {
   version: 1;
   id: string;
@@ -37,6 +63,12 @@ export type CompanyState = {
   untrackedCostRequests: number;
   costRates: Record<string, { input: number; output: number }>;
   fundingProposal?: string;
+  /** Strict budget: the director never proposes extra funding and must conclude with the allowance it has. */
+  strictBudget?: boolean;
+  /** The user said "research this and publish it": LSI claim/post/publish actions need no per-call approval for this study. */
+  autoPublish?: boolean;
+  /** Strict studies get one automatic conclude-and-publish turn when the allowance runs out. */
+  strictWrapUp?: boolean;
   finalReportPath?: string;
   inputTokens: number;
   outputTokens: number;
@@ -55,7 +87,7 @@ export function newCompany(objective: string): CompanyState {
     maxRequests: Number.MAX_SAFE_INTEGER,
     maxAgents: Number.MAX_SAFE_INTEGER,
     maxDepth: 3,
-    parallel: 3,
+    parallel: 5,
     maxMs: 30 * 60_000,
     elapsedMs: 0,
     status: "ready",
@@ -90,6 +122,10 @@ export function parseCostBudget(value: string): number {
 }
 export const costKey = (provider: string, model: string) =>
   JSON.stringify([provider, model]);
+export function proposedFunding(current: number) {
+  const additional = Math.max(1, Math.round(current * 0.5 * 100) / 100);
+  return { additional, total: Math.round((current + additional) * 100) / 100 };
+}
 export const formatUsd = (micros: number) =>
   `$${(micros / 1_000_000).toFixed(4)}`;
 
@@ -153,7 +189,7 @@ export function validateCompany(state: CompanyState): CompanyState {
     !integer(state.maxAgents, 1, Number.MAX_SAFE_INTEGER) ||
     !integer(state.agents, 0, Number.MAX_SAFE_INTEGER) ||
     !integer(state.maxDepth, 1, 3) ||
-    !integer(state.parallel, 1, 3) ||
+    !integer(state.parallel, 1, 6) ||
     !integer(state.maxMs, 1000, 86400000) ||
     !Number.isFinite(state.elapsedMs) ||
     state.elapsedMs < 0 ||
@@ -309,29 +345,42 @@ export class CompanyRuntime {
       release();
     }
   }
+  // Group commit: concurrent records share one append and one checkpoint
+  // write. Every caller still resolves only after a write that contains its
+  // event and a state snapshot taken at or after its call.
+  private pending: string[] = [];
   async record(kind: string, data: unknown) {
     if (!this.directory) return;
     const directory = this.directory;
-    const entry =
-      JSON.stringify({ at: new Date().toISOString(), kind, data }) + "\n";
-    const snapshot =
-      JSON.stringify(
-        {
-          ...this.state,
-          elapsedMs: this.state.elapsedMs + performance.now() - this.started,
-        },
-        null,
-        2,
-      ) + "\n";
+    this.pending.push(
+      JSON.stringify({ at: new Date().toISOString(), kind, data }) + "\n",
+    );
     const write = this.tail.then(async () => {
-      await mkdir(directory, { recursive: true });
-      await appendFile(join(directory, "events.jsonl"), entry);
-      const temporary = join(directory, `state.${crypto.randomUUID()}.tmp`);
+      const entries = this.pending.splice(0);
+      if (!entries.length) return;
       try {
-        await writeFile(temporary, snapshot);
-        await replaceCheckpoint(temporary, join(directory, "state.json"));
-      } finally {
-        await rm(temporary, { force: true });
+        const snapshot =
+          JSON.stringify(
+            {
+              ...this.state,
+              elapsedMs: this.state.elapsedMs + performance.now() - this.started,
+            },
+            null,
+            2,
+          ) + "\n";
+        await mkdir(directory, { recursive: true });
+        await appendFile(join(directory, "events.jsonl"), entries.join(""));
+        const temporary = join(directory, `state.${crypto.randomUUID()}.tmp`);
+        try {
+          await writeFile(temporary, snapshot);
+          await replaceCheckpoint(temporary, join(directory, "state.json"));
+        } finally {
+          await rm(temporary, { force: true });
+        }
+      } catch (error) {
+        // Keep the events for the next write instead of losing them.
+        this.pending.unshift(...entries);
+        throw error;
       }
     });
     // Report this failure to its caller, but allow later writes/checkpoints to
@@ -457,12 +506,25 @@ export class CompanyRuntime {
       }
     };
   }
+  /** Same formula everywhere so the UI can offer exactly what the proposal says. */
+  proposedFunding() {
+    return proposedFunding(this.state.maxCostUsd ?? 0);
+  }
   async saveFundingProposal(reason: string): Promise<string> {
     this.state.status = "budget_exhausted";
-    const current = this.state.maxCostUsd ?? 0;
-    const additional = Math.max(1, Math.round(current * 0.5 * 100) / 100);
-    const proposed = Math.round((current + additional) * 100) / 100;
-    const text = `# Research funding proposal\n\nObjective: ${this.state.objective}\n\nStatus: incomplete. ${reason}\n\nRecorded cost: ${formatUsd(this.state.spentCostMicros)} USD; estimated/in-flight: ${formatUsd(this.state.estimatedCostMicros)}.\nEvidence: research/${this.state.id}/events.jsonl, state.json and agents/. Inspect saved experiment artifacts before accepting any findings.\n\nRequested additional allowance: $${additional.toFixed(2)} USD (proposed total $${proposed.toFixed(2)}). This is a provisional continuation allowance, not a prediction of completion.\n\nNext work: inspect the latest checkpoint and reviewer findings, identify unresolved evidence, estimate the required model calls, run justified follow-up experiments and obtain final independent review. The director should refine these tasks and their costs in funding-proposal.md while budget remains.\n\nWould you like to increase the allowance? Set /research budget ${proposed.toFixed(2)}$ then /research resume. No additional credit has been authorized.\n`;
+    if (this.state.strictBudget) {
+      const spentStrict = formatUsd(this.state.spentCostMicros + this.state.estimatedCostMicros);
+      const note = `Strict budget: ${spentStrict} of $${(this.state.maxCostUsd ?? 0).toFixed(2)} used. No extra funding is requested; the study concludes with what it has.`;
+      this.state.fundingProposal = undefined;
+      await this.record("strict_budget_reached", { reason });
+      return note;
+    }
+    const { additional, total: proposed } = this.proposedFunding();
+    const spent = formatUsd(this.state.spentCostMicros + this.state.estimatedCostMicros);
+    const text = `Budget reached: ${spent} of $${(this.state.maxCostUsd ?? 0).toFixed(2)} used. Study incomplete (${reason.replace(/\s+/g, " ").slice(0, 120)}).
+Add $${additional.toFixed(2)} (new total $${proposed.toFixed(2)}) and continue?  yes / no
+No = wrap up and publish what exists to LSI.
+`;
     // Keep a detailed director-authored proposal if it already exists.
     if (this.directory) {
       await mkdir(this.directory, { recursive: true });
@@ -518,7 +580,7 @@ export function researchNextAction(state: CompanyState): string {
     state.spentCostMicros + state.estimatedCostMicros >=
       Math.round(state.maxCostUsd * 1_000_000)
   )
-    return "/research budget <higher total USD>, then /research resume";
+    return "answer yes (add funds, continue) or no (wrap up and publish to LSI)";
   if (state.status === "running")
     return "Esc to pause · /agents to inspect workers";
   return state.status === "ready" ? "/research start" : "/research resume";

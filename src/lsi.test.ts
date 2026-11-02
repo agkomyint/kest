@@ -1,8 +1,9 @@
+import { URS_EXAMPLE } from "./urs-check";
 import { beforeEach, afterEach, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LsiTools, lsiKey, lsiBaseUrl, saveLsiKey, lsiRequest, lsiToolDefinitions, lsiReadToolDefinitions } from "./lsi";
+import { LsiTools, lsiKey, lsiBaseUrl, saveLsiKey, lsiRequest, lsiToolDefinitions, lsiReadToolDefinitions, lsiChatToolDefinitions } from "./lsi";
 import { autoApprove } from "./permissions";
 
 const KEY = "lsi_" + "a".repeat(32);
@@ -61,7 +62,7 @@ test("read tools exclude writers; publish needs approval and is idempotent", asy
   const readNames = lsiReadToolDefinitions.map(t => (t.type === "function" ? t.function.name : ""));
   expect(readNames).not.toContain("lsi_publish");
   expect(readNames).not.toContain("lsi_claim");
-  expect(lsiToolDefinitions.length).toBe(9);
+  expect(lsiToolDefinitions.length).toBe(13);
 
   const seen: { url: string; init: RequestInit }[] = [];
   const approvals: string[] = [];
@@ -72,11 +73,12 @@ test("read tools exclude writers; publish needs approval and is idempotent", asy
       fetch: async (url, init) => { seen.push({ url, init }); return reply({ id: "LSI-R-000001" }, 201); },
     });
 
-  expect(await tools(false).execute("lsi_publish", { research: { title: "t" } }, signal())).toContain("Denied");
+  const linked = { ...URS_EXAMPLE, answers_question: "LSI-Q-000001" };
+  expect(await tools(false).execute("lsi_publish", { research: linked }, signal())).toContain("Denied");
   expect(seen).toHaveLength(0);
 
-  const out = await tools(true).execute("lsi_publish", { research: { title: "t" } }, signal());
-  await tools(true).execute("lsi_publish", { research: { title: "t" } }, signal());
+  const out = await tools(true).execute("lsi_publish", { research: linked }, signal());
+  await tools(true).execute("lsi_publish", { research: linked }, signal());
   expect(out).toContain("untrusted");
   expect(approvals[1]).toBe("lsi:Publish research to LSI");
   const headers = seen[0]!.init.headers as Record<string, string>;
@@ -118,6 +120,8 @@ test("LSI write tools exist only inside a /research run; chat and workers only r
   expect(names()).toContain("lsi_search");
   expect(names()).not.toContain("lsi_publish");
   expect(names()).not.toContain("lsi_claim");
+  expect(names()).toContain("lsi_suggest");
+  expect(names()).toContain("lsi_post_question");
   agent.research = newCompany("test objective");
   expect(names()).toContain("lsi_claim");
   expect(names()).not.toContain("lsi_publish"); // not until the study is completed
@@ -140,4 +144,68 @@ test("stops retrying a tool after three consecutive failures", async () => {
   for (let i = 0; i < 3; i++) await expect(tools.execute("lsi_post_question", args, new AbortController().signal)).rejects.toThrow("lsi_domains");
   await expect(tools.execute("lsi_post_question", args, new AbortController().signal)).rejects.toThrow("Stop retrying");
   expect(calls).toBe(3);
+});
+
+test("publishing links the record to the question this study claimed", async () => {
+  const sent: Record<string, unknown>[] = [];
+  const tools = new LsiTools(async () => true, {
+    key: () => KEY, baseUrl: () => "https://lsi.test",
+    fetch: async (_url, init) => { if (init.body) sent.push(JSON.parse(String(init.body))); return reply({ id: "LSI-R-000001" }, 201); },
+  });
+  const { answers_question: _omit, ...unlinked } = URS_EXAMPLE;
+  await tools.execute("lsi_claim", { question_id: "LSI-Q-000007" }, signal());
+  await tools.execute("lsi_publish", { research: unlinked }, signal());
+  expect(sent.at(-1)!.answers_question).toBe("LSI-Q-000007"); // filled in automatically
+  await tools.execute("lsi_release", { question_id: "LSI-Q-000007" }, signal());
+});
+
+test("a record with no question is always refused, however many times it is retried", async () => {
+  let posts = 0;
+  const tools = new LsiTools(async () => true, {
+    key: () => KEY, baseUrl: () => "https://lsi.test",
+    fetch: async () => { posts++; return reply({ id: "LSI-R-000002" }, 201); },
+  });
+  const { answers_question: _omit, ...unlinked } = URS_EXAMPLE;
+  await expect(tools.execute("lsi_publish", { research: unlinked }, signal())).rejects.toThrow("cannot be published without");
+  await expect(tools.execute("lsi_publish", { research: unlinked }, signal())).rejects.toThrow("cannot be published without");
+  expect(posts).toBe(0);
+});
+
+test("a follow-up question carries the research it came from", () => {
+  const request = lsiRequest("lsi_post_question", { text: "Does X still hold at larger scale?", domain: "computer_science", research_ids: ["LSI-R-000003"] });
+  expect(request.body).toMatchObject({ basis: { gap: "open_question", research_ids: ["LSI-R-000003"] } });
+  expect(lsiRequest("lsi_post_question", { text: "Does X still hold at larger scale?", domain: "computer_science" }).body).not.toHaveProperty("basis");
+  expect(() => lsiRequest("lsi_post_question", { text: "Does X still hold at larger scale?", domain: "computer_science", research_ids: ["../x"] })).toThrow("research ids");
+});
+
+test("hashEvidence fills sha256, corrects a wrong one without blocking, and leaves sources and bad links alone", async () => {
+  const { hashEvidence } = await import("./lsi");
+  const body = "hello evidence";
+  const sha = new Bun.CryptoHasher("sha256").update(body).digest("hex");
+  const doFetch = async (url: string) => (url.includes("missing") ? new Response("no", { status: 404 }) : new Response(body));
+  const mk = (evidence: unknown[]) => ({ research: { title: "t", evidence } });
+  const signal = new AbortController().signal;
+  const out = (await hashEvidence(mk([
+    { type: "artifact", description: "d", uri: "https://example.com/a.csv" },
+    { type: "source", description: "d", uri: "https://example.com/page" },
+    { type: "artifact", description: "d", uri: "https://example.com/missing" },
+    { type: "benchmark", description: "d", text: "inline" },
+  ]), doFetch, signal)) as { research: { evidence: Record<string, unknown>[] } };
+  expect(out.research.evidence[0]!.sha256).toBe(sha);
+  expect(out.research.evidence[0]!.size_bytes).toBe(body.length);
+  expect(out.research.evidence[1]!.sha256).toBeUndefined();
+  expect(out.research.evidence[2]!.sha256).toBeUndefined();
+  expect(out.research.evidence[3]!.sha256).toBeUndefined();
+  const fixed = (await hashEvidence(mk([{ type: "artifact", description: "d", uri: "https://example.com/a.csv", sha256: "0".repeat(64) }]), doFetch, signal)) as { research: { evidence: Record<string, unknown>[] } };
+  expect(fixed.research.evidence[0]!.sha256).toBe(sha);
+});
+
+test("lsi_stats is a read; lsi_set_published is an approval-gated PATCH available in chat", () => {
+  expect(lsiRequest("lsi_stats", {})).toMatchObject({ path: "/api/stats", method: "GET" });
+  expect(lsiRequest("lsi_set_published", { id: "LSI-R-000001", published: false })).toMatchObject({ path: "/api/account/research/LSI-R-000001", method: "PATCH", body: { published: false } });
+  const chat = lsiChatToolDefinitions.map(t => (t.type === "function" ? t.function.name : ""));
+  expect(chat).toContain("lsi_stats");
+  expect(chat).toContain("lsi_set_published");
+  expect(chat).not.toContain("lsi_publish");
+  expect(lsiReadToolDefinitions.map(t => (t.type === "function" ? t.function.name : ""))).not.toContain("lsi_set_published");
 });

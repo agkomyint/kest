@@ -1,3 +1,4 @@
+#!/usr/bin/env bun
 import { loadStore, savePermission } from "./config";
 export {};
 import { autoApprove, parsePermission } from "./permissions";

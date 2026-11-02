@@ -1,3 +1,5 @@
+// Fixtures below are sized for a 20k budget; the product default is covered separately.
+process.env.KEST_CONTEXT_BUDGET = "20000";
 import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -195,7 +197,9 @@ test("agent summary receives plan and memory; API failures and cancellation pres
       true,
     ),
   ).toBe(true);
-  expect(agent.context.summary).toBe(summary);
+  expect(agent.context.summary).toStartWith(summary);
+  expect(agent.context.summary).toContain("Current plan (authoritative");
+  expect(agent.context.summary).toContain("Verify persistence");
 });
 
 test("automatic compaction triggers from the configured budget, including tool definitions", () => {
@@ -213,7 +217,7 @@ test("automatic compaction triggers from the configured budget, including tool d
     expect(report.tools).toBeGreaterThan(100);
     expect(report.budget).toBe(12000);
     process.env.KEST_CONTEXT_BUDGET = "invalid";
-    expect(contextReport(messages, [], state).budget).toBe(20000);
+    expect(contextReport(messages, [], state).budget).toBe(42000);
   } finally {
     if (previous === undefined) delete process.env.KEST_CONTEXT_BUDGET;
     else process.env.KEST_CONTEXT_BUDGET = previous;
@@ -430,4 +434,39 @@ test("summary and archive persist through saving/resuming sessions", async () =>
     else process.env.KEST_CONFIG_DIR = previous;
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("shrinkToBudget cuts oversized messages when summarizing cannot help", async () => {
+  const { shrinkToBudget, contextReport, OUTPUT_RESERVE } = await import("./context");
+  const state = { summary: "", archive: [], compactions: 0, lastCompactedAt: null, lastPromptTokens: null } as any;
+  const messages: any[] = [
+    { role: "system", content: "rules" },
+    { role: "user", content: "x".repeat(200_000) },
+  ];
+  expect(shrinkToBudget(messages, [], state)).toBe(true);
+  const r = contextReport(messages, [], state);
+  expect(r.input + OUTPUT_RESERVE).toBeLessThanOrEqual(r.budget);
+  expect(state.archive).toHaveLength(1);
+  expect(messages[1].content).toContain("Observation excerpt");
+});
+
+test("shrinkToBudget drops oldest complete steps when many small messages overflow", async () => {
+  const { shrinkToBudget, contextReport, OUTPUT_RESERVE } = await import("./context");
+  const state = { summary: "", archive: [], compactions: 0, lastCompactedAt: null, lastPromptTokens: null } as any;
+  const messages: any[] = [{ role: "system", content: "s".repeat(40_000) }];
+  for (let i = 0; i < 40; i++) messages.push({ role: "user", content: `turn ${i} ` + "y".repeat(900) }, { role: "assistant", content: "ok ".repeat(300) });
+  messages.push({ role: "user", content: "latest request" });
+  expect(shrinkToBudget(messages, [], state)).toBe(true);
+  const r = contextReport(messages, [], state);
+  expect(r.input + OUTPUT_RESERVE).toBeLessThanOrEqual(r.budget);
+  expect(messages.at(-1).content).toBe("latest request");
+  expect(state.archive.length).toBeGreaterThan(0);
+});
+
+test("default context budget is 42k", async () => {
+  const { contextBudget } = await import("./context");
+  const previous = process.env.KEST_CONTEXT_BUDGET;
+  delete process.env.KEST_CONTEXT_BUDGET;
+  try { expect(contextBudget()).toBe(42000); }
+  finally { process.env.KEST_CONTEXT_BUDGET = previous; }
 });
