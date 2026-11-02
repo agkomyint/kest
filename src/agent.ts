@@ -4,6 +4,9 @@ import { tavilyKey, tavilyToolDefinitions } from "./tavily";
 import { lsiKey, lsiToolDefinitions, lsiReadToolDefinitions, lsiChatToolDefinitions } from "./lsi";
 import { bunContext } from "./bun-context";
 import { kestGuideToolDefinition, kestGuideHint } from "./kest-guide";
+import { estimateCall, inputRate } from "./cost";
+import { defaultToolMs, isParallelTool, toolNames, toolSpec, type Tier } from "./registry";
+import { machineAdvice, machineCheckTool } from "./machine";
 import OpenAI from "openai";
 import { endpointFor, type Credentials } from "./config";
 import { WorkspaceTools, toolDefinitions, type Approve } from "./tools";
@@ -64,31 +67,7 @@ async function abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
     if (signal.aborted) abort();
   });
 }
-// Fallback expected durations when this agent has not observed a tool yet.
-// Observed durations replace these defaults, so estimates track this machine.
-const TOOL_TIME_DEFAULTS: Record<string, number> = {
-  list_files: 500,
-  read_file: 500,
-  search: 1_000,
-  list_models: 500,
-  research_status: 500,
-  kest_guide: 100,
-  research_prepare: 2000,
-  research_start_all: 2000,
-  research_list: 1000,
-  research_delete: 2000,
-  notify_control: 200,
-  ask_control: 180000,
-  inbox_draft: 300,
-  inbox_send: 2000,
-  edit_file: 2_000,
-  write_file: 2_000,
-  browser: 5_000,
-  shell: 15_000,
-  spawn_subagent: 60_000,
-  research_team: 60_000,
-  research_review: 60_000,
-};
+// Fallback expected durations come from the tool registry; observed durations replace them.
 export const LONG_TOOL_MS = 5_000;
 // Read-only calls with no shared mutable state: safe to overlap in one reply.
 export const researchPrepareToolDefinition: OpenAI.ChatCompletionTool = {
@@ -174,7 +153,7 @@ export const askControlToolDefinition: OpenAI.ChatCompletionTool = {
   function: {
     name: "ask_control",
     description:
-      "Ask the user's control chat a short form (1-5 fields) when a research direction really needs their input, and wait for the answer. The user may take a few minutes; if there is no answer in about 3 minutes you are told to decide yourself and continue, so always include a sensible default. Never use it for budget, funding, spending or publishing: those are decided by the user in the study room. Ask once with all your questions together.",
+      "Ask the user's control chat a short form (1-5 fields) when a research direction really needs their input, and wait for the answer. The user may take a few minutes; if there is no answer in about 3 minutes you are told to decide yourself and continue, so always include a sensible default. A question about budget, funding, spending or publishing is allowed, but it is the user's decision alone: it has no defaults, if unanswered it counts as NOT approved, and it never changes the allowance by itself (the user sets that with /research budget). Ask once with all your questions together.",
     parameters: {
       type: "object",
       properties: {
@@ -237,14 +216,42 @@ export const inboxSendToolDefinition: OpenAI.ChatCompletionTool = {
   },
 };
 
-export const PARALLEL_TOOLS = new Set([
-  "list_files",
-  "read_file",
-  "search",
-  "list_models",
-  "research_status",
-  "kest_guide",
-]);
+const SEARCH_HOSTS = /(^|\.)(google|bing|duckduckgo|yahoo|baidu|brave|ecosia|startpage|kagi|yandex)\.[a-z.]+$|^search\./i;
+/** Search-engine result pages: the browser must not be used to search when Tavily is available. */
+export function searchEngineUrl(args: Record<string, unknown>) {
+  const items = Array.isArray(args.steps) ? (args.steps as Record<string, unknown>[]) : [];
+  return [args, ...items].some((a) => {
+    if (typeof a?.url !== "string") return false;
+    try {
+      return SEARCH_HOSTS.test(new URL(a.url).hostname);
+    } catch {
+      return false;
+    }
+  });
+}
+
+export const machineCheckToolDefinition: OpenAI.ChatCompletionTool = {
+  type: "function",
+  function: {
+    name: "machine_check",
+    description:
+      "Check if THIS computer can run/train/download something (model size, dataset). Returns OK/TIGHT/IMPOSSIBLE plus alternatives (smaller scope, API, cloud). Never attempt IMPOSSIBLE; tell the user and offer the alternatives.",
+    parameters: {
+      type: "object",
+      properties: {
+        task: { type: "string", enum: ["inference", "finetune_lora", "train_full", "download", "dataset"] },
+        params_b: { type: "number", description: "Model size in billions of parameters (1T = 1000)." },
+        quant: { type: "string", description: "fp32, fp16, int8 or int4 (default fp16)." },
+        download_gb: { type: "number" },
+        dataset_gb: { type: "number" },
+      },
+      required: ["task"],
+      additionalProperties: false,
+    },
+  },
+};
+
+export const PARALLEL_TOOLS = new Set(toolNames().filter(isParallelTool));
 
 export function estimateToolMs(name: string, observed: number[]): number {
   const samples = observed.filter((ms) => Number.isFinite(ms) && ms >= 0);
@@ -252,7 +259,7 @@ export function estimateToolMs(name: string, observed: number[]): number {
     const sorted = [...samples].sort((a, b) => a - b);
     return Math.round(sorted[Math.floor(sorted.length / 2)]!);
   }
-  return TOOL_TIME_DEFAULTS[name] ?? 1_000;
+  return defaultToolMs(name);
 }
 
 export type AgentEvent =
@@ -293,6 +300,11 @@ export type AgentEvent =
       output?: string;
       durationMs?: number;
       estimatedMs?: number;
+      /** Who made the call, and how much text came back (a proxy for context added). */
+      tier?: Tier;
+      chars?: number;
+      /** Estimated cost of the call (context carry + direct money), in USD. */
+      estUsd?: number;
     }
   | { type: "status"; text: string };
 
@@ -579,6 +591,7 @@ export class Agent {
   /** /research wrapup: finish this study (review once, report, complete) instead of continuing it. */
   wrappingUp = false;
   private toolDurations = new Map<string, number[]>();
+  private toolChars = new Map<string, number[]>();
   allowBackground = true;
   onBackground: ((event: AgentEvent) => void) | null = null;
   /** Set by the UI on chat agents: creates a prepared (not started) study room. */
@@ -682,6 +695,15 @@ export class Agent {
   modelOverride: string | null = null;
   tasks: PlanTask[] = [];
   canSpawn = true;
+  /**
+   * Where this agent sits: the person's chat (ceo), the one director of a study, a researcher (a worker
+   * that may delegate) or a subagent (a worker that may not).
+   */
+  get tier(): Tier {
+    if (this.companyWorker)
+      return this.depth === 0 ? "director" : this.canSpawn ? "researcher" : "subagent";
+    return this.research || this.activeCompanyRun ? "director" : "ceo";
+  }
   runChild: (
     task: string,
     expected: string,
@@ -854,6 +876,7 @@ export class Agent {
     return [
       ...toolDefinitions,
       kestGuideToolDefinition,
+      ...(!inResearch ? [machineCheckToolDefinition] : []),
       ...(!inResearch && this.onPrepareResearch ? [researchPrepareToolDefinition] : []),
       ...(!inResearch && this.onStartPrepared ? [researchStartAllToolDefinition] : []),
       ...(!inResearch && this.onListResearch ? [researchListToolDefinition] : []),
@@ -894,7 +917,9 @@ export class Agent {
     const start = args.start === true;
     if (start && budgetUsd === undefined) throw new Error("start requires budget_usd: ask the user for a budget first.");
     const autoPublish = args.auto_publish === true;
-    return this.onPrepareResearch(objective, { budgetUsd, start, autoPublish, studyId });
+    const prepared = await this.onPrepareResearch(objective, { budgetUsd, start, autoPublish, studyId });
+    const advice = await machineAdvice();
+    return advice ? `${prepared}\n${advice}` : prepared;
   }
 
   executePlanTool(name: string, raw: string): string {
@@ -1695,6 +1720,10 @@ Wrap-up stopped: ${error instanceof Error ? error.message : "could not complete"
             name,
             this.toolDurations.get(name) ?? [],
           );
+          const estimate = estimateCall(name, {
+            observedChars: this.toolChars.get(name),
+            rate: inputRate(model),
+          });
           emit({
             type: "tool",
             callId: call.id,
@@ -1712,8 +1741,13 @@ Wrap-up stopped: ${error instanceof Error ? error.message : "could not complete"
               throw new Error(
                 `Tool not available in this agent's scope: ${name}`,
               );
+            const registered = toolSpec(name);
+            if (registered && !registered.tiers.includes(this.tier))
+              throw new Error(`${name} is not available to a ${this.tier}.`);
             if (name === "research_prepare") {
               output = await this.prepareResearchTool(args);
+            } else if (name === "machine_check") {
+              output = await machineCheckTool(JSON.parse(args) as Record<string, unknown>);
             } else if (name === "research_list") {
               if (!this.onListResearch) throw new Error("research_list is not available here.");
               output = await this.onListResearch();
@@ -1771,7 +1805,11 @@ Wrap-up stopped: ${error instanceof Error ? error.message : "could not complete"
                 signal,
                 emit,
               );
+            } else if (name === "browser" && tavilyKey() && (this.research || this.activeCompanyRun) && searchEngineUrl(JSON.parse(args || "{}"))) {
+              state = "error";
+              output = "Error: do not use a search engine in the browser. Use tavily_search to find sources. Use the browser for niche sites, scraping and pages Tavily cannot read.";
             } else {
+              this.tools.procOwner = this.research ? `study ${this.research.id.slice(0, 8)}` : "chat";
               output = await this.tools.execute(name, args, signal);
             }
           } catch (error) {
@@ -1788,13 +1826,18 @@ Wrap-up stopped: ${error instanceof Error ? error.message : "could not complete"
             toolCallId: call.id,
             agentId: this.agentId,
             depth: this.depth,
+            tier: this.tier,
             name,
             args,
             state,
             output,
             durationMs,
             estimatedMs,
+            estTokens: estimate.tokens,
+            estUsd: estimate.totalUsd,
+            actualChars: output.length,
           });
+          this.toolChars.set(name, [...(this.toolChars.get(name) ?? []), output.length].slice(-20));
           emit({
             type: "tool",
             callId: call.id,
@@ -1803,6 +1846,9 @@ Wrap-up stopped: ${error instanceof Error ? error.message : "could not complete"
             state,
             output,
             durationMs,
+            tier: this.tier,
+            chars: output.length,
+            estUsd: estimate.totalUsd,
           });
           return { call, output };
         };

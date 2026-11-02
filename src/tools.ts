@@ -1,3 +1,4 @@
+import { ProcClient, procTool } from "./procs";
 import { BrowserSession, browserActions, browserRequest } from "./browser";
 import type OpenAI from "openai";
 import { readdir, realpath, stat, mkdir } from "node:fs/promises";
@@ -55,6 +56,28 @@ const schema = (
   },
 });
 const str = (description: string) => ({ type: "string", description });
+const procToolDefinition = schema(
+  "proc",
+  "Long-running background processes (dev servers, watchers, notebooks, scrapers, local APIs). They keep running after the turn and after Kest restarts, and every agent in the workspace can use them. action: start (script = Bun source, or argv = external program; optional name, port, wait_port / wait_log to return once ready, ttl_minutes), list, logs (id or name; lines or since), send (stdin text), stop, stop_all. Use this instead of shell for anything that must keep running or would exceed the timeout.",
+  {
+    action: { type: "string", enum: ["start", "list", "logs", "send", "stop", "stop_all"] },
+    name: str("Short unique name, e.g. api-server"),
+    script: str("Bun/TypeScript source to run (start)"),
+    argv: { type: "array", items: { type: "string" }, description: "External program and arguments (start), e.g. python script.py" },
+    port: { type: "integer", description: "Port the process uses; passed as PORT (start)" },
+    wait_port: { type: "integer", description: "Return only once this local port accepts connections (start)" },
+    wait_log: str("Return only once output matches this regex, e.g. ready|listening (start)"),
+    wait_ms: { type: "integer", description: "Max wait for readiness, default 15000" },
+    ttl_minutes: { type: "integer", description: "Auto-stop after this long; default 360" },
+    id: str("Process id or name (logs, send, stop)"),
+    lines: { type: "integer" },
+    since: { type: "integer", description: "Byte offset from a previous logs call's next=" },
+    text: str("Text to write to stdin (send)"),
+    title: str("Short plain-language title for this action"),
+  },
+  ["action"],
+);
+
 export const toolDefinitions: OpenAI.ChatCompletionTool[] = [
   schema(
     "browser",
@@ -170,10 +193,17 @@ export const toolDefinitions: OpenAI.ChatCompletionTool[] = [
     },
     ["command"],
   ),
+  procToolDefinition,
 ];
 
 export class WorkspaceTools {
   readonly root: string;
+  /** Who started processes: "chat" or a study label. */
+  procOwner = "chat";
+  private procs?: ProcClient;
+  procClient() {
+    return (this.procs ??= new ProcClient(this.root));
+  }
   private reads = new Map<string, string>();
   private preparedShell: ReturnType<WorkspaceTools["startShell"]> | null = null;
 
@@ -333,6 +363,28 @@ export class WorkspaceTools {
         return "Denied by user. Do not retry unless asked.";
       signal.throwIfAborted();
       return this.browser.execute(request, signal);
+    }
+    if (name === "proc") {
+      if (args.action === "start") {
+        const code = typeof args.script === "string" ? args.script : Array.isArray(args.argv) ? (args.argv as string[]).join(" ") : "";
+        if (
+          !(await this.approve(
+            {
+              kind: "script",
+              title: `Start background process${typeof args.name === "string" ? `: ${args.name}` : ""}`,
+              preview: `This keeps running after the turn and after Kest restarts, until stopped or ${args.ttl_minutes ?? 360} minutes pass.
+Working directory: ${this.root}${args.port ? `
+Port: ${args.port} (localhost)` : ""}
+
+${code}`,
+            },
+            signal,
+          ))
+        )
+          return "Denied by user. Do not retry this command unless asked.";
+        signal.throwIfAborted();
+      }
+      return procTool(this.procClient(), args, this.procOwner);
     }
     if (name === "shell") {
       const timeout = args.timeout_ms ?? 60000;

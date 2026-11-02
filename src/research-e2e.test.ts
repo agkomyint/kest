@@ -414,7 +414,7 @@ test("persistent research executes parallel teams, real experiments, review, pap
   const state = newCompany(
     "Test the research workflow using a deterministic arithmetic experiment; make no indexing claims.",
   );
-  state.maxCostUsd = 0.05;
+  state.maxCostUsd = 0.08;
   for (const model of ["director", "a", "b", "c"])
     state.costRates[costKey("fixture", model)] = { input: 0.001, output: 1 };
   const directory = `research/${state.id}`;

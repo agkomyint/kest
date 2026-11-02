@@ -29,6 +29,7 @@ export type InboxItem = {
   status: InboxStatus;
   createdAt: number;
   deadline: number | null;
+  sensitive: boolean;
   draft: Record<string, string> | null;
   answers: Record<string, string> | null;
 };
@@ -38,7 +39,10 @@ export type FormOutcome =
   | { kind: "expired"; text: string }
   | { kind: "aborted"; text: string };
 
-/** Money and publishing are never delegated to a timeout or to the chat model. */
+/**
+ * Money and publishing questions may come through the chat, but they are "sensitive": no default,
+ * no timeout decision by the director, and only the user's own confirmed answers count.
+ */
 const reserved = /\b(budget|fund(?:s|ing|ed)?|allowance|spend(?:ing)?|extra money|publish(?:ing)?)\b/i;
 
 const norm = (s: string) => s.trim().toLowerCase();
@@ -51,13 +55,14 @@ export class Inbox {
   private seq = 0;
   private waiting = new Map<number, { settle: (o: FormOutcome) => void; timer: ReturnType<typeof setTimeout> }>();
 
-  private add(partial: Omit<InboxItem, "id" | "status" | "createdAt" | "draft" | "answers" | "fields" | "deadline"> & Partial<InboxItem>) {
+  private add(partial: Omit<InboxItem, "id" | "status" | "createdAt" | "sensitive" | "draft" | "answers" | "fields" | "deadline"> & Partial<InboxItem>) {
     const item: InboxItem = {
       id: ++this.seq,
       status: "new",
       createdAt: Date.now(),
       fields: [],
       deadline: null,
+      sensitive: false,
       draft: null,
       answers: null,
       ...partial,
@@ -109,8 +114,7 @@ export class Inbox {
       if (f.type === "choice" && !(f.options && f.options.length >= 2)) throw new Error(`Field ${f.id}: a choice needs 2 or more options.`);
     }
     const text = [title, ...fields.map((f) => f.label)].join(" ");
-    if (reserved.test(text))
-      throw new Error("Budget, funding, spending and publishing decisions are never put to the chat; the user makes them in the study room. Rephrase or decide the research question yourself.");
+    const sensitive = reserved.test(text);
     const deadline = Date.now() + this.timeoutMs;
     const item = this.add({
       studyId,
@@ -120,6 +124,7 @@ export class Inbox {
       body: fields.map((f) => `${f.label}${f.why ? ` (${f.why})` : ""}`).join("\n"),
       fields,
       deadline,
+      sensitive,
     });
     return new Promise<FormOutcome>((resolve) => {
       let done = false;
@@ -139,7 +144,9 @@ export class Inbox {
         finish(
           {
             kind: "expired",
-            text: `The user did not answer within ${Math.round(this.timeoutMs / 60_000) || 1} minute(s). Decide what is best yourself, say which assumption you made in your next update, and continue.${defaults.length ? ` Your own suggested defaults were: ${defaults.join("; ")}.` : ""} Do not ask this again.`,
+            text: sensitive
+              ? `The user did not answer this money/publishing question within ${Math.round(this.timeoutMs / 60_000) || 1} minute(s). Treat it as NOT approved: the allowance is unchanged and nothing is published. Continue within the current budget, or conclude with what you have. Do not ask again unless something new comes up.`
+              : `The user did not answer within ${Math.round(this.timeoutMs / 60_000) || 1} minute(s). Decide what is best yourself, say which assumption you made in your next update, and continue.${defaults.length ? ` Your own suggested defaults were: ${defaults.join("; ")}.` : ""} Do not ask this again.`,
           },
           "expired",
           "expired",
@@ -210,16 +217,18 @@ export class Inbox {
     return item;
   }
 
-  /** Fields that still have no answer in the draft and no default. */
+  /** Fields that still have no answer. Money questions have no defaults: the user must answer each one. */
   missing(item: InboxItem) {
-    return item.fields.filter((f) => item.draft?.[f.id] === undefined && f.default === undefined).map((f) => f.id);
+    return item.fields
+      .filter((f) => item.draft?.[f.id] === undefined && (item.sensitive || f.default === undefined))
+      .map((f) => f.id);
   }
 
   /** The answers that would be sent: draft values, then each field's default. */
   finalAnswers(item: InboxItem): Record<string, string> {
     const out: Record<string, string> = {};
     for (const f of item.fields) {
-      const v = item.draft?.[f.id] ?? f.default;
+      const v = item.draft?.[f.id] ?? (item.sensitive ? undefined : f.default);
       if (v !== undefined) out[f.id] = v;
     }
     return out;
@@ -241,7 +250,7 @@ export class Inbox {
     const waiter = this.waiting.get(id);
     if (!waiter) throw new Error(`The study is no longer waiting on form #${id}.`);
     item.answers = answers;
-    waiter.settle({ kind: "answered", text: `The user answered your form "${item.title}":\n${this.describeAnswers(item, answers)}\nContinue with these decisions.` });
+    waiter.settle({ kind: "answered", text: `The user answered your form "${item.title}":\n${this.describeAnswers(item, answers)}\n${item.sensitive ? "This is the user's own decision on a money/publishing question. It does not change the allowance by itself: the user sets that with /research budget in this room, so check research_status before relying on new funds. " : ""}Continue with these decisions.` });
     return item;
   }
 

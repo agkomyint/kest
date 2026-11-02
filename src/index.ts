@@ -2,6 +2,13 @@
 import { loadStore, savePermission } from "./config";
 export {};
 import { autoApprove, parsePermission } from "./permissions";
+const procdAt = process.argv.indexOf("--procd");
+if (procdAt !== -1) {
+  // Background process supervisor: detached from the app, serves .kest/procs.
+  const { runDaemon } = await import("./procd");
+  await runDaemon(process.argv[procdAt + 1] ?? process.cwd());
+  process.exit(0);
+}
 const args = process.argv.slice(2);
 const permissionIndex = args.indexOf("--permission");
 let permission: import("./permissions").Permission = "strict";
@@ -20,7 +27,7 @@ if (!args.includes("--help") && !args.includes("-h")) {
 }
 if (args.includes("--help") || args.includes("-h")) {
   console.log(
-    "kest [directory] [--permission all|minimal|strict]\nkest --prompt <message> [--research --budget 10$] [--permission all|minimal|strict]\n\nBun coding agent · /connect · /help inside the TUI\nStrict is the default. Headless mode denies actions that require approval.",
+    "kest [directory] [--permission all|minimal|strict]\nkest --prompt <message> [--research --budget 10$ [--auto-publish]] [--permission all|minimal|strict]\n\nBun coding agent · /connect · /help inside the TUI\nStrict is the default. Headless mode denies actions that require approval.",
   );
 } else if (args.includes("--prompt")) {
   const { Agent } = await import("./agent");
@@ -33,11 +40,19 @@ if (args.includes("--help") || args.includes("-h")) {
   } else {
     const controller = new AbortController();
     process.on("SIGINT", () => controller.abort());
+    const denied: string[] = [];
     const agent = new Agent(
       process.cwd(),
-      async (request, signal) =>
-        !signal.aborted && autoApprove(permission, request),
+      async (request, signal) => {
+        const ok = !signal.aborted && autoApprove(permission, request);
+        if (!ok) {
+          denied.push(request.kind ?? "action");
+          console.error(`[denied ${request.kind ?? "action"}] ${request.title}`);
+        }
+        return ok;
+      },
     );
+    const published: string[] = [];
     if (args.includes("--research")) {
       const { newCompany, parseCostBudget } =
         await import("./research-company");
@@ -50,7 +65,10 @@ if (args.includes("--help") || args.includes("-h")) {
       }
       agent.research = newCompany(prompt);
       agent.research.maxCostUsd = parseCostBudget(budget);
+      // Headless has no one to ask: --auto-publish lets the study claim, post and publish to LSI.
+      if (args.includes("--auto-publish")) agent.research.autoPublish = true;
     }
+    const { publishedIds, runReport } = await import("./headless");
     const { newSession, saveSession } = await import("./sessions");
     const { recordUsage, flushUsage } = await import("./usage");
     const session = newSession(process.cwd(), agent.messages);
@@ -75,8 +93,18 @@ if (args.includes("--help") || args.includes("-h")) {
           name: event.name,
           durationMs: event.durationMs,
           error: event.state === "error",
+          tier: event.tier,
+          chars: event.chars,
+          estUsd: event.estUsd,
         });
       }
+      if (
+        event.type === "tool" &&
+        event.name === "lsi_publish" &&
+        event.state === "done" &&
+        event.output
+      )
+        published.push(...publishedIds(event.output));
       if (event.type === "text")
         process.stdout.write(
           event.delta.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, ""),
@@ -89,6 +117,20 @@ if (args.includes("--help") || args.includes("-h")) {
         console.error(
           `[background ${event.state}] ${event.taskId.slice(0, 8)} ${event.task}`,
         );
+      if (
+        event.type === "worker" &&
+        event.event?.type === "tool" &&
+        event.event.state !== "running" &&
+        event.event.durationMs !== undefined
+      )
+        (session.toolStats ??= []).push({
+          name: event.event.name,
+          durationMs: event.event.durationMs,
+          error: event.event.state === "error",
+          tier: event.event.tier,
+          chars: event.event.chars,
+          estUsd: event.event.estUsd,
+        });
       if (event.type === "worker" && event.event?.type !== "text")
         console.error(
           `[${event.workerId.slice(0, 8)} ${event.role} ${event.model}] ${event.event?.type === "tool" ? `${event.event.name}: ${event.event.state}` : event.event?.type === "status" ? event.event.text : event.state}`,
@@ -125,6 +167,19 @@ if (args.includes("--help") || args.includes("-h")) {
         console.error("Could not save session to disk."),
       );
       await agent.browser.close();
+      if (agent.research || published.length) {
+        const { lsiBaseUrl } = await import("./lsi");
+        const report = runReport({
+          study: agent.research ?? null,
+          autoPublish: agent.research?.autoPublish === true,
+          published: [...new Set(published)],
+          denied,
+          toolStats: session.toolStats ?? [],
+          baseUrl: lsiBaseUrl(),
+        });
+        console.error(report.lines.join("\n"));
+        if (report.exitCode && !process.exitCode) process.exitCode = report.exitCode;
+      }
     }
   }
 } else {

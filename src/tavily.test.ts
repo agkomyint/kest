@@ -244,3 +244,18 @@ test("Tavily environment credentials are excluded from the script subprocess", a
     await tools.disposeShell();
   }
 });
+
+test("with Tavily connected, workers keep the browser but search-engine pages are refused", async () => {
+  const { searchEngineUrl } = await import("./agent");
+  expect(searchEngineUrl({ action: "open", url: "https://www.google.com/search?q=x" })).toBe(true);
+  expect(searchEngineUrl({ action: "batch", steps: [{ action: "open", url: "https://duckduckgo.com/?q=x" }] })).toBe(true);
+  expect(searchEngineUrl({ action: "open", url: "http://localhost:3000/" })).toBe(false);
+  expect(searchEngineUrl({ action: "open", url: "https://arxiv.org/abs/1" })).toBe(false);
+  const names = (a: Agent) => a.toolDefs().flatMap((t) => (t.type === "function" ? [t.function.name] : []));
+  const worker = new Agent(process.cwd(), async () => false);
+  worker.toolScope = "research";
+  expect(names(worker)).toContain("browser");
+  process.env.TAVILY_API_KEY = "tvly-test";
+  expect(names(worker)).toContain("browser"); // still there for niche sites and scraping
+  expect(names(worker)).toContain("tavily_search");
+});

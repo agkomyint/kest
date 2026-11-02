@@ -20,7 +20,7 @@ import {
   permissionHelp,
   type Permission,
 } from "./permissions";
-import { formatToolStats } from "./stats";
+import { formatToolStats, tierStats } from "./stats";
 import {
   BoxRenderable,
   TextRenderable,
@@ -40,6 +40,9 @@ import {
 } from "@opentui/core";
 import OpenAI from "openai";
 import { version } from "../package.json";
+import { describeMachine, getMachine } from "./machine";
+import { ProcClient, describeProc, procPanel } from "./procs";
+import type { ProcInfo } from "./procd";
 import { Inbox, type FormField, type InboxItem } from "./inbox";
 import { Agent, formatTasks, systemPrompt, type AgentEvent } from "./agent";
 import {
@@ -80,6 +83,8 @@ import { formatStudyTab, loadStudyArtifacts, studyTabs, type StudyTab } from "./
 import {
   formatUsage,
   formatModelCosts,
+  usagePanel,
+  loadDaily,
   loadUsage,
   recordUsage,
   flushUsage,
@@ -204,6 +209,7 @@ export class KestUI {
   private secretText: TextRenderable;
   private hints: TextRenderable;
   private roomBar: TextRenderable;
+  private procBar: TextRenderable;
   private tipRow: BoxRenderable;
   private tipText: TextRenderable;
   private tipPrevious: TextRenderable;
@@ -421,6 +427,14 @@ export class KestUI {
         if (this.focusRoom(room)) this.composer.focus();
       },
     });
+    this.procBar = new TextRenderable(renderer, {
+      content: "",
+      visible: false,
+      fg: theme.muted,
+      height: 1,
+      flexShrink: 0,
+      wrapMode: "none",
+    });
     this.promptBox = new BoxRenderable(renderer, {
       border: false,
       height: 5,
@@ -567,9 +581,11 @@ export class KestUI {
     root.add(this.tipRow);
     root.add(this.promptBox);
     root.add(this.roomBar);
+    root.add(this.procBar);
     root.add(this.footer);
     renderer.root.add(root);
     renderer.keyInput.on("keypress", (key) => this.key(key));
+    this.startProcTimer();
     renderer.keyInput.on("paste", (event) => {
       if (!this.connectStep) {
         const text = new TextDecoder().decode(event.bytes);
@@ -736,7 +752,7 @@ export class KestUI {
       const miss = this.inbox.missing(item);
       if (miss.length) throw new Error(`Still unanswered: ${miss.join(", ")}.`);
       return {
-        preview: `${item.studyTitle}: ${item.title}\n${this.inbox.describeAnswers(item)}`,
+        preview: `${item.sensitive ? "MONEY / PUBLISHING DECISION: only you can approve this. It does not change the allowance by itself; set that with /research budget.\n" : ""}${item.studyTitle}: ${item.title}\n${this.inbox.describeAnswers(item)}`,
         send: () => {
           try {
             this.inbox.send(id);
@@ -1070,7 +1086,7 @@ export class KestUI {
         : what === "expired"
           ? `⏱ #${item.id} no reply in ${minutes} min: the ${item.studyTitle} director decided and continued.`
           : item.kind === "form"
-            ? `▲ #${item.id} ${item.studyTitle} asks: ${item.title} · ${item.fields.length} question(s) · reply within ${minutes} min or the director decides · /inbox read ${item.id}`
+            ? `▲ #${item.id} ${item.studyTitle} asks: ${item.title} · ${item.fields.length} question(s) · ${item.sensitive ? `money decision: no reply in ${minutes} min means NOT approved` : `reply within ${minutes} min or the director decides`} · /inbox read ${item.id}`
             : `${item.kind === "done" ? "✓" : item.kind === "blocked" ? "!" : "•"} #${item.id} ${item.studyTitle}: ${item.title}${item.body ? ` · ${item.body.replace(/\s+/g, " ").slice(0, 120)}` : ""} · /inbox read ${item.id}`;
     if (this.rooms.focused === chat) this.info(text);
     else chat.session.entries.push({ role: "info", text });
@@ -1089,7 +1105,7 @@ export class KestUI {
     const fields = item.fields
       .map((f) => `- ${f.id} (${f.type}${f.options ? `: ${f.options.join(" | ")}` : ""}${f.default !== undefined ? `; default ${f.default}` : ""}) ${f.label}${f.why ? ` — ${f.why}` : ""}`)
       .join("\n");
-    return `[Control inbox #${item.id}, form from study "${item.studyTitle}"] ${item.title}\n${fields}\nThe study is waiting; if there is no answer in ${Math.max(1, Math.round(this.inbox.timeoutMs / 60_000))} minutes its director decides alone. The user will now give you direction in their own words. Draft answers with inbox_draft and show them. Do not send anything until the user tells you to; sending asks them to confirm.`;
+    return `[Control inbox #${item.id}, form from study "${item.studyTitle}"] ${item.title}\n${fields}\nThe study is waiting; ${item.sensitive ? `there is no answer in ${Math.max(1, Math.round(this.inbox.timeoutMs / 60_000))} minutes it counts as NOT approved. This is a money/publishing decision: only the user decides it, every field needs their explicit answer (no defaults), and you must not choose for them. ` : `if there is no answer in ${Math.max(1, Math.round(this.inbox.timeoutMs / 60_000))} minutes its director decides alone. `}The user will now give you direction in their own words. Draft answers with inbox_draft and show them. Do not send anything until the user tells you to; sending asks them to confirm.`;
   }
 
   private async inboxCommand(value: string) {
@@ -2327,6 +2343,16 @@ export class KestUI {
       if (next && this.focusRoom(next)) this.composer.focus();
       return;
     }
+    if ((key.meta || key.option) && !key.ctrl && key.name === "p") {
+      key.preventDefault();
+      const running = this.procList.filter((p) => p.state === "running");
+      const at = running.findIndex((p) => p.id === this.procWatch);
+      this.procWatch = at + 1 < running.length ? running[at + 1]!.id : null;
+      this.procWatchText = "";
+      this.procKey = "";
+      this.drawProcs();
+      return;
+    }
     if (key.ctrl && key.name === "k" && this.rooms.list().length > 1) {
       key.preventDefault();
       this.openRoomPicker();
@@ -2940,6 +2966,9 @@ export class KestUI {
           name: activity.name,
           durationMs: activity.durationMs,
           error: activity.state === "error",
+          tier: activity.tier,
+          chars: activity.chars,
+          estUsd: activity.estUsd,
         });
     } else if (activity?.type === "status") {
       worker.latest = activity.text;
@@ -3130,6 +3159,9 @@ export class KestUI {
           name: event.name,
           durationMs: event.durationMs,
           error: event.state === "error",
+          tier: event.tier,
+          chars: event.chars,
+          estUsd: event.estUsd,
         });
       }
       const group = this.toolGroup;
@@ -3425,6 +3457,14 @@ export class KestUI {
     }
     if (command === "/exit" || command === "/quit") {
       this.close();
+      return;
+    }
+    if (command === "/procs") {
+      await this.procsCommand(value);
+      return;
+    }
+    if (command === "/machine") {
+      this.info(`This computer: ${describeMachine(await getMachine(this.cwd))}\nResearch is planned inside these limits. When an idea is too big, Kest proposes a smaller scope, a hosted API, or cloud compute.`);
       return;
     }
     if (command === "/inbox") {
@@ -3996,36 +4036,56 @@ export class KestUI {
     if (command === "/usage" || command === "/tokens") {
       await flushUsage();
       const sessions = await allSessions(this.session);
+      const log = await loadUsage();
+      if (rest.join(" ").trim().toLowerCase().startsWith("models")) {
+        this.info(formatUsage(log) + "\n\n" + formatModelCosts(log));
+        return;
+      }
+      const studies = this.rooms
+        .list()
+        .filter((r) => r.study)
+        .map((r) => ({
+          id: r.study!.id,
+          title: r.title,
+          spent: studySpentUsd(r.study!),
+          budget: r.study!.maxCostUsd,
+        }));
       this.info(
-        formatUsage(await loadUsage(), {
-          sessions: sessions.length,
-          workspaces: new Set(sessions.map((s) => s.cwd)).size,
-        }) +
-          "\n\n" +
-          formatModelCosts(await loadUsage()),
+        usagePanel(log, {
+          width: Math.min(78, Math.max(40, this.renderer.width - 8)),
+          daily: await loadDaily(),
+          studies,
+          summary: {
+            sessions: sessions.length,
+            workspaces: new Set(sessions.map((s) => s.cwd)).size,
+          },
+        }).join("\n"),
       );
       return;
     }
     if (command === "/stats") {
       await flushUsage();
       const sessions = await allSessions(this.session);
-      this.info(
-        formatToolStats(
-          this.agent.toolDefs(),
-          sessions.flatMap((s) =>
-            (s.toolStats ?? []).filter(
-              (t) =>
-                t &&
-                typeof t.name === "string" &&
-                Number.isFinite(t.durationMs) &&
-                t.durationMs >= 0,
-            ),
-          ),
-          {
-            sessions: sessions.length,
-            workspaces: new Set(sessions.map((s) => s.cwd)).size,
-          },
+      const timings = sessions.flatMap((s) =>
+        (s.toolStats ?? []).filter(
+          (t) =>
+            t &&
+            typeof t.name === "string" &&
+            Number.isFinite(t.durationMs) &&
+            t.durationMs >= 0,
         ),
+      );
+      const summary = {
+        sessions: sessions.length,
+        workspaces: new Set(sessions.map((s) => s.cwd)).size,
+      };
+      this.info(
+        rest.join(" ").trim().toLowerCase().startsWith("tools")
+          ? formatToolStats(this.agent.toolDefs(), timings, summary)
+          : tierStats(timings, {
+              width: Math.min(78, Math.max(40, this.renderer.width - 8)),
+              summary,
+            }).join("\n"),
       );
       return;
     }
@@ -4321,6 +4381,99 @@ export class KestUI {
       this.drawListPicker();
     }
   }
+  // Background processes live in a separate supervisor, so they are polled, never owned by this UI.
+  private procs!: ProcClient;
+  private procList: ProcInfo[] = [];
+  private procWatch: string | null = null;
+  private procWatchText = "";
+  private procKey = "";
+  private procTimer: ReturnType<typeof setInterval> | null = null;
+  private procAnnounced = false;
+  private procBusy = false;
+  private startProcTimer() {
+    if (this.procTimer) return;
+    this.procs = new ProcClient(this.cwd);
+    const poll = async () => {
+      if (this.procBusy || this.closed) return;
+      this.procBusy = true;
+      try {
+        this.procList = await this.procs.listIfRunning();
+        if (this.procWatch && !this.procList.some((p) => p.id === this.procWatch)) this.procWatch = null;
+        if (this.procWatch) {
+          const r = await this.procs.logs(this.procWatch, { lines: 14 });
+          this.procWatchText = r.text;
+        }
+        const running = this.procList.filter((p) => p.state === "running").length;
+        if (!this.procAnnounced && running) {
+          this.procAnnounced = true;
+          this.info(`Reattached to ${running} background process${running === 1 ? "" : "es"} that kept running. /procs to see them.`);
+        }
+        this.drawProcs();
+      } catch {
+        /* the supervisor may be starting or stopping */
+      } finally {
+        this.procBusy = false;
+      }
+    };
+    this.procTimer = setInterval(() => void poll(), 1000);
+    this.procTimer.unref?.();
+    void poll();
+  }
+  private drawProcs() {
+    if (this.closed || !this.procBar) return;
+    const logLines = Math.max(4, Math.min(10, Math.floor((this.renderer.height - 22) / 2)));
+    const lines = procPanel(this.procList, Math.max(20, this.renderer.width - 4), {
+      watch: this.procWatch,
+      watchText: this.procWatchText,
+      logLines,
+    });
+    const key = lines.join("\n");
+    if (key === this.procKey) return;
+    this.procKey = key;
+    this.procBar.visible = lines.length > 0;
+    this.procBar.content = key;
+    this.procBar.height = Math.max(1, lines.length);
+  }
+  private async procsCommand(value: string) {
+    const [sub = "", id = "", ...rest] = value.trim().split(/\s+/);
+    const known = (ref: string) => this.procList.find((p) => p.id === ref || p.name === ref);
+    try {
+      if (!sub || sub === "list") {
+        const all = await this.procs.listIfRunning();
+        this.procList = all;
+        this.info(all.length ? `Background processes (they keep running if Kest closes):
+${all.map(describeProc).join("\n")}
+
+/procs watch NAME · logs NAME [lines] · send NAME text · stop NAME|all` : "No background processes. Agents start them with the proc tool.");
+      } else if (sub === "watch") {
+        const target = id ? known(id) : this.procList.find((p) => p.state === "running");
+        if (!target) return this.info("No such process. /procs lists them.");
+        this.procWatch = target.id;
+        this.procWatchText = "";
+        this.procKey = "";
+        this.drawProcs();
+      } else if (sub === "unwatch") {
+        this.procWatch = null;
+        this.procKey = "";
+        this.drawProcs();
+      } else if (sub === "logs") {
+        if (!id) return this.info("Usage: /procs logs NAME [lines]");
+        const r = await this.procs.logs(id, { lines: Number(rest[0]) || 60 });
+        this.info(`${id} (${r.state})
+${r.text || "(no output yet)"}`);
+      } else if (sub === "send") {
+        if (!id || !rest.length) return this.info("Usage: /procs send NAME text");
+        await this.procs.send(id, rest.join(" ") + "\n");
+        this.info(`Sent to ${id}.`);
+      } else if (sub === "stop") {
+        if (!id) return this.info("Usage: /procs stop NAME|all");
+        if (id === "all") this.info(`Stopped ${await this.procs.stopAll()} process(es).`);
+        else this.info(`${id} is ${(await this.procs.stop(id)).state}.`);
+      } else this.info("Usage: /procs [list|watch NAME|unwatch|logs NAME|send NAME text|stop NAME|all]");
+    } catch (error) {
+      this.info(error instanceof Error ? error.message : "Process command failed.");
+    }
+  }
   private stopAllRooms() {
     if (this.barTimer) clearInterval(this.barTimer);
     this.barTimer = null;
@@ -4332,6 +4485,8 @@ export class KestUI {
   close() {
     if (this.closed) return;
     this.closed = true;
+    if (this.procTimer) clearInterval(this.procTimer);
+    this.procTimer = null;
     this.inbox.closeAll();
     this.stopAllRooms();
     this.approval?.finish(false);

@@ -120,6 +120,7 @@ async function updateUsage(
       mode: 0o600,
     });
     await rename(temporary, file);
+    await bumpDay(file, model, input, output).catch(() => {});
     return log;
   } finally {
     await unlink(temporary).catch(() => {});
@@ -212,4 +213,245 @@ export function formatUsage(
     `TOTAL  in ${fmt(totalIn)} · out ${fmt(totalOut)} · total ${fmt(totalIn + totalOut)} · ${totalReq} requests`,
   );
   return scope + lines.join("\n");
+}
+
+// ---- per-day history (powers the /usage panel) --------------------------------------------
+
+/** date (YYYY-MM-DD, local) -> model -> tokens. Stored beside the totals; older totals have no history. */
+export type DailyUsage = Record<
+  string,
+  Record<string, { input: number; output: number }>
+>;
+
+export const dailyFile = (file = usageFile()) =>
+  file.replace(/\.json$/, "") + ".days.json";
+export const dayKey = (d = new Date()) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+export async function loadDaily(file = usageFile()): Promise<DailyUsage> {
+  try {
+    const f = Bun.file(dailyFile(file));
+    if (!(await f.exists())) return {};
+    const raw: unknown = await f.json();
+    return raw && typeof raw === "object" ? (raw as DailyUsage) : {};
+  } catch {
+    return {};
+  }
+}
+
+// Runs inside the usage lock, so it needs no lock of its own.
+async function bumpDay(
+  file: string,
+  model: string,
+  input: number,
+  output: number,
+) {
+  const days = await loadDaily(file);
+  const clean = (n: number) =>
+    Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
+  const day = (days[dayKey()] ??= {});
+  const m = (day[model] ??= { input: 0, output: 0 });
+  m.input += clean(input);
+  m.output += clean(output);
+  for (const k of Object.keys(days).sort().slice(0, -90)) delete days[k];
+  const target = dailyFile(file);
+  const tmp = `${target}.${crypto.randomUUID()}.tmp`;
+  try {
+    await Bun.write(tmp, JSON.stringify(days) + "\n", { mode: 0o600 });
+    await rename(tmp, target);
+  } finally {
+    await unlink(tmp).catch(() => {});
+  }
+}
+
+// ---- the /usage panel ---------------------------------------------------------------------
+
+export type StudySpend = {
+  id: string;
+  title: string;
+  spent: number;
+  budget: number | null;
+};
+
+/** Cost of one model's tokens, or null when the catalog has no verified rate. */
+export function costOf(
+  model: string,
+  t: { input: number; output: number },
+): number | null {
+  const provider = modelProvider(model);
+  const pricing = provider ? modelPricing(provider, model) : null;
+  if (!pricing) return null;
+  return (
+    (t.input * pricing.inputUsdPerMillionTokens +
+      t.output * pricing.outputUsdPerMillionTokens) /
+    1_000_000
+  );
+}
+
+const compact = (n: number) =>
+  n >= 1e9
+    ? `${(n / 1e9).toFixed(1)}B`
+    : n >= 1e6
+      ? `${(n / 1e6).toFixed(1)}M`
+      : n >= 1e3
+        ? `${Math.round(n / 1e3)}K`
+        : String(n);
+const usd = (v: number) =>
+  v === 0 ? "$0" : v < 0.01 ? `$${v.toFixed(4)}` : `$${v.toFixed(2)}`;
+const cut = (s: string, n: number) =>
+  s.length > n ? s.slice(0, Math.max(1, n - 1)) + "…" : s;
+const bar = (frac: number, w: number) => {
+  const n = Math.max(0, Math.min(w, Math.round(frac * w)));
+  return "█".repeat(n) + "░".repeat(w - n);
+};
+const SPARK = "▁▂▃▄▅▆▇█";
+
+/**
+ * The /usage view: totals on top, models ranked by cost with bars, a 7-day sparkline and study
+ * budgets. Pure: pass in what to show, get lines back.
+ */
+export function usagePanel(
+  log: UsageLog,
+  o: {
+    width?: number;
+    daily?: DailyUsage;
+    studies?: StudySpend[];
+    summary?: { sessions: number; workspaces: number };
+    now?: Date;
+  } = {},
+): string[] {
+  const width = Math.max(40, o.width ?? 80);
+  const wide = width >= 70;
+  const rule = "─".repeat(Math.min(width, 78));
+  const head = `USAGE · this machine${o.summary ? ` · ${o.summary.sessions} sessions · ${o.summary.workspaces} workspaces` : ""}`;
+  const models = Object.keys(log);
+  if (!models.length)
+    return [
+      cut(head, width),
+      rule,
+      "No token usage yet. Send a message; usage is logged per model on this machine.",
+    ];
+
+  const rows = models.map((m) => ({
+    model: m,
+    t: log[m]!,
+    cost: costOf(m, log[m]!),
+  }));
+  rows.sort(
+    (a, b) =>
+      (b.cost ?? -1) - (a.cost ?? -1) ||
+      b.t.input + b.t.output - (a.t.input + a.t.output),
+  );
+  const priced = rows.filter((r) => r.cost !== null);
+  const total = priced.reduce((s, r) => s + r.cost!, 0);
+  const inTok = rows.reduce((s, r) => s + r.t.input, 0);
+  const outTok = rows.reduce((s, r) => s + r.t.output, 0);
+  const req = rows.reduce((s, r) => s + r.t.requests, 0);
+  const inCost = priced.reduce((s, r) => {
+    const p = modelPricing(modelProvider(r.model)!, r.model)!;
+    return s + (r.t.input * p.inputUsdPerMillionTokens) / 1e6;
+  }, 0);
+
+  const lines = [cut(head, width), rule];
+  const unknown = rows.length - priced.length;
+  lines.push(
+    cut(
+      `Spend (est.) ${usd(total)}${unknown ? "+" : ""}   Tokens ${compact(inTok + outTok)}   Requests ${req.toLocaleString("en-US")}`,
+      width,
+    ),
+    cut(
+      `  in ${usd(inCost)} · out ${usd(total - inCost)}   ·   in ${compact(inTok)} · out ${compact(outTok)}`,
+      width,
+    ),
+    "",
+    "By model",
+  );
+  const barW = wide ? 16 : 8;
+  const nameW = Math.max(10, width - (2 + 1 + barW + 1 + 6 + 1 + 8 + (wide ? 5 : 0)));
+  const top = Math.max(...rows.map((r) => r.cost ?? 0), 1e-9);
+  for (const r of rows) {
+    const provider = modelProvider(r.model);
+    const name = cut(
+      provider ? `${provider} · ${r.model.split("/").pop()}` : r.model.split("/").pop()!,
+      nameW,
+    ).padEnd(nameW);
+    const tok = compact(r.t.input + r.t.output).padStart(6);
+    const cost =
+      r.cost === null ? "unpriced" : r.cost === 0 ? "free" : usd(r.cost);
+    const share =
+      r.cost !== null && total > 0
+        ? `${Math.round((r.cost / total) * 100)}%`.padStart(4)
+        : "";
+    lines.push(
+      cut(
+        `  ${name} ${bar((r.cost ?? 0) / top, barW)} ${tok} ${cost.padStart(8)}${wide ? " " + share : ""}`,
+        width,
+      ),
+    );
+  }
+  if (unknown) {
+    const toks = rows
+      .filter((r) => r.cost === null)
+      .reduce((s, r) => s + r.t.input + r.t.output, 0);
+    lines.push(
+      cut(
+        `  ⚠ ${unknown} model${unknown === 1 ? "" : "s"} (${compact(toks)} tokens) lack a verified rate, not in the total`,
+        width,
+      ),
+    );
+  }
+
+  const days = o.daily ?? {};
+  if (Object.keys(days).length) {
+    const now = o.now ?? new Date();
+    const series: number[] = [];
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date(now);
+      d.setDate(d.getDate() - i);
+      const day = days[dayKey(d)] ?? {};
+      series.push(
+        Object.entries(day).reduce((s, [m, t]) => s + (costOf(m, t) ?? 0), 0),
+      );
+    }
+    const max = Math.max(...series, 1e-9);
+    const spark = series
+      .map((v) =>
+        v <= 0 ? "▁" : SPARK[Math.min(7, Math.floor((v / max) * 7.999))]!,
+      )
+      .join("");
+    const avg = series.reduce((a, b) => a + b, 0) / 7;
+    lines.push(
+      "",
+      cut(
+        `Last 7 days  ${spark}   today ${usd(series[6]!)} · avg ${usd(avg)}/day`,
+        width,
+      ),
+    );
+  }
+
+  const studies = (o.studies ?? []).filter(
+    (s) => s.spent > 0 || s.budget !== null,
+  );
+  if (studies.length) {
+    lines.push("", "Research studies (open in this session)");
+    for (const s of studies.slice(0, 6)) {
+      const money =
+        s.budget !== null
+          ? `${usd(s.spent)} / ${usd(s.budget)}`
+          : usd(s.spent);
+      const frac = s.budget ? Math.min(1, s.spent / s.budget) : 0;
+      const tail = s.budget
+        ? ` ${bar(frac, 10)} ${Math.round(frac * 100)}%`
+        : "";
+      const right = `${money}${wide ? tail : ""}`;
+      const w = Math.max(10, width - right.length - 4);
+      lines.push(cut(`  ${cut(s.title, w).padEnd(w)} ${right}`, width));
+    }
+  }
+  lines.push(
+    "",
+    cut("/usage models for per-model detail", width),
+    cut("Estimates use current catalog rates. Not an invoice.", width),
+  );
+  return lines;
 }

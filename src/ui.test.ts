@@ -878,9 +878,12 @@ test("/usage shows recorded per-model token totals", async () => {
       await testUI.flush();
       await testUI.renderOnce();
       const frame = testUI.captureCharFrame();
-      expect(frame).toContain("meta-models/muse-spark-open-1026");
-      expect(frame).toContain("1,200");
-      expect(frame).toContain("340");
+      expect(frame).toContain("muse-spark-open-1026");
+      expect(frame).toContain("Spend (est.) $0.0029");
+      expect(frame).toContain("out 340");
+      ui.composer.setText("/usage models");
+      ui.composer.submit();
+      await ui.settled;
       const usageText = ui["session"].entries.at(-1)?.text ?? "";
       expect(usageText).toContain(
         "Input $1.25 · output $4.25 / 1M tokens (USD)",
@@ -1683,7 +1686,7 @@ test("tool timing appears on rows and /stats aggregates all saved sessions", asy
   process.env.KEST_CONFIG_DIR = dir;
   const { newSession, saveSession } = await import("./sessions");
   const other = newSession(join(dir, "other-workspace"), []);
-  other.toolStats = [{ name: "read_file", durationMs: 10, error: false }];
+  other.toolStats = [{ name: "read_file", durationMs: 10, error: false, tier: "director" }];
   await saveSession(other);
   const testUI = await createTestRenderer({ width: 140, height: 35 });
   const ui = new KestUI(testUI.renderer, process.cwd(), null);
@@ -1704,6 +1707,7 @@ test("tool timing appears on rows and /stats aggregates all saved sessions", asy
         args: "{}",
         state,
         durationMs,
+        tier: "ceo",
       });
     }
     await testUI.renderOnce();
@@ -1716,16 +1720,23 @@ test("tool timing appears on rows and /stats aggregates all saved sessions", asy
     await testUI.flush();
     await testUI.renderOnce();
     const frame = testUI.captureCharFrame();
-    expect(frame).toContain(`${ui["agent"].toolDefs().length} tools available`);
-    expect(frame).toContain("3 calls across saved sessions");
+    expect(frame).toContain("tool usage by tier");
     expect(frame).toContain("2 sessions · 2 workspaces");
-    expect(frame).toContain(
-      "3 calls · 1 errors · total 50.00 ms · avg 16.67 ms · max 28.00 ms",
-    );
+    expect(frame).toContain("CEO (you)");
+    expect(frame).toContain("2 calls · 50% errors");
+    expect(frame).toContain("Directors");
     expect(ui["session"].toolStats).toHaveLength(2);
-    ui.composer.setText("/stats");
+    ui.composer.setText("/stats tools");
     ui.composer.submit();
     await ui.settled;
+    await testUI.flush();
+    await testUI.renderOnce();
+    const toolFrame = testUI.captureCharFrame();
+    expect(toolFrame).toContain(`${ui["agent"].toolDefs().length} tools available`);
+    expect(toolFrame).toContain("3 calls across saved sessions");
+    expect(toolFrame).toContain(
+      "3 calls · 1 errors · total 50.00 ms · avg 16.67 ms · max 28.00 ms",
+    );
     expect(ui["session"].entries.at(-1)?.text).toContain(
       "3 calls across saved sessions",
     );
@@ -1739,7 +1750,7 @@ test("tool timing appears on rows and /stats aggregates all saved sessions", asy
       "2 sessions · 2 workspaces",
     );
     expect(ui["session"].entries.at(-1)?.text).toContain(
-      "Estimated model cost",
+      "No token usage yet",
     );
     ui.composer.setText("/stat");
     ui.composer.submit();
