@@ -9,5 +9,7 @@
     "types": ["bun"],
     "skipLibCheck": true
   },
-  "include": ["src/**/*.ts", "scripts/**/*.ts"]
+  "include": ["src/**/*.ts", "scripts/**/*.ts"],
+  // Dev-only live check; it reads LSI's schema from a sibling checkout that CI does not have.
+  "exclude": ["scripts/lsi-success.ts"]
 }
