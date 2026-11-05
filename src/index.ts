@@ -27,19 +27,39 @@ if (!args.includes("--help") && !args.includes("-h")) {
 }
 if (args.includes("--help") || args.includes("-h")) {
   console.log(
-    "kest [directory] [--permission all|minimal|strict]\nkest --prompt <message> [--research --budget 10$ [--auto-publish]] [--permission all|minimal|strict]\n\nBun coding agent · /connect · /help inside the TUI\nStrict is the default. Headless mode denies actions that require approval.",
+    "kest [directory] [--permission all|minimal|strict]\nkest --prompt <message> [--research --budget 10$ [--auto-publish|--no-publish]] [--permission all|minimal|strict]\nkest --resume <all|study-id> [--budget 12$] [--auto-publish]   continue unfinished studies in this folder\n\nBun coding agent · /connect · /help inside the TUI\nStrict is the default. Headless mode denies actions that require approval.",
   );
-} else if (args.includes("--prompt")) {
+} else if (args.includes("--prompt") || args.includes("--resume")) {
+  // Headless runs reach LSI only when asked to (--auto-publish). Otherwise LSI is switched off for the
+  // whole process, so even --permission all cannot post, claim or publish. --no-publish forces it off.
+  if (args.includes("--no-publish") || !args.includes("--auto-publish")) process.env.KEST_NO_LSI = "1";
   const { Agent } = await import("./agent");
   const { loadCredentials } = await import("./config");
-  const credentials = await loadCredentials();
-  const prompt = args[args.indexOf("--prompt") + 1];
+  let credentials = await loadCredentials();
+  // --model <id> picks a catalogued model and the saved key of its provider for this run only.
+  let chosenModel: string | null = null;
+  if (args.includes("--model")) {
+    const { MODELS, loadStore, activeKey } = await import("./config");
+    const want = args[args.indexOf("--model") + 1] ?? "";
+    const option = MODELS.find((m) => m.id.toLowerCase() === want.toLowerCase());
+    const key = option ? activeKey(await loadStore(), option.provider) : null;
+    if (!option || !key) {
+      console.error(option ? `No saved key for ${option.provider}. Run kest and /connect ${option.provider}.` : `Unknown model "${want}". Known: ${MODELS.map((m) => m.id).join(", ")}`);
+      process.exit(1);
+    }
+    credentials = key.credential;
+    chosenModel = option.id;
+  }
+  const resumeAt = args.indexOf("--resume");
+  const resumeTarget = resumeAt >= 0 ? (args[resumeAt + 1]?.startsWith("--") ? "all" : args[resumeAt + 1] ?? "all") : null;
+  const prompt = resumeTarget ? "resume" : args[args.indexOf("--prompt") + 1];
   if (!credentials || !prompt) {
     console.error("Run kest and /connect first, then use --prompt <message>.");
     process.exitCode = 1;
   } else {
     const controller = new AbortController();
     process.on("SIGINT", () => controller.abort());
+    const runOne = async (prompt: string, resume?: import("./sessions").Session) => {
     const denied: string[] = [];
     const agent = new Agent(
       process.cwd(),
@@ -53,7 +73,26 @@ if (args.includes("--help") || args.includes("-h")) {
       },
     );
     const published: string[] = [];
-    if (args.includes("--research")) {
+    if (chosenModel) agent.modelOverride = chosenModel;
+    if (resume?.research) {
+      const { recoverCompany, parseCostBudget } = await import("./research-company");
+      const study = resume.research;
+      await recoverCompany(process.cwd(), study);
+      const topUp = args.includes("--budget") ? args[args.indexOf("--budget") + 1] : undefined;
+      if (topUp) study.maxCostUsd = parseCostBudget(topUp);
+      const used = study.spentCostMicros + study.estimatedCostMicros;
+      if (study.maxCostUsd === null || (study.status === "budget_exhausted" && !topUp) || Math.round(study.maxCostUsd * 1_000_000) <= used) {
+        console.error(`skipped ${study.id.slice(0, 8)}: no budget left (spent $${(used / 1_000_000).toFixed(2)}). Add --budget <new total>$ to continue.`);
+        process.exitCode = process.exitCode || 3;
+        return;
+      }
+      study.status = "paused";
+      if (args.includes("--auto-publish")) study.autoPublish = true;
+      agent.research = study;
+      agent.messages = resume.messages;
+      prompt = `Resume research/${study.id}/ from the saved checkpoint. Read the saved report, worker findings and relevant evidence before choosing the next unresolved task; do not repeat completed experiments. Objective: ${study.objective}\nUse research_status for spending. Reserve funding for independent review; call research_complete only with a reviewed report.`;
+    }
+    if (args.includes("--research") && !resume) {
       const { newCompany, parseCostBudget } =
         await import("./research-company");
       const budget = args[args.indexOf("--budget") + 1];
@@ -71,8 +110,8 @@ if (args.includes("--help") || args.includes("-h")) {
     const { publishedIds, runReport } = await import("./headless");
     const { newSession, saveSession } = await import("./sessions");
     const { recordUsage, flushUsage } = await import("./usage");
-    const session = newSession(process.cwd(), agent.messages);
-    session.title = prompt.slice(0, 80);
+    const session = resume ?? newSession(process.cwd(), agent.messages);
+    if (!resume) session.title = prompt.slice(0, 80);
     session.entries.push({ role: "you", text: prompt });
     if (agent.research) {
       session.research = agent.research;
@@ -181,6 +220,20 @@ if (args.includes("--help") || args.includes("-h")) {
         if (report.exitCode && !process.exitCode) process.exitCode = report.exitCode;
       }
     }
+    };
+    if (resumeTarget) {
+      const { listSessions } = await import("./sessions");
+      const open = (await listSessions(process.cwd())).filter((s) => s.research && s.research.status !== "completed");
+      const picked = resumeTarget === "all" ? open : open.filter((s) => s.research!.id.startsWith(resumeTarget) || s.id.startsWith(resumeTarget));
+      if (!picked.length) {
+        console.error(resumeTarget === "all" ? "No unfinished studies in this folder." : `No unfinished study matches "${resumeTarget}".`);
+        process.exitCode = 1;
+      } else console.error(`Resuming ${picked.length} stud${picked.length === 1 ? "y" : "ies"} one after another.`);
+      for (const s of picked) {
+        if (controller.signal.aborted) break;
+        await runOne("resume", s);
+      }
+    } else await runOne(prompt);
   }
 } else {
   const { resolve } = await import("node:path");

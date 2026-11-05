@@ -14,6 +14,7 @@ import {
   connectionFailure,
 } from "./tool-display";
 import { savePermission } from "./config";
+import { activityHead, activityKind, requestCost, teamBody, teamHead, workerRow, type WorkerStat } from "./team-view";
 import {
   autoApprove,
   parsePermission,
@@ -77,7 +78,7 @@ import {
   deleteSession,
   loadLocalChat,
 } from "./sessions";
-import { Room, RoomManager, roomList, roomOrder, statusSymbol, studySpentUsd } from "./rooms";
+import { Room, RoomManager, roomLabel, roomList, roomOrder, statusSymbol, studyCard, studySpentUsd } from "./rooms";
 import { loadCompanyLimits, saveCompanyLimits } from "./company-settings";
 import { formatStudyTab, loadStudyArtifacts, studyTabs, type StudyTab } from "./study-view";
 import {
@@ -209,6 +210,7 @@ export class KestUI {
   private secretText: TextRenderable;
   private hints: TextRenderable;
   private roomBar: TextRenderable;
+  private studyCardBar: TextRenderable;
   private procBar: TextRenderable;
   private tipRow: BoxRenderable;
   private tipText: TextRenderable;
@@ -270,11 +272,16 @@ export class KestUI {
       meta: Extract<AgentEvent, { type: "worker" }>;
       entry: Entry;
       view: ToolView;
-      log: string;
+      /** Activity group id: this worker's own tool-call rows hang under it. */
+      group: string;
+      pending: ToolView[];
       latest: string;
       renderedAt: number;
+      stat: WorkerStat;
     }
   >();
+  /** Teams started so far in this room, for "Team 2". */
+  private teamCount = 0;
   private loadingTimer: ReturnType<typeof setInterval> | null = null;
   private loadingLabel = "Kesting…";
   private idleVerb = "Kesting…";
@@ -299,6 +306,8 @@ export class KestUI {
     node: TextRenderable;
     view: ToolView;
     children: ToolView[];
+    ids: Set<string>;
+    number: number;
   } | null = null;
   private toolGroup: {
     entry: Entry;
@@ -310,6 +319,7 @@ export class KestUI {
     totalMs: number;
     running: number;
     names: string[];
+    kinds: Map<string, number>;
   } | null = null;
   private groupHeads = new Set<ToolView>();
   private activityGroups = new Map<
@@ -411,6 +421,14 @@ export class KestUI {
       fg: theme.accent,
       height: 1,
       flexShrink: 0,
+    });
+    this.studyCardBar = new TextRenderable(renderer, {
+      content: "",
+      visible: false,
+      fg: theme.muted,
+      height: 1,
+      flexShrink: 0,
+      wrapMode: "none",
     });
     this.roomBar = new TextRenderable(renderer, {
       content: "",
@@ -573,6 +591,7 @@ export class KestUI {
         this.jumpToBottom();
       },
     });
+    root.add(this.studyCardBar);
     root.add(this.scroll);
     root.add(this.activity);
     root.add(this.status);
@@ -715,6 +734,7 @@ export class KestUI {
       return `Prepared "${session.title}" with a ${budget} total allowance and started it in the background in its own room. The screen stays on this chat. Tell the user briefly that it is running (strict budget: it will conclude and publish within the allowance, no extra funding) and that they can keep chatting or prepare another idea; do not repeat the setup steps.`;
     };
     agent.onStartPrepared = async () => this.startAllPrepared();
+    agent.onResumeAll = async () => this.startAllPrepared(true);
     agent.onListResearch = async () => this.listStudies();
     agent.onDeleteResearch = async (id) => this.deleteStudy(id);
     agent.onNotifyControl = (kind, title, body) => {
@@ -918,7 +938,7 @@ export class KestUI {
         ? undefined
         : this.session.research);
     return study
-      ? `Research paused · progress checkpointed in research/${study.id}/ · choose below or /research resume.`
+      ? `Research paused · checkpoint saved · /research resume`
       : "Stopped. Completed tool actions are kept.";
   }
 
@@ -1044,13 +1064,14 @@ export class KestUI {
       room.agent.publishNow = false;
       room.agent.wrappingUp = false;
       await saveSession(room.session);
-      this.toast(`study started in background · $${(study.maxCostUsd ?? 0).toFixed(2)} strict budget`);
+      const resuming = study.status !== "ready";
+      this.toast(`study ${resuming ? "resumed" : "started"} in background · $${(study.maxCostUsd ?? 0).toFixed(2)} budget`);
       const strict = study.strictBudget
         ? "\nSTRICT BUDGET: the allowance is final. Never propose or request extra funding. Plan to finish inside it and conclude with research_complete (limitations and unanswered questions stated honestly) even if the result is partial."
         : "";
       await this.runTurn(
         room,
-        `Research objective: ${study.objective}\nUse the research company workflow. Save reproducible evidence in research/${study.id}/. Check research_status for the shared allowance. Reserve funding for independent review; call research_complete only with a reviewed report.${strict}${lsiKey() ? " Publish the reviewed findings to LSI with lsi_publish when complete, answering the LSI question named in the objective." : ""}`,
+        `${resuming ? `Resume research/${study.id}/ from the saved checkpoint. Read the saved report, worker findings and relevant evidence before choosing the next unresolved task; do not repeat completed experiments. Objective: ${study.objective}\nUse research_status for spending.` : `Research objective: ${study.objective}\nUse the research company workflow. Save reproducible evidence in research/${study.id}/. Check research_status for the shared allowance.`} Reserve funding for independent review; call research_complete only with a reviewed report.${strict}${lsiKey() ? " Publish the reviewed findings to LSI with lsi_publish when complete, answering the LSI question named in the objective." : ""}`,
       );
     } catch (error) {
       room.buffer.push({ type: "note", text: this.errorText(error) });
@@ -1192,7 +1213,7 @@ export class KestUI {
       const free = this.rooms.limits.maxRunning - this.rooms.running().length - this.pendingStarts;
       if (free <= 0) return;
       const next = this.startQueue.shift()!;
-      if (next.study?.status !== "ready" || next.running) continue;
+      if (!["ready", "paused", "running"].includes(next.study?.status ?? "") || next.running) continue;
       this.pendingStarts++;
       void this.runStudyInBackground(next).finally(() => (this.pendingStarts = Math.max(0, this.pendingStarts - 1)));
     }
@@ -1201,11 +1222,21 @@ export class KestUI {
   private pendingStarts = 0;
 
   /** Start every prepared study that has a budget, in the background, up to the concurrent-run limit. */
-  private async startAllPrepared(): Promise<string> {
-    if (!this.credentials) return "No model provider is connected: tell the user to run /connect, then start the studies.";
+  private async startAllPrepared(resume = false): Promise<string> {
+    if (!this.credentials) return `No model provider is connected: tell the user to run /connect, then ${resume ? "resume" : "start"} the studies.`;
     await this.loadSavedStudies();
-    const ready = this.rooms.studies().filter((r) => r.study?.status === "ready" && !r.running);
-    if (!ready.length) return "No prepared studies are waiting. Prepare some with research_prepare first.";
+    const all = this.rooms.studies().filter((r) => !r.running);
+    const ready = all.filter((r) => (resume ? r.study?.status === "paused" || r.study?.status === "running" : r.study?.status === "ready"));
+    if (!ready.length) {
+      if (!resume) return "No prepared studies are waiting. Prepare some with research_prepare first.";
+      const broke = all.filter((r) => r.study?.status === "budget_exhausted");
+      const fresh = all.filter((r) => r.study?.status === "ready");
+      return [
+        "No paused studies to resume.",
+        broke.length ? `Out of budget (need the user to raise it with /research budget <study> N$): ${broke.map((r) => `"${r.title.slice(0, 50)}"`).join("; ")}.` : "",
+        fresh.length ? `${fresh.length} prepared stud${fresh.length === 1 ? "y has" : "ies have"} not started; use research_start_all.` : "",
+      ].filter(Boolean).join("\n");
+    }
     const withBudget = ready.filter((r) => r.study!.maxCostUsd !== null);
     const noBudget = ready.filter((r) => r.study!.maxCostUsd === null);
     let slots = Math.max(0, this.rooms.limits.maxRunning - this.rooms.running().length - this.pendingStarts);
@@ -1219,10 +1250,12 @@ export class KestUI {
       void this.runStudyInBackground(room).finally(() => (this.pendingStarts = Math.max(0, this.pendingStarts - 1)));
     }
     for (const room of queued) if (!this.startQueue.includes(room)) this.startQueue.push(room);
-    if (started.length) this.toast(`${started.length} stud${started.length === 1 ? "y" : "ies"} started in background`);
+    if (started.length) this.toast(`${started.length} stud${started.length === 1 ? "y" : "ies"} ${resume ? "resumed" : "started"} in background`);
+    const broke = resume ? all.filter((r) => r.study?.status === "budget_exhausted") : [];
     const label = (r: Room) => `"${r.title.slice(0, 50)}" ($${r.study!.maxCostUsd?.toFixed(2) ?? "?"})`;
     return [
-      started.length ? `Started in the background: ${started.map(label).join("; ")}.` : "Nothing was started.",
+      started.length ? `${resume ? "Resumed" : "Started"} in the background: ${started.map(label).join("; ")}.` : `Nothing was ${resume ? "resumed" : "started"}.`,
+      broke.length ? `Out of budget, not resumed (the user can raise it with /research budget <study> N$): ${broke.map((r) => `"${r.title.slice(0, 50)}"`).join("; ")}.` : "",
       queued.length ? `Queued (only ${this.rooms.limits.maxRunning} studies run at once; these start automatically as others finish, or raise /research parallel up to 10): ${queued.map(label).join("; ")}.` : "",
       allowanceUsed ? `Not started: the total allowance is used up; raise /research total.` : "",
       noBudget.length ? `Skipped, no budget set: ${noBudget.map((r) => `"${r.title.slice(0, 50)}"`).join("; ")}.` : "",
@@ -1322,6 +1355,7 @@ export class KestUI {
   private emitFor(room: Room) {
     return (event: AgentEvent) => {
       if (this.closed) return;
+      room.track(event);
       if (this.rooms.focused === room) this.event(event);
       else this.observe(room, event);
     };
@@ -1475,6 +1509,12 @@ export class KestUI {
       focused?.kind === "study"
         ? "to director ❯ direct this study…  /chat leaves"
         : "Build, fix, explain…  /help";
+    const card = focused ? studyCard(focused, Math.max(20, this.renderer.width - 4), performance.now()) : [];
+    this.studyCardBar.visible = card.length > 0;
+    if (card.length) {
+      this.studyCardBar.content = card.join("\n");
+      this.studyCardBar.height = card.length;
+    }
     if (rooms.length < 2) {
       this.roomBar.visible = false;
       return;
@@ -1893,7 +1933,7 @@ export class KestUI {
       if (entry.parentActivityGroup) {
         const group = this.activityGroups.get(entry.parentActivityGroup);
         group?.children.push(tool);
-        block.visible = group?.head.expanded ?? true;
+        block.visible = group ? this.groupVisible(entry.parentActivityGroup) : true;
       }
       this.lastTool = tool;
       this.renderTool(tool);
@@ -2356,6 +2396,13 @@ export class KestUI {
     if (key.ctrl && key.name === "k" && this.rooms.list().length > 1) {
       key.preventDefault();
       this.openRoomPicker();
+      return;
+    }
+    if (key.ctrl && key.name === "t" && !!this.rooms.focused?.research) {
+      key.preventDefault();
+      const room = this.rooms.focused;
+      room.teamOpen = !room.teamOpen;
+      this.drawBar();
       return;
     }
     if (key.ctrl && key.name === "o" && this.lastTool) {
@@ -2900,15 +2947,24 @@ export class KestUI {
 
   private workerEvent(event: Extract<AgentEvent, { type: "worker" }>) {
     let worker = this.workerViews.get(event.workerId);
+    if (!worker && this.teamGroup) {
+      // A worker that appears after every member of the current team finished belongs to a new team.
+      const members = [...this.teamGroup.ids].map((id) => this.workerViews.get(id));
+      if (members.every((m) => !m || m.stat.state !== "running")) {
+        this.teamGroup = null;
+        this.teamFeed = [];
+      }
+    }
     if (!worker) {
       // Hybrid team UI: one head per team; each worker keeps its OWN row
       // (old UI) hidden under the head until the head is expanded.
       // Every worker row individually expands to its own live activity log.
       if (!this.teamGroup) {
         this.teamFeed = [];
+        this.teamCount++;
         const head = this.add(
           "tool",
-          "→ Research team",
+          `→ Research team ${this.teamCount}`,
           {
             input:
               "Research team — expand the head for per-worker rows, then expand a worker for its live tool activity. /agents <id> inspects a saved transcript.",
@@ -2925,18 +2981,20 @@ export class KestUI {
           view,
           children: this.activityGroups.get(head.entry.activityGroup!)!
             .children,
+          ids: new Set(),
+          number: this.teamCount,
         };
       }
       const team = this.teamGroup;
+      team.ids.add(event.workerId);
+      // The worker row is itself a group: its Input is the task it was given, its Output is what it
+      // returned, and its tool calls are rows under it, like the Activity group of a normal turn.
+      const group = crypto.randomUUID();
       const added = this.add(
         "tool",
         `→ ${event.role} ${event.workerId.slice(0, 8)} · ${event.model}`,
-        {
-          input: `Task: ${event.task}\nRole: ${event.role}\nModel: ${event.model}\nParent: ${event.parentId}\nDepth: ${event.depth}\n\nClick this row for live activity. /agents ${event.workerId.slice(0, 8)} inspects its transcript.`,
-          output: "Starting…",
-          language: "text",
-        },
-        { parentActivityGroup: team.entry.activityGroup },
+        { input: event.task, output: "Running…", language: "text" },
+        { parentActivityGroup: team.entry.activityGroup, activityGroup: group },
       );
       const childView = this.toolViews.get(added.node as TextRenderable)!;
       if (childView.block && !childView.block.isDestroyed) childView.block.visible = team.view.expanded;
@@ -2944,23 +3002,45 @@ export class KestUI {
         meta: event,
         entry: added.entry,
         view: childView,
-        log: "",
+        group,
+        pending: [],
         latest: "Starting",
         renderedAt: 0,
+        stat: {
+          workerId: event.workerId,
+          parentId: event.parentId,
+          role: event.role,
+          model: event.model,
+          task: event.task,
+          depth: event.depth,
+          state: "running",
+          calls: 0,
+          usd: 0,
+          startedAt: performance.now(),
+          latest: "Starting",
+        },
       };
       this.workerViews.set(event.workerId, worker);
     }
     worker.meta = event;
+    const stat = worker.stat;
+    if (event.usage) stat.usd += requestCost(event.usage.model, event.usage.input, event.usage.output);
+    stat.state = event.state;
+    if (event.state !== "running") {
+      stat.endedAt ??= performance.now();
+      stat.output = event.output;
+    }
     const activity = event.event;
     if (activity?.type === "tool") {
       worker.latest = `${actionLabel(activity.name, activity.args)} · ${activity.state}`;
+      if (activity.state !== "running") stat.calls++;
       if (activity.state !== "running") {
         this.teamFeed.push(
           `${activity.state === "error" ? "✕" : "✓"} ${event.role} ${event.workerId.slice(0, 6)} · ${brief(actionLabel(activity.name, activity.args), 70)}${activity.durationMs === undefined ? "" : ` · ${formatDuration(activity.durationMs)}`}`,
         );
         if (this.teamFeed.length > 8) this.teamFeed.shift();
       }
-      worker.log += `\n[${activity.state}] ${activity.name}${activity.durationMs === undefined ? "" : ` · ${formatDuration(activity.durationMs)}`}\n${activity.state === "running" ? activity.args : (activity.output ?? "")}\n`;
+      this.workerToolRow(worker, activity);
       if (activity.state !== "running" && activity.durationMs !== undefined)
         (this.session.toolStats ??= []).push({
           name: activity.name,
@@ -2972,22 +3052,14 @@ export class KestUI {
         });
     } else if (activity?.type === "status") {
       worker.latest = activity.text;
-      worker.log += `\n[status] ${activity.text}\n`;
-    } else if (activity?.type === "text") worker.log += activity.delta;
-    else if (activity?.type === "response") worker.log += "\n[assistant]\n";
+    }
     if (event.state !== "running") {
       worker.latest = event.state === "done" ? "Completed" : "Failed";
-      worker.log += `\n[${worker.latest}]\n${event.output ?? ""}\n`;
+      // Output is what the worker returned, not a log of how it got there.
+      worker.entry.detail!.output = event.output || "(no output)";
     }
-    // Bound the live preview; complete messages are saved with the worker.
-    if (worker.log.length > 24000)
-      worker.log =
-        "[Earlier activity omitted from live preview; see saved transcript]\n" +
-        worker.log.slice(-23000);
-    // Own row, old style: status + role/id/model + latest tool, expandable
-    // to this worker's live log (with per-tool timings).
-    worker.entry.text = `${event.state === "done" ? "✓" : event.state === "error" ? "✕" : "→"} ${event.role} ${event.workerId.slice(0, 8)} · ${truncateMiddle(event.model, 36)} · ${brief(worker.latest, 70)}`;
-    worker.entry.detail!.output = worker.log || "Starting…";
+    stat.latest = brief(worker.latest, 60);
+    worker.entry.text = this.workerRowText(worker);
     if (
       activity?.type === "text" &&
       performance.now() - worker.renderedAt < 100
@@ -2998,6 +3070,44 @@ export class KestUI {
     this.renderTeamGroup();
   }
 
+  /** One row per tool call a worker makes, with the call's real arguments and result. */
+  private workerToolRow(
+    worker: NonNullable<ReturnType<KestUI["workerViews"]["get"]>>,
+    activity: Extract<NonNullable<Extract<AgentEvent, { type: "worker" }>["event"]>, { type: "tool" }>,
+  ) {
+    const language = activity.name === "shell" ? "TypeScript" : "JSON";
+    let input = activity.args;
+    if (activity.name === "shell") {
+      try {
+        input = JSON.parse(activity.args).command ?? activity.args;
+      } catch {
+        /* Keep raw input. */
+      }
+    }
+    if (activity.state === "running") {
+      const added = this.add(
+        "tool",
+        `→ ${brief(actionLabel(activity.name, activity.args), 180)}`,
+        { input, output: "Running…", language, toolName: activity.name },
+        { parentActivityGroup: worker.group },
+      );
+      const view = this.toolViews.get(added.node as TextRenderable)!;
+      view.callId = activity.callId;
+      view.toolName = activity.name;
+      view.rawArgs = activity.args;
+      worker.pending.push(view);
+      return;
+    }
+    let at = worker.pending.findIndex((v) => (activity.callId ? v.callId === activity.callId : v.toolName === activity.name && v.rawArgs === activity.args));
+    if (at < 0 && !activity.callId) at = worker.pending.findIndex((v) => v.toolName === activity.name);
+    const row = at < 0 ? undefined : worker.pending.splice(at, 1)[0];
+    if (!row) return;
+    const took = activity.durationMs === undefined ? "" : ` · ${formatDuration(activity.durationMs)}`;
+    row.entry.text = `${activity.state === "error" ? "✕" : "✓"} ${row.entry.text.split("\n")[0]!.slice(2)}${took}`;
+    row.entry.detail = { input, output: activity.output ?? "", language, toolName: activity.name };
+    this.renderTool(row);
+  }
+
   private applyTeamVisibility() {
     const team = this.teamGroup;
     if (!team) return;
@@ -3005,29 +3115,33 @@ export class KestUI {
       if (child.block && !child.block.isDestroyed) child.block.visible = team.view.expanded;
   }
 
+  private teamWorkers(team: NonNullable<KestUI["teamGroup"]>) {
+    return [...team.ids].map((id) => this.workerViews.get(id)).filter((w) => !!w);
+  }
+
+  private workerRowText(worker: NonNullable<ReturnType<KestUI["workerViews"]["get"]>>) {
+    const team = this.teamGroup;
+    const stats = team ? this.teamWorkers(team).map((w) => w.stat) : [worker.stat];
+    const base = Math.min(...stats.map((w) => w.depth));
+    return workerRow(worker.stat, performance.now(), base);
+  }
+
   private renderTeamGroup() {
     const team = this.teamGroup;
     if (!team) return;
-    const workers = [...this.workerViews.values()];
-    const running = workers.filter((w) => w.meta.state === "running").length;
-    const done = workers.filter((w) => w.meta.state === "done").length;
-    const failed = workers.filter((w) => w.meta.state === "error").length;
-    const roles = [...new Set(workers.map((w) => w.meta.role))].join(", ");
-    const live = workers.find((w) => w.meta.state === "running");
-    team.entry.text =
-      running > 0
-        ? `→ Research team · ${workers.length} ${roles} · ${running} running${done ? ` · ${done} done` : ""}${failed ? ` · ${failed} failed` : ""}${live ? ` · ${truncateMiddle(live.latest, 48)}` : ""}`
-        : `${failed ? "✕" : "✓"} Research team · ${done}/${workers.length} done${failed ? ` · ${failed} failed` : ""}`;
-    // Head detail stays a thin index; per-tool logs live on worker rows.
+    const workers = this.teamWorkers(team);
+    if (!workers.length) return;
+    const stats = workers.map((w) => w.stat);
+    const now = performance.now();
+    team.entry.text = teamHead(stats, team.number, now);
+    // The head lists every worker's row and the newest tool calls; per-tool logs live on the rows.
     team.entry.detail!.output = [
       ...(this.teamFeed.length ? ["Recent tool calls:", ...this.teamFeed.map((l) => `  ${l}`), ""] : []),
-      ...workers
-      .map(
-        (w) =>
-          `${w.meta.state === "done" ? "✓" : w.meta.state === "error" ? "✕" : "→"} ${w.meta.role} ${w.meta.workerId.slice(0, 8)} · ${truncateMiddle(w.meta.model, 36)} · ${w.latest}`,
-      ),
+      teamBody(stats, now),
     ].join("\n");
-    if (failed > 0 && running === 0) team.view.expanded = true;
+    const failed = stats.some((w) => w.state === "error");
+    const running = stats.some((w) => w.state === "running");
+    if (failed && !running) team.view.expanded = true;
     if (!team.view.node.isDestroyed) this.renderTool(team.view);
     this.applyTeamVisibility();
   }
@@ -3124,12 +3238,15 @@ export class KestUI {
           totalMs: 0,
           running: 0,
           names: [],
+          kinds: new Map(),
         };
       }
       const group = this.toolGroup;
       group.count++;
       group.running++;
       if (!group.names.includes(event.name)) group.names.push(event.name);
+      const kind = activityKind(event.name);
+      group.kinds.set(kind, (group.kinds.get(kind) ?? 0) + 1);
       const tool = this.add(
         "tool",
         event.name === "shell"
@@ -3211,11 +3328,19 @@ export class KestUI {
       this.toolEntry = null;
     }
   }
+  /** A group's rows show when its head is open and, for a worker, the team it belongs to is open too. */
+  private groupVisible(id: string): boolean {
+    const group = this.activityGroups.get(id);
+    if (!group) return true;
+    const parent = group.head.entry.parentActivityGroup;
+    return group.head.expanded && (parent ? this.groupVisible(parent) : true);
+  }
   private applyGroupVisibility() {
-    for (const group of this.activityGroups.values())
+    for (const [id, group] of this.activityGroups) {
+      const visible = this.groupVisible(id);
       for (const child of group.children)
-        if (child.block && !child.block.isDestroyed)
-          child.block.visible = group.head.expanded;
+        if (child.block && !child.block.isDestroyed) child.block.visible = visible;
+    }
   }
 
   private renderToolGroup() {
@@ -3225,7 +3350,7 @@ export class KestUI {
     group.entry.text =
       group.running > 0
         ? `→ Activity · ${done}/${group.count} done · ${brief(group.children.at(-1)?.entry.text.split("\n")[0]?.slice(2) ?? "Working", 70)}`
-        : `${group.failures ? "✕" : "✓"} Activity · ${group.count} ${group.count === 1 ? "action" : "actions"} · ${formatDuration(group.totalMs)} total action time${group.failures ? ` · ${group.failures} failed` : ""}`;
+        : activityHead(group.count, group.kinds, group.totalMs, group.failures, formatDuration);
     group.entry.text += `\nTechnical tools: ${group.names.join(", ")}\nExpand each action for its input, output and timing. Concurrent action times overlap.`;
     // Failures auto-expand the head so the failed row is visible.
     if (group.failures > 0 && group.running === 0) group.view.expanded = true;
@@ -3450,7 +3575,13 @@ export class KestUI {
         this.info(
           record
             ? brief(workerTranscript(record), 60000)
-            : `${live!.entry.detail!.input}\n\n${live!.log}`,
+            : [
+                `Task\n${live!.entry.detail!.input}`,
+                ...(this.activityGroups.get(live!.group)?.children ?? []).map(
+                  (call) => `${call.entry.text.split("\n")[0]}\n${call.entry.detail?.output ?? ""}`,
+                ),
+                `Output\n${live!.entry.detail!.output}`,
+              ].join("\n\n"),
         );
       }
       return;
@@ -3474,6 +3605,10 @@ export class KestUI {
     if (command === "/research") {
       const [action, ...rest] = value.split(/\s+/);
       let parts = rest;
+      if (action === "resume" && parts.join(" ").trim().toLowerCase() === "all") {
+        this.info(await this.startAllPrepared(true));
+        return;
+      }
       let budgetOp: "set" | "add" | "remove" = "set";
       // "/research wrapup now" (or `publish now`): finish and publish without another review round.
       const wrapNow = action === "wrapup" && rest.at(-1) === "now";
@@ -3860,7 +3995,7 @@ export class KestUI {
             ? `Research objective: ${study.objective}\nUse the research company workflow. Save reproducible evidence in research/${study.id}/. Check research_status for the shared allowance. Reserve funding for independent review; call research_complete only with a reviewed report.`
             : `Resume research/${study.id}/ from the saved checkpoint. Objective: ${study.objective}\nUse research_status for spending. Read the saved report, worker findings and relevant evidence before choosing the next unresolved task. Do not repeat completed experiments or read the whole event journal for status. Keep the shared allowance and obtain independent review before research_complete.`,
       );
-      await this.submit("Research instructions · expand to inspect");
+      await this.submit(action === "wrapup" ? "Wrapping up research" : study.status === "ready" ? "Starting research" : "Resuming research");
       return;
     }
     if (command === "/browser") {
@@ -4297,6 +4432,7 @@ export class KestUI {
   private clearView() {
     this.workerViews.clear();
     this.teamGroup = null;
+    this.teamCount = 0;
     this.toolGroup = null;
     this.groupHeads.clear();
     this.activityGroups.clear();
@@ -4356,16 +4492,9 @@ export class KestUI {
   }
   private openRoomPicker() {
     if (this.approval || this.connectStep || this.listPicker) return;
-    const rooms = this.rooms.list();
+    const rooms = roomOrder(this.rooms);
     const here = this.rooms.focused;
-    const labels = rooms.map((room) => {
-      const study = room.study;
-      const spend =
-        study && study.maxCostUsd !== null
-          ? `  $${studySpentUsd(study).toFixed(1)}/${study.maxCostUsd}`
-          : "";
-      return `${statusSymbol(room.status)} ${room.title}${spend}  ${room.status}${room === here ? "  (here)" : ""}`;
-    });
+    const labels = rooms.map((room) => roomLabel(room, here ?? null));
     this.openListPicker(
       "Rooms · Enter opens · Esc closes",
       labels,

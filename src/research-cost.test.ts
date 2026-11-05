@@ -96,6 +96,28 @@ test("parallel calls reserve shared dollars and missing usage is charged conserv
   expect(state.requests).toBe(2);
 });
 
+test("cache-hit input settles at the cached rate only when one is published", async () => {
+  const state = funded(1);
+  state.costRates[costKey("fixture", "a")] = { input: 10, output: 20, cached: 1 };
+  const runtime = new CompanyRuntime(state);
+  const reserve = () =>
+    runtime.acquire("fixture", "a", AbortSignal.timeout(2000), undefined, {
+      input: 1000,
+      output: 100,
+    });
+  // 800 of 1000 input tokens were cache hits: 200*10 + 800*1 + 50*20.
+  (await reserve())({ input: 1000, output: 50, cached: 800 });
+  expect(state.spentCostMicros).toBe(3800);
+  // Cached count can never exceed the input it is part of.
+  (await reserve())({ input: 100, output: 0, cached: 5000 });
+  expect(state.spentCostMicros).toBe(3800 + 100);
+  // No published cached rate: cache hits cost the full input rate.
+  state.costRates[costKey("fixture", "b")] = { input: 10, output: 20 };
+  const plain = await runtime.acquire("fixture", "b", AbortSignal.timeout(2000), undefined, { input: 100, output: 10 });
+  plain({ input: 100, output: 0, cached: 90 });
+  expect(state.spentCostMicros).toBe(3900 + 1000);
+});
+
 test("persisted reservations survive crashes and extensions retain consumption and frozen rates", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "kest-cost-recovery-"));
   const state = funded();

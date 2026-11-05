@@ -16,6 +16,7 @@ import {
   MODAL_MODEL,
   NEBIUS_MODEL,
   modelPricing,
+  MODELS,
   type ModelPricing,
   type Provider,
 } from "./config";
@@ -25,6 +26,8 @@ export type ModelConnection = {
   baseURL: string;
   apiKey: string;
   model: string;
+  /** Set when the user fixed the model, so every descendant keeps it. */
+  pinned?: boolean;
 };
 type BuiltinProfile = { name: string; provider: Provider; model: string };
 type EndpointProfile = {
@@ -40,7 +43,33 @@ const defaults: BuiltinProfile[] = [
   { name: "nebius", provider: "nebius", model: NEBIUS_MODEL },
   { name: "modal", provider: "modal", model: MODAL_MODEL },
   { name: "baseten", provider: "baseten", model: BASETEN_MODEL },
+  { name: "deepseek", provider: "nebius", model: "deepseek-ai/DeepSeek-V4.1-Flash-1017" },
 ];
+
+/** Model ids Kest knows for a built-in provider (its default plus the catalog). */
+const testModels = new Set<string>();
+/** Tests only: serve these fixture ids on every built-in provider. */
+export function allowModelsForTests(ids: string[]) {
+  for (const id of ids) testModels.add(id);
+}
+export function modelsOf(provider: string): string[] {
+  return [...new Set([...testModels, aliasDefaultModel(provider), ...MODELS.filter((m) => m.provider === provider).map((m) => m.id)].filter((m): m is string => Boolean(m)))];
+}
+
+/**
+ * Whether `model` exists on the connection's provider. Built-in providers only serve the models in
+ * the catalog (so every call is priced); custom endpoints are the user's own and are not checked.
+ */
+export function modelAllowedFor(provider: string, model: string, own: string): boolean {
+  if (provider === "custom" || model === own) return true;
+  return modelsOf(provider).includes(model);
+}
+
+const providerDefaults: Record<string, string> = { nebius: NEBIUS_MODEL, modal: MODAL_MODEL, baseten: BASETEN_MODEL };
+/** The model a built-in provider alias runs by default; the user's /model choice replaces it. */
+export function aliasDefaultModel(provider: string): string | undefined {
+  return providerDefaults[provider];
+}
 function storage() {
   const directory = process.env.KEST_CONFIG_DIR?.trim() || configDir;
   return { directory, file: join(directory, "research-models.json") };
@@ -187,6 +216,8 @@ export async function listResearchModels(): Promise<
     model: string;
     available: boolean;
     pricing: ModelPricing | null;
+    /** Other models this provider serves; pass one as `model` with this profile. */
+    models: string[];
   }>
 > {
   const [profiles, store] = await Promise.all([
@@ -198,6 +229,7 @@ export async function listResearchModels(): Promise<
     provider: profile.provider,
     model: profile.model,
     pricing: modelPricing(profile.provider, profile.model),
+    models: profile.provider === "custom" ? [profile.model] : modelsOf(profile.provider),
     available:
       profile.provider === "custom"
         ? Boolean(process.env[profile.apiKeyEnv]?.trim())
@@ -231,7 +263,7 @@ export async function resolveResearchModel(
     );
   return {
     provider: profile.provider,
-    ...endpointFor(key.credential),
+    ...endpointFor(key.credential, profile.model),
     model: profile.model,
   };
 }

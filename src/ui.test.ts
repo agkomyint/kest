@@ -1132,8 +1132,15 @@ test("parallel worker rows stream separate activity without overwriting the dire
     });
     // Hybrid team UI: head row + one row per worker, like normal tools.
     expect(first.entry).not.toBe(second.entry);
-    expect(first.entry.detail!.output).toContain("Measured evidence");
-    expect(second.entry.detail!.output).not.toContain("Measured evidence");
+    // The worker's own Input/Output are its task and its returned result, not a tool log.
+    expect(first.entry.detail!.input).toBe("Inspect research evidence");
+    expect(first.entry.detail!.output).toBe("Running…");
+    // Its tool calls are rows under it, each with the call's real input and output.
+    const calls = ui["activityGroups"].get(first.group)!.children;
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.entry.text).toContain("✓");
+    expect(calls[0]!.entry.detail).toMatchObject({ toolName: "read_file", input: "{}", output: "Measured evidence" });
+    expect(ui["activityGroups"].get(second.group)!.children).toHaveLength(0);
     const head = ui["teamGroup"]!.view;
     expect(head.entry.text).toContain("Research team");
     await testUI.renderOnce();
@@ -1152,7 +1159,7 @@ test("parallel worker rows stream separate activity without overwriting the dire
       output: "Provider unavailable",
     });
     expect(second.entry.text).toContain("✕");
-    expect(second.entry.detail!.output).toContain("Failed");
+    expect(second.entry.detail!.output).toBe("Provider unavailable");
     expect(head.entry.text).toContain("1 failed");
     ui["event"]({
       ...worker("aaaaaaaa-1111", "model-a"),
@@ -1160,7 +1167,7 @@ test("parallel worker rows stream separate activity without overwriting the dire
       output: "Evidence checked",
     });
     expect(first.entry.text).toContain("✓");
-    expect(first.entry.detail!.output).toContain("Completed");
+    expect(first.entry.detail!.output).toBe("Evidence checked");
     expect(head.entry.text).toContain("1/2 done");
     ui["event"]({
       type: "tool",
@@ -1550,7 +1557,7 @@ test("parallel actions retain their own output and timing, and groups expand aft
     ui["flushResponse"]();
     await renderer.renderOnce();
     expect(renderer.captureCharFrame()).toContain(
-      "2 actions · 120ms total action time",
+      "2 actions · 2 files · 120ms",
     );
     expect(renderer.captureCharFrame()).not.toContain("read_file");
     await renderer.mockMouse.click(group.view.node.x + 2, group.view.node.y);
@@ -1712,7 +1719,7 @@ test("tool timing appears on rows and /stats aggregates all saved sessions", asy
     }
     await testUI.renderOnce();
     expect(testUI.captureCharFrame()).toContain(
-      "Activity · 2 actions · 40ms total action time",
+      "Activity · 2 actions · 2 files · 40ms · 1 failed",
     );
     ui.composer.setText("/stats");
     ui.composer.submit();
@@ -2003,6 +2010,10 @@ test("a study keeps running in the background while chat is used, and replays wh
     await testUI.renderOnce();
     expect(ui["agent"]).toBe(room.agent);
     expect(testUI.captureCharFrame()).toContain("Director note alpha beta");
+    ui["drawBar"]();
+    await testUI.renderOnce();
+    expect(testUI.captureCharFrame()).toContain("phase  ");
+    expect(testUI.captureCharFrame()).toContain("Compare indexing");
     expect(room.question).toBeNull();
     ui["focusRoom"](chat);
     await testUI.renderOnce();

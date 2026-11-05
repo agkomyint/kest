@@ -62,7 +62,7 @@ test("read tools exclude writers; publish needs approval and is idempotent", asy
   const readNames = lsiReadToolDefinitions.map(t => (t.type === "function" ? t.function.name : ""));
   expect(readNames).not.toContain("lsi_publish");
   expect(readNames).not.toContain("lsi_claim");
-  expect(lsiToolDefinitions.length).toBe(13);
+  expect(lsiToolDefinitions.length).toBe(14);
 
   const seen: { url: string; init: RequestInit }[] = [];
   const approvals: string[] = [];
@@ -208,4 +208,26 @@ test("lsi_stats is a read; lsi_set_published is an approval-gated PATCH availabl
   expect(chat).toContain("lsi_set_published");
   expect(chat).not.toContain("lsi_publish");
   expect(lsiReadToolDefinitions.map(t => (t.type === "function" ? t.function.name : ""))).not.toContain("lsi_set_published");
+});
+
+test("lsi_post_questions skips near-duplicates before sending and posts the rest in one batch", async () => {
+  const sent: { url: string; body?: any }[] = [];
+  const tools = new LsiTools(async () => true, {
+    key: () => KEY, baseUrl: () => "https://lsi.test",
+    fetch: async (url: any, init: any) => {
+      sent.push({ url: String(url), body: init?.body ? JSON.parse(init.body) : undefined });
+      if (String(url).includes("/api/questions?")) return new Response(JSON.stringify({ results: [{ text: "Does graphene doping change thermal conductivity at room temperature?" }] }), { status: 200 });
+      return new Response(JSON.stringify({ created: 2, duplicate: 0, invalid: 0, results: [] }), { status: 201 });
+    },
+  });
+  const out = await tools.execute("lsi_post_questions", { questions: [
+    { text: "Does graphene doping change thermal conductivity at room temperature?", domain: "physics" },
+    { text: "Can acoustic metamaterials suppress turbulence-induced noise in ducts below 200 Hz?", domain: "physics" },
+    { text: "Can acoustic metamaterials suppress turbulence-induced noise in ducts below 200 Hz?", domain: "physics" },
+    { text: "Which sparse-coding priors predict receptive-field drift in mouse V1 over weeks?", domain: "neuroscience" },
+  ] }, new AbortController().signal);
+  const post = sent.find(s => s.url.endsWith("/api/questions/batch"))!;
+  expect(post.body.questions.map((q: any) => q.domain)).toEqual(["physics", "neuroscience"]);
+  expect(out).toContain("Skipped 2 near-duplicate");
+  await expect(tools.execute("lsi_post_questions", { questions: [] }, new AbortController().signal)).rejects.toThrow("1 to 100");
 });

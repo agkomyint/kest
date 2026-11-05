@@ -5,6 +5,7 @@ import { readdir, realpath, stat, mkdir } from "node:fs/promises";
 import { resolve, relative, isAbsolute, dirname, join } from "node:path";
 import { createPatch } from "diff";
 import { TavilyTools, isTavilyTool } from "./tavily";
+import { ScholarTools, isScholarTool } from "./scholar";
 import { LsiTools, isLsiTool } from "./lsi";
 import { kestGuide } from "./kest-guide";
 
@@ -205,6 +206,8 @@ export class WorkspaceTools {
     return (this.procs ??= new ProcClient(this.root));
   }
   private reads = new Map<string, string>();
+  private readSeen = new Map<string, { text: string; n: number }>();
+  private readCount = 0;
   private preparedShell: ReturnType<WorkspaceTools["startShell"]> | null = null;
 
   // Start the interpreter while the model is thinking; it receives no code until approval.
@@ -254,6 +257,7 @@ export class WorkspaceTools {
 
   // One per Tools so the retry and duplicate-claim guards see every call.
   private lsi?: LsiTools;
+  private scholar?: ScholarTools;
 
   private async path(
     input: string,
@@ -345,6 +349,8 @@ export class WorkspaceTools {
     if (name === "kest_guide") return kestGuide(args.topic);
     if (isLsiTool(name))
       return (this.lsi ??= new LsiTools(this.approve)).execute(name, args, signal);
+    if (isScholarTool(name))
+      return (this.scholar ??= new ScholarTools(this.approve)).execute(name, args, signal);
     if (isTavilyTool(name))
       return new TavilyTools(this.approve).execute(name, args, signal);
     if (name === "browser") {
@@ -489,6 +495,13 @@ ${code}`,
         throw new Error("offset and limit must be positive integers.");
       const lines = text.split("\n");
       const start = Number(offset) - 1;
+      const key = `${file}:${start}:${Math.min(300, Number(limit))}`;
+      this.readCount++;
+      const prior = this.readSeen.get(key);
+      this.readSeen.set(key, { text, n: this.readCount });
+      // Only collapse recent repeats, so a summarized-away read is never replaced by a stub.
+      if (prior && prior.text === text && this.readCount - prior.n <= 6)
+        return `[Unchanged: these lines were read moments ago; use that result instead of re-reading. ${lines.length} lines total]`;
       return (
         clip(
           lines

@@ -19,9 +19,9 @@ for (const part of companyInstructions.split(/^## /m).slice(1)) {
   promptSections.set(title.trim(), `## ${title.trim()}\n${body.join("\n").trim()}`);
 }
 const childSections: Record<string, string[]> = {
-  lead: ["WORKERS", "RESEARCH LEADS", "EVIDENCE"],
-  researcher: ["WORKERS", "EVIDENCE"],
-  reviewer: ["WORKERS", "EVIDENCE", "REVIEW BOARD"],
+  lead: ["WORKERS", "RESEARCH LEADS", "SPEED (wall-clock time)", "EVIDENCE"],
+  researcher: ["WORKERS", "SPEED (wall-clock time)", "EVIDENCE"],
+  reviewer: ["WORKERS", "SPEED (wall-clock time)", "EVIDENCE", "REVIEW BOARD"],
 };
 /**
  * Instructions for one research role. The director gets everything; delegates
@@ -61,7 +61,7 @@ export type CompanyState = {
   estimatedCostMicros: number;
   costRevision: number;
   untrackedCostRequests: number;
-  costRates: Record<string, { input: number; output: number }>;
+  costRates: Record<string, { input: number; output: number; cached?: number }>;
   fundingProposal?: string;
   /** Strict budget: the director never proposes extra funding and must conclude with the allowance it has. */
   strictBudget?: boolean;
@@ -131,9 +131,12 @@ export const formatUsd = (micros: number) =>
 
 export function tokenReservation(data: unknown, output: number) {
   // Conservative preflight headroom, not a model-specific tokenizer. Provider
-  // usage replaces this reservation after the request completes.
+  // usage replaces this reservation after the request completes. One token is
+  // at least ~3 UTF-8 bytes of English or JSON, so bytes/3 still over-estimates;
+  // reserving one token per byte priced requests at ~4.5x their real cost and
+  // stopped studies with "cannot fit the next request" while money remained.
   return {
-    input: Buffer.byteLength(JSON.stringify(data), "utf8") + 1024,
+    input: Math.ceil(Buffer.byteLength(JSON.stringify(data), "utf8") / 3) + 512,
     output,
   };
 }
@@ -400,7 +403,7 @@ export class CompanyRuntime {
     signal: AbortSignal,
     agent?: { id: string; depth: number; role?: string },
     reservation = { input: 0, output: 0 },
-  ): Promise<(usage?: { input: number; output: number }) => void> {
+  ): Promise<(usage?: { input: number; output: number; cached?: number }) => void> {
     const reserved = reservation.input + reservation.output;
     if (
       !Number.isSafeInteger(reserved) ||
@@ -427,6 +430,9 @@ export class CompanyRuntime {
       rate = {
         input: published.inputUsdPerMillionTokens,
         output: published.outputUsdPerMillionTokens,
+        ...(published.cachedInputUsdPerMillionTokens !== undefined
+          ? { cached: published.cachedInputUsdPerMillionTokens }
+          : {}),
       };
       this.state.costRates[key] = rate;
     }
@@ -497,8 +503,19 @@ export class CompanyRuntime {
           this.state.estimatedTokens -= reserved;
           this.state.estimatedCostMicros -= reserveCost;
           this.state.costRevision++;
+          // Cache hits are a subset of the input; they bill at the cached rate only when one is published.
+          const cached =
+            rate?.cached !== undefined &&
+            Number.isSafeInteger(usage.cached) &&
+            usage.cached! > 0
+              ? Math.min(usage.cached!, usage.input)
+              : 0;
           this.state.spentCostMicros += rate
-            ? Math.ceil(usage.input * rate.input + usage.output * rate.output)
+            ? Math.ceil(
+                (usage.input - cached) * rate.input +
+                  cached * (rate.cached ?? rate.input) +
+                  usage.output * rate.output,
+              )
             : 0;
           this.state.inputTokens += usage.input;
           this.state.outputTokens += usage.output;

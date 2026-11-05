@@ -1,6 +1,7 @@
 import { BrowserSession } from "./browser";
 import { saveWorkerRecord } from "./research-workers";
 import { tavilyKey, tavilyToolDefinitions } from "./tavily";
+import { forbidsWeb, scholarToolDefinitions } from "./scholar";
 import { lsiKey, lsiToolDefinitions, lsiReadToolDefinitions, lsiChatToolDefinitions } from "./lsi";
 import { bunContext } from "./bun-context";
 import { kestGuideToolDefinition, kestGuideHint } from "./kest-guide";
@@ -8,7 +9,13 @@ import { estimateCall, inputRate } from "./cost";
 import { defaultToolMs, isParallelTool, toolNames, toolSpec, type Tier } from "./registry";
 import { machineAdvice, machineCheckTool } from "./machine";
 import OpenAI from "openai";
-import { endpointFor, type Credentials } from "./config";
+export type Toolset = "read-only" | "web" | "research";
+import {
+  endpointFor,
+  modelBaseURL,
+  modelProvider,
+  type Credentials,
+} from "./config";
 import { WorkspaceTools, toolDefinitions, type Approve } from "./tools";
 import {
   normalizeContext,
@@ -36,10 +43,27 @@ import {
 import {
   listResearchModels,
   resolveResearchModel,
+  aliasDefaultModel,
+  modelAllowedFor,
+  modelsOf,
   type ModelConnection,
 } from "./research-models";
 
 export type Message = OpenAI.ChatCompletionMessageParam;
+/**
+ * A per-request note appended to the end of the prompt without being saved in the history. Only the
+ * tail changes between requests, so the provider's prefix cache still covers everything before it.
+ */
+function withTrailingNote(messages: Message[], note: string | null): Message[] {
+  const last = messages.at(-1);
+  if (!note || !last) return messages;
+  if (
+    (last.role === "tool" || last.role === "user") &&
+    typeof last.content === "string"
+  )
+    return [...messages.slice(0, -1), { ...last, content: `${last.content}\n\n${note}` } as Message];
+  return [...messages, { role: "user", content: note }];
+}
 function summaryTimeoutMs() {
   const value = Number(process.env.KEST_SUMMARY_TIMEOUT_MS);
   return Number.isFinite(value) && value >= 50 && value <= 120000
@@ -97,6 +121,16 @@ export const researchStartAllToolDefinition: OpenAI.ChatCompletionTool = {
     name: "research_start_all",
     description:
       "Start every prepared study that already has a budget, in the background, so they run side by side (up to the concurrent-run limit; the rest stay prepared). Use after several research_prepare calls with budget_usd and without start, and only when the user asked to start them. Studies without a budget are skipped and listed.",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+  },
+};
+
+export const researchResumeAllToolDefinition: OpenAI.ChatCompletionTool = {
+  type: "function",
+  function: {
+    name: "research_resume_all",
+    description:
+      "Resume every paused or interrupted study that still has budget, in the background, side by side (up to the concurrent-run limit; the rest queue and start as others finish). Use when the user says 'resume all', 'continue everything' or similar. Studies that ran out of budget are listed, not resumed: only the user raises a budget. Prepared studies that never started need research_start_all.",
     parameters: { type: "object", properties: {}, additionalProperties: false },
   },
 };
@@ -286,9 +320,11 @@ export type AgentEvent =
         { type: "worker" } | { type: "usage" } | { type: "budget" }
       >;
       output?: string;
+      /** Tokens one of this worker's own requests used, for its live cost on the team rows. */
+      usage?: { model: string; input: number; output: number };
     }
   | { type: "text"; delta: string }
-  | { type: "usage"; model: string; input: number; output: number }
+  | { type: "usage"; model: string; input: number; output: number; agent?: string }
   | { type: "budget"; state: import("./research-company").CompanyState }
   | { type: "response" }
   | {
@@ -397,7 +433,7 @@ const spawnToolDefinition: OpenAI.ChatCompletionTool = {
         profile: {
           type: "string",
           description:
-            "Configured model profile from list_models; defaults to this agent's connection",
+            "Configured model profile from list_models (e.g. nebius, modal, baseten, deepseek); defaults to this agent's connection",
         },
         provider: { type: "string", enum: ["modal", "baseten", "nebius"] },
         model: {
@@ -407,9 +443,9 @@ const spawnToolDefinition: OpenAI.ChatCompletionTool = {
         role: { type: "string", enum: ["lead", "researcher", "reviewer"] },
         toolset: {
           type: "string",
-          enum: ["read-only", "research"],
+          enum: ["read-only", "web", "research"],
           description:
-            "Local files only, or local files plus agent-owned tabs in the shared approved browser. No edits or experiment execution.",
+            "read-only: local files only. web: plus Tavily search/extract and LSI reads (the default when Tavily is set up). research: plus agent-owned tabs in the shared browser; only for pages Tavily cannot read, forms/logins, JS-only or interactive pages. No edits or experiment execution.",
         },
       },
       required: ["task"],
@@ -488,7 +524,7 @@ const companyToolDefinitions: OpenAI.ChatCompletionTool[] = [
                   type: "string",
                   enum: ["lead", "researcher", "reviewer"],
                 },
-                toolset: { type: "string", enum: ["read-only", "research"] },
+                toolset: { type: "string", enum: ["read-only", "web", "research"] },
               },
               required: ["task"],
               additionalProperties: false,
@@ -576,9 +612,20 @@ export class Agent {
   context: ContextState;
   research: CompanyState | null = null;
   connectionOverride: ModelConnection | null = null;
-  toolScope: "workspace" | "read-only" | "research" = "workspace";
+  toolScope: "workspace" | "read-only" | "web" | "research" = "workspace";
   depth = 0;
   researchRole = "director";
+  /**
+   * Reasoning tokens are decoded one by one, so they are wall-clock time. KEST_EFFORT
+   * (low|medium|high) overrides every role; unset keeps "medium".
+   */
+  reasoningEffort(): "low" | "medium" | "high" {
+    const forced = process.env.KEST_EFFORT;
+    if (forced === "low" || forced === "medium" || forced === "high") return forced;
+    // Delegates mostly run mechanical lookups and checks (open a source, quote it); the
+    // director keeps full reasoning for planning, synthesis and the final report.
+    return this.companyWorker && this.researchRole !== "director" ? "low" : "medium";
+  }
   private company: CompanyRuntime | null = null;
   companyWorker = false;
   private activeCompanyRun = false;
@@ -596,6 +643,7 @@ export class Agent {
   onBackground: ((event: AgentEvent) => void) | null = null;
   /** Set by the UI on chat agents: creates a prepared (not started) study room. */
   onStartPrepared: (() => Promise<string>) | null = null;
+  onResumeAll: (() => Promise<string>) | null = null;
   onListResearch: (() => Promise<string>) | null = null;
   onDeleteResearch: ((id: string) => Promise<string>) | null = null;
   /** Study director to the control inbox. */
@@ -693,6 +741,8 @@ export class Agent {
     return `Cancelling background task ${taskId.slice(0, 8)}: ${entry.task}`;
   }
   modelOverride: string | null = null;
+  /** True for workers of a study whose model the user chose; they must not switch models. */
+  modelPinned = false;
   tasks: PlanTask[] = [];
   canSpawn = true;
   /**
@@ -713,7 +763,7 @@ export class Agent {
     model: string,
     connection?: ModelConnection,
     role?: string,
-    toolset?: "read-only" | "research",
+    toolset?: Toolset,
     workerId?: string,
   ) => Promise<string> = (
     task,
@@ -821,7 +871,9 @@ export class Agent {
   }
 
   toolDefs(): OpenAI.ChatCompletionTool[] {
-    const webTools = tavilyKey() ? tavilyToolDefinitions : [];
+    // A study whose objective forbids web research gets no search or browser tools at all.
+    const noWeb = forbidsWeb((this.company?.state ?? this.research)?.objective);
+    const webTools = noWeb ? [] : [...(tavilyKey() ? tavilyToolDefinitions : []), ...scholarToolDefinitions];
     const lsiReads = lsiKey() ? lsiReadToolDefinitions : [];
     // Claim/post exist only inside a /research run; publishing only after the director has
     // completed the study (independent review done, final report saved). Chat and workers only read.
@@ -847,10 +899,12 @@ export class Agent {
         ...(this.toolScope === "research"
           ? toolDefinitions
               .filter(
-                (t) => t.type === "function" && t.function.name === "browser",
+                (t) => !forbidsWeb((this.company?.state ?? this.research)?.objective) && t.type === "function" && t.function.name === "browser",
               )
               .concat(webTools, lsiReads)
-          : []),
+          : this.toolScope === "web"
+            ? [...webTools, ...lsiReads]
+            : []),
         ...companyToolDefinitions.filter(
           (t) =>
             t.type === "function" &&
@@ -879,6 +933,7 @@ export class Agent {
       ...(!inResearch ? [machineCheckToolDefinition] : []),
       ...(!inResearch && this.onPrepareResearch ? [researchPrepareToolDefinition] : []),
       ...(!inResearch && this.onStartPrepared ? [researchStartAllToolDefinition] : []),
+      ...(!inResearch && this.onResumeAll ? [researchResumeAllToolDefinition] : []),
       ...(!inResearch && this.onListResearch ? [researchListToolDefinition] : []),
       ...(!inResearch && this.onDeleteResearch ? [researchDeleteToolDefinition] : []),
       ...(inResearch && this.depth === 0 && this.onNotifyControl ? [notifyControlToolDefinition] : []),
@@ -1001,8 +1056,19 @@ export class Agent {
             }
           : this.research,
       );
-    if (name === "list_models")
+    if (name === "list_models") {
+      // A model the user chose (/model, --model) is final: workers must not drift to other providers.
+      if (this.modelOverride && (this.modelPinned || this.depth === 0))
+        return JSON.stringify([
+          {
+            name: "selected",
+            provider: this.connectionOverride?.provider ?? modelProvider(this.modelOverride) ?? "custom",
+            model: this.modelOverride,
+            note: "The user fixed this model for the whole study. Every worker and reviewer uses it automatically; profile and model arguments are ignored. Do not call list_models again.",
+          },
+        ]);
       return JSON.stringify(await listResearchModels());
+    }
     const args = JSON.parse(raw);
     if (!args || typeof args !== "object" || Array.isArray(args))
       throw new Error("Research tool arguments must be an object.");
@@ -1084,7 +1150,37 @@ export class Agent {
     );
   }
 
+  /** Consecutive failed delegations; after two, further delegation is refused so a broken reviewer cannot eat the whole run. */
+  private delegationFailures = 0;
+
   async executeSpawn(
+    raw: string,
+    credentials: Credentials,
+    signal: AbortSignal,
+    emit: (event: AgentEvent) => void,
+  ): Promise<string> {
+    if (this.delegationFailures >= 2)
+      return "Delegation is unavailable: it failed twice in a row (provider or schema errors). Do NOT retry it. Review the evidence yourself: re-run the key computation with a second independent implementation, state in the report that no independent reviewer ran, then finish (write the report and call research_complete).";
+    // A foreground delegate that hangs (stalled provider) must not hold the director for the rest of the run.
+    let background = false;
+    try { background = Boolean(JSON.parse(raw)?.background); } catch {}
+    const limitMs = Number(process.env.KEST_DELEGATE_TIMEOUT_S ?? 420) * 1000;
+    const guarded = background || !(limitMs > 0) ? signal : AbortSignal.any([signal, AbortSignal.timeout(limitMs)]);
+    try {
+      const out = await this.spawnOnce(raw, credentials, guarded, emit);
+      this.delegationFailures = 0;
+      return out;
+    } catch (error) {
+      if (!signal.aborted && !(error instanceof ResearchBudgetError)) {
+        this.delegationFailures++;
+        if (guarded.aborted)
+          throw new Error(`The delegate made no progress within ${Math.round(limitMs / 60000)} minutes and was stopped. Do not wait for it again: continue the work yourself and finish.`);
+      }
+      throw error;
+    }
+  }
+
+  private async spawnOnce(
     raw: string,
     credentials: Credentials,
     signal: AbortSignal,
@@ -1120,36 +1216,75 @@ export class Agent {
       );
     const expected = args.expected;
     const role = args.role ?? "researcher";
-    const toolset = args.toolset ?? "read-only";
+    // Web access (Tavily) is the default for sources; the browser is an explicit opt-in.
+    const toolset =
+      args.toolset ??
+      (this.toolScope !== "read-only" && !forbidsWeb((this.company?.state ?? this.research)?.objective) ? "web" : "read-only");
     if (this.toolScope === "read-only" && toolset !== "read-only")
       throw new Error(
-        "A read-only lead cannot grant browser access to descendants.",
+        "A read-only lead cannot grant web or browser access to descendants.",
+      );
+    if (this.toolScope === "web" && toolset === "research")
+      throw new Error(
+        "A web-only lead cannot grant browser access to descendants.",
       );
     if (
       !["lead", "researcher", "reviewer"].includes(String(role)) ||
-      !["read-only", "research"].includes(String(toolset))
+      !["read-only", "web", "research"].includes(String(toolset))
     )
       throw new Error("Invalid researcher role or toolset.");
     if (args.profile !== undefined && args.provider !== undefined)
       throw new Error("Choose profile or provider, not both.");
-    const profile = args.profile ?? args.provider;
-    if (profile !== undefined && typeof profile !== "string")
+    const requestedProfile = args.profile ?? args.provider;
+    if (requestedProfile !== undefined && typeof requestedProfile !== "string")
       throw new Error("Profile must be a configured model name.");
+    // The user's own model choice overrides any profile or model the director asks for.
+    const pinned =
+      this.modelPinned || (this.depth === 0 && Boolean(this.modelOverride));
+    const profile = pinned ? undefined : requestedProfile;
+    if (pinned) delete args.model;
     const selectedConnection: ModelConnection = profile
       ? await resolveResearchModel(String(profile))
       : (this.connectionOverride ?? {
           provider: credentials.provider,
-          ...endpointFor(credentials),
+          ...endpointFor(credentials, this.modelOverride),
           model: this.modelOverride ?? endpointFor(credentials).model,
         });
-    const connection = { ...selectedConnection };
+    const connection: ModelConnection = {
+      ...selectedConnection,
+      ...(pinned ? { pinned: true } : {}),
+    };
+    // A built-in provider alias (nebius, modal, baseten) follows the user's /model choice.
+    if (
+      typeof profile === "string" &&
+      ["nebius", "modal", "baseten"].includes(profile) &&
+      this.modelOverride &&
+      connection.model === aliasDefaultModel(connection.provider) &&
+      modelProvider(this.modelOverride) === connection.provider
+    ) {
+      connection.model = this.modelOverride;
+      connection.baseURL = modelBaseURL(
+        connection.provider,
+        connection.model,
+        connection.baseURL,
+      );
+    }
     if (args.model !== undefined) {
       if (
         typeof args.model !== "string" ||
         !/^[^\s\x00-\x1f\x7f]{1,200}$/.test(args.model)
       )
         throw new Error("Invalid model ID.");
+      if (!modelAllowedFor(connection.provider, args.model, selectedConnection.model))
+        throw new Error(
+          `Model ${args.model} is not served by ${connection.provider}. Available: ${modelsOf(connection.provider).join(", ")}. Or pick a profile from list_models.`,
+        );
       connection.model = args.model;
+      connection.baseURL = modelBaseURL(
+        connection.provider,
+        connection.model,
+        connection.baseURL,
+      );
     }
     this.company ??= new CompanyRuntime(newCompany(task));
     this.company.addAgent(this.depth + 1, role === "reviewer");
@@ -1191,14 +1326,17 @@ export class Agent {
               event.type === "worker" ||
               event.type === "usage" ||
               event.type === "budget"
-            )
+            ) {
               emit(event);
-            else emit({ ...activity, state: "running", event });
+              // The worker's own requests also ride on its row, so the team view can price it.
+              if (event.type === "usage" && event.agent === workerId)
+                emit({ ...activity, state: "running", usage: { model: event.model, input: event.input, output: event.output } });
+            } else emit({ ...activity, state: "running", event });
           },
           connection.model,
           connection,
           String(role),
-          toolset as "read-only" | "research",
+          toolset as Toolset,
           workerId,
         );
       } catch (error) {
@@ -1306,8 +1444,9 @@ export class Agent {
     const callerSignal = signal;
 
     // Research is bounded by estimated USD cost, not elapsed time or token totals.
-    const roundLimit = maxRounds ?? (this.research ? 10_000 : 20);
-    const endpoint = this.connectionOverride ?? endpointFor(credentials);
+    const roundLimit = maxRounds ?? (this.research ? 10_000 : 40);
+    const endpoint =
+      this.connectionOverride ?? endpointFor(credentials, this.modelOverride);
     const client = new OpenAI({
       baseURL: endpoint.baseURL,
       apiKey: endpoint.apiKey,
@@ -1346,8 +1485,18 @@ export class Agent {
       const lsiCalls = new Set<string>();
       let publishRounds = 0;
       let wrapRounds = 0;
+      let lengthRetries = 0;
       let emptyResponses = 0;
+      let stepWarned = false;
       for (let round = 0; round < roundLimit; round++) {
+        // Workers have a hard step cap; without a warning they hit it mid-investigation and their findings are lost.
+        if (maxRounds && !stepWarned && round >= roundLimit - 4) {
+          stepWarned = true;
+          this.messages.push({
+            role: "user",
+            content: `Research controller: you have ${roundLimit - round} steps left. Stop investigating now and reply with your findings as plain text, with no more tool calls.`,
+          });
+        }
         signal.throwIfAborted();
         if (this.pendingNotes.length) {
           // Direction typed while the run was busy: deliver before the next model round.
@@ -1401,16 +1550,19 @@ Wrap-up stopped: ${error instanceof Error ? error.message : "could not complete"
             return;
           }
         }
+        // The live cost status changes every round. Kept in the system message it would rewrite the
+        // start of the prompt each time and defeat the provider's prefix cache for the whole history, so
+        // the system message stays byte-stable and the status rides as a trailing, unsaved message.
+        let costStatus: string | null = null;
         if (this.activeCompanyRun && this.messages[0]?.role === "system") {
           const first = this.messages[0];
           const instructions = String(first.content).replace(
             /\n<research-cost-status>[\s\S]*?<\/research-cost-status>/g,
             "",
           );
-          this.messages[0] = {
-            role: "system",
-            content: `${instructions}\n<research-cost-status>\n${formatCompany(runtime.snapshot())}\nAllocate useful research within this remaining USD allowance. Reserve funding for review. Only the user can increase it.\n</research-cost-status>`,
-          };
+          if (instructions !== first.content)
+            this.messages[0] = { role: "system", content: instructions };
+          costStatus = `<research-cost-status>\n${formatCompany(runtime.snapshot())}\nAllocate useful research within this remaining USD allowance. Reserve funding for review. Only the user can increase it.\n</research-cost-status>`;
         }
         if (
           this.research &&
@@ -1479,8 +1631,11 @@ Wrap-up stopped: ${error instanceof Error ? error.message : "could not complete"
         const model = this.modelOverride ?? endpoint.model;
         let content = "";
         let finish: string | null = null;
-        let usage: { prompt_tokens: number; completion_tokens: number } | null =
-          null;
+        let usage: {
+          prompt_tokens: number;
+          completion_tokens: number;
+          cached_tokens?: number;
+        } | null = null;
         const calls = new Map<
           number,
           {
@@ -1489,6 +1644,11 @@ Wrap-up stopped: ${error instanceof Error ? error.message : "could not complete"
             function: { name: string; arguments: string };
           }
         >();
+        // A reply is never cut short in practice: reasoning models spend output on thinking, and a report
+        // or file write can be long. The cap only bounds the budget reservation.
+        const maxOutput = 32768;
+        // Budget headroom for a typical reply; real usage replaces it, so long replies are never refused for it.
+        const RESERVED_OUTPUT = 8192;
         const release = await runtime.acquire(
           "provider" in endpoint
             ? String(endpoint.provider)
@@ -1498,19 +1658,19 @@ Wrap-up stopped: ${error instanceof Error ? error.message : "could not complete"
           { id: this.agentId, depth: this.depth, role: this.researchRole },
           tokenReservation(
             { messages: this.messages, tools: this.toolDefs() },
-            4096,
+            RESERVED_OUTPUT,
           ),
         );
         try {
           const stream = await client.chat.completions.create(
             {
               model,
-              messages: this.messages,
+              messages: withTrailingNote(this.messages, costStatus),
               tools: this.toolDefs(),
               temperature: 0.3,
-              max_tokens: 4096,
+              max_tokens: maxOutput,
               top_p: 0.95,
-              reasoning_effort: "medium",
+              reasoning_effort: this.reasoningEffort(),
               stream: true,
               stream_options: { include_usage: true },
             },
@@ -1523,6 +1683,8 @@ Wrap-up stopped: ${error instanceof Error ? error.message : "could not complete"
               usage = {
                 prompt_tokens: chunkUsage.prompt_tokens ?? 0,
                 completion_tokens: chunkUsage.completion_tokens ?? 0,
+                cached_tokens:
+                  (chunkUsage as any).prompt_tokens_details?.cached_tokens ?? 0,
               };
             }
             const choice = chunk.choices[0];
@@ -1551,7 +1713,11 @@ Wrap-up stopped: ${error instanceof Error ? error.message : "could not complete"
         } finally {
           release(
             usage
-              ? { input: usage.prompt_tokens, output: usage.completion_tokens }
+              ? {
+                  input: usage.prompt_tokens,
+                  output: usage.completion_tokens,
+                  cached: usage.cached_tokens,
+                }
               : undefined,
           );
           await runtime.record("model_usage", {
@@ -1570,6 +1736,7 @@ Wrap-up stopped: ${error instanceof Error ? error.message : "could not complete"
             model,
             input: Math.max(0, usage.prompt_tokens),
             output: Math.max(0, usage.completion_tokens),
+            agent: this.agentId,
           });
           // Only real research runs report budget. A transient runtime
           // created for a plain turn must never flip the UI into
@@ -1577,10 +1744,24 @@ Wrap-up stopped: ${error instanceof Error ? error.message : "could not complete"
           if (this.company && this.research)
             emit({ type: "budget", state: this.company.snapshot() });
         }
-        if (finish === "length" && toolCalls.length)
+        if (finish === "length" && toolCalls.length) {
+          // A reasoning model can spend the whole allowance thinking, or a report can be longer than
+          // one reply. In a study that used to pause the whole run; instead drop the cut-off call and
+          // tell the model what happened so it can write in smaller parts.
+          if (++lengthRetries <= 3) {
+            emit({ type: "status", text: `Reply hit the output limit · retrying smaller (${lengthRetries}/3)` });
+            this.messages.push({
+              role: "user",
+              content:
+                "Research controller: your last reply hit the output limit and its tool call was discarded. Think less and act: write long files in parts (create the file with the first section, then append the next sections in separate calls, each under ~1500 words), and keep each call small.",
+            });
+            round--;
+            continue;
+          }
           throw new Error(
-            "Tool call exceeded the output limit. Ask for a smaller change.",
+            "The model's reply was cut off at the output limit 3 times in a row. Progress is saved; resume to try again.",
           );
+        }
         if (toolCalls.some((call) => !call.id || !call.function.name))
           throw new Error("Endpoint returned an incomplete tool call.");
         if (!content.trim() && !toolCalls.length) {
@@ -1783,6 +1964,9 @@ Wrap-up stopped: ${error instanceof Error ? error.message : "could not complete"
             } else if (name === "research_start_all") {
               if (!this.onStartPrepared) throw new Error("research_start_all is not available here.");
               output = await this.onStartPrepared();
+            } else if (name === "research_resume_all") {
+              if (!this.onResumeAll) throw new Error("research_resume_all is not available here.");
+              output = await this.onResumeAll();
             } else if (name === "set_plan" || name === "update_task") {
               output = this.executePlanTool(name, args);
             } else if (name === "background_status") {
@@ -1807,7 +1991,7 @@ Wrap-up stopped: ${error instanceof Error ? error.message : "could not complete"
               );
             } else if (name === "browser" && tavilyKey() && (this.research || this.activeCompanyRun) && searchEngineUrl(JSON.parse(args || "{}"))) {
               state = "error";
-              output = "Error: do not use a search engine in the browser. Use tavily_search to find sources. Use the browser for niche sites, scraping and pages Tavily cannot read.";
+              output = "Error: do not use a search engine in the browser. Use scholar_search (free) for papers and tavily_search for other web sources. Use the browser for niche sites, scraping and pages Tavily cannot read.";
             } else {
               this.tools.procOwner = this.research ? `study ${this.research.id.slice(0, 8)}` : "chat";
               output = await this.tools.execute(name, args, signal);
@@ -1857,14 +2041,19 @@ Wrap-up stopped: ${error instanceof Error ? error.message : "could not complete"
         // delegation, plan changes) keep their original sequential order.
         // Results are appended in call order regardless of finish order,
         // then the next model round decides: continue, delegate, or stop.
+        // Tools that ask for approval overlap only inside a research run, where
+        // approvals are queued one at a time; elsewhere prompts must not stack.
+        const overlaps = (name: string) =>
+          PARALLEL_TOOLS.has(name) &&
+          (!toolSpec(name)?.approval || Boolean(this.company || this.research));
         const results: { call: (typeof toolCalls)[number]; output: string }[] =
           [];
         for (let index = 0; index < toolCalls.length;) {
-          if (PARALLEL_TOOLS.has(toolCalls[index]!.function.name)) {
+          if (overlaps(toolCalls[index]!.function.name)) {
             const group: typeof toolCalls = [];
             while (
               index < toolCalls.length &&
-              PARALLEL_TOOLS.has(toolCalls[index]!.function.name)
+              overlaps(toolCalls[index]!.function.name)
             )
               group.push(toolCalls[index++]!);
             if (group.length > 1) {
@@ -1942,7 +2131,7 @@ Wrap-up stopped: ${error instanceof Error ? error.message : "could not complete"
             role: "user",
             content: lsiClaimed
               ? "Research controller: the study is complete and you claimed an LSI question. Call lsi_publish now with the reviewed findings (domain from lsi_domains, answers_question set to the claimed question, artifacts linked as evidence), then give the final answer."
-              : `Research controller: the study is complete and its objective names LSI question ${objectiveQuestion}, but you have not linked a result to it. Claim it with lsi_claim (if the claim is refused, say why in the report), then call lsi_publish with the reviewed findings (domain from lsi_domains, answers_question set to ${objectiveQuestion}, artifacts linked as evidence), then give the final answer.`,
+              : `Research controller: the study is complete and its objective names LSI question ${objectiveQuestion}, but you have not linked a result to it. Try lsi_claim (claims are optional: if it is refused because the question is full or already answered, publish anyway), then call lsi_publish with the reviewed findings (domain from lsi_domains, answers_question set to ${objectiveQuestion}, artifacts linked as evidence), then give the final answer.`,
           });
           continue;
         }
@@ -2029,7 +2218,8 @@ Wrap-up stopped: ${error instanceof Error ? error.message : "could not complete"
         : null;
     const budget = this.company ?? manualBudget;
 
-    const endpoint = this.connectionOverride ?? endpointFor(credentials);
+    const endpoint =
+      this.connectionOverride ?? endpointFor(credentials, this.modelOverride);
     const model = this.modelOverride ?? endpoint.model;
     const client = new OpenAI({
       baseURL: endpoint.baseURL,
@@ -2281,7 +2471,7 @@ async function defaultRunChild(
   company?: CompanyRuntime,
   depth = 1,
   role = "researcher",
-  toolset: "read-only" | "research" = "read-only",
+  toolset: Toolset = "read-only",
   approve: Approve = async () => false,
   workerId?: string,
   browser?: BrowserSession,
@@ -2296,6 +2486,7 @@ async function defaultRunChild(
   );
   child.toolScope = toolset;
   child.connectionOverride = connection ?? null;
+  child.modelPinned = connection?.pinned === true;
   if (company) child.useCompany(company, depth);
   child.modelOverride = model;
   const brief =
@@ -2310,7 +2501,7 @@ async function defaultRunChild(
       credentials,
       signal,
       emit,
-      Math.max(1, Math.min(role === "lead" ? 16 : 8, 16)),
+      role === "lead" ? 40 : role === "reviewer" ? 32 : 24,
     );
     const last = [...child.messages]
       .reverse()

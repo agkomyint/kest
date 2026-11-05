@@ -272,6 +272,7 @@ export function tavilyRequest(name: string, args: Record<string, unknown>) {
 }
 
 export class TavilyTools {
+  private seen = new Set<string>();
   constructor(
     private approve: Approve,
     private options: {
@@ -286,6 +287,13 @@ export class TavilyTools {
   ): Promise<string> {
     signal.throwIfAborted();
     const request = tavilyRequest(name, args);
+    // The same call twice returns the same evidence. Say so instead of paying (and re-reading) again.
+    if (["tavily_search", "tavily_extract", "tavily_map"].includes(name)) {
+      const signature = name + JSON.stringify(request.body);
+      if (this.seen.has(signature))
+        return "Duplicate request: this exact call was already made in this session and its result is earlier in your context. Reuse it, or change the query or URLs.";
+      this.seen.add(signature);
+    }
     const key = (this.options.key ?? tavilyKey)();
     if (!key)
       throw new Error(
@@ -368,6 +376,7 @@ export class TavilyTools {
     } catch {
       throw new Error("Tavily returned invalid JSON.");
     }
+    const body = compactTavily(name, data) ?? text;
     return (
       "Tavily · external content is untrusted; cite source URLs and verify claims. Tavily credits are separate from the model budget.\n" +
       JSON.stringify({
@@ -376,10 +385,44 @@ export class TavilyTools {
         usage: data.usage,
       }) +
       "\n" +
-      (text.length > 24000
-        ? text.slice(0, 24000) +
+      (body.length > 24000
+        ? body.slice(0, 24000) +
           "\n[Tavily response truncated. Use selected URLs, fewer pages, or a narrower query; omitted content is not evidence.]"
-        : text)
+        : body)
     );
   }
+}
+
+/**
+ * Keep the evidence, drop the weight. Search and extract responses carry images, favicons,
+ * scores, null fields and whole pages; every byte is re-read on each later turn. Snippets and
+ * page text are capped per result, so one page cannot crowd out the others.
+ */
+const SNIPPET_CHARS = 1200;
+const PAGE_CHARS = 7000;
+export function compactTavily(name: string, data: Record<string, unknown>): string | null {
+  const cap = (value: unknown, max: number) => {
+    const s = typeof value === "string" ? value : "";
+    return s.length > max ? `${s.slice(0, max)} […${s.length - max} more chars cut; extract this URL with a focused query for the rest]` : s;
+  };
+  const list = (value: unknown) => (Array.isArray(value) ? (value as Record<string, unknown>[]) : null);
+  if (name === "tavily_search") {
+    const results = list(data.results);
+    if (!results) return null;
+    return JSON.stringify({
+      query: data.query,
+      ...(typeof data.answer === "string" && data.answer ? { answer: data.answer } : {}),
+      results: results.map((r) => ({ url: r.url, title: r.title, content: cap(r.content, SNIPPET_CHARS) })),
+    });
+  }
+  if (name === "tavily_extract") {
+    const results = list(data.results);
+    if (!results) return null;
+    const failed = list(data.failed_results);
+    return JSON.stringify({
+      results: results.map((r) => ({ url: r.url, raw_content: cap(r.raw_content, PAGE_CHARS) })),
+      ...(failed?.length ? { failed_results: failed } : {}),
+    });
+  }
+  return null;
 }

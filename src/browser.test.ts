@@ -3,6 +3,8 @@ import { BrowserSession, browserRequest } from "./browser";
 import { WorkspaceTools } from "./tools";
 import { Agent } from "./agent";
 import { CompanyRuntime, newCompany } from "./research-company";
+import { allowModelsForTests } from "./research-models";
+allowModelsForTests(["one","two","three"]);
 
 const signal = () => new AbortController().signal;
 test("browser requests reject invalid actions, URLs, and target indices", () => {

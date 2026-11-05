@@ -19,6 +19,7 @@ import {
   resolveResearchModel,
   saveResearchModel,
   saveResearchEndpoint,
+  modelsOf,
 } from "./research-models";
 
 async function isolated(run: (directory: string) => Promise<void>) {
@@ -53,6 +54,7 @@ test("default research aliases list availability without requiring credentials o
         provider: "nebius",
         model: NEBIUS_MODEL,
         pricing: modelPricing("nebius", NEBIUS_MODEL),
+        models: modelsOf("nebius"),
         available: false,
       },
       {
@@ -60,6 +62,7 @@ test("default research aliases list availability without requiring credentials o
         provider: "modal",
         model: MODAL_MODEL,
         pricing: modelPricing("modal", MODAL_MODEL),
+        models: modelsOf("modal"),
         available: false,
       },
       {
@@ -67,6 +70,15 @@ test("default research aliases list availability without requiring credentials o
         provider: "baseten",
         model: BASETEN_MODEL,
         pricing: modelPricing("baseten", BASETEN_MODEL),
+        models: modelsOf("baseten"),
+        available: false,
+      },
+      {
+        name: "deepseek",
+        provider: "nebius",
+        model: "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        pricing: modelPricing("nebius", "deepseek-ai/DeepSeek-V4.1-Flash-1017"),
+        models: modelsOf("nebius"),
         available: false,
       },
     ]);
@@ -293,4 +305,14 @@ test("nebius research profiles use current provider credentials", async () => {
       saveResearchEndpoint("nebius", "https://example.com/v1", "m", "KEY"),
     ).rejects.toThrow();
   });
+});
+
+test("an explicit model must not belong to another provider, and aliases follow /model", async () => {
+  const { modelAllowedFor, aliasDefaultModel } = await import("./research-models");
+  const ds = "deepseek-ai/DeepSeek-V4.1-Flash-1017";
+  expect(modelAllowedFor("modal", ds, MODAL_MODEL)).toBe(false);
+  expect(modelAllowedFor("nebius", ds, NEBIUS_MODEL)).toBe(true);
+  expect(modelAllowedFor("baseten", "my-private-model", BASETEN_MODEL)).toBe(false);
+  expect(modelAllowedFor("custom", ds, "x")).toBe(true);
+  expect(aliasDefaultModel("nebius")).toBe(NEBIUS_MODEL);
 });

@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import type { AgentEvent } from "./agent";
 import { newCompany } from "./research-company";
 import { newSession } from "./sessions";
-import { companyBar, EventBuffer, Room, RoomManager, roomList, roomOrder } from "./rooms";
+import { companyBar, EventBuffer, Room, RoomManager, roomLabel, studyCard, roomList, roomOrder } from "./rooms";
 
 const room = (kind: "chat" | "study", objective = "Compare indexing algorithms") => {
   const session = newSession(process.cwd(), []);
@@ -128,4 +128,69 @@ test("room list is quiet when idle, windows around the focused room when crowded
   const order = roomOrder(manager);
   expect(order[0]!.kind).toBe("chat");
   expect(order.at(-1)).toBe(studies[3]!);
+});
+
+test("the studies list says what each count means and how many workers are busy", () => {
+  const manager = new RoomManager();
+  manager.add(room("chat"));
+  const busy = manager.add(room("study", "Compare fact-checker rating scales"));
+  busy.study!.maxCostUsd = 1;
+  busy.study!.spentCostMicros = 210_000;
+  busy.controller = new AbortController();
+  for (const [id, state] of [["a", "done"], ["b", "running"], ["c", "running"]] as const)
+    busy.track({ type: "worker", workerId: id, parentId: "p", task: "t", role: "researcher", model: "m", depth: 1, state } as never);
+  const broke = manager.add(room("study", "Corrections policies"));
+  broke.study!.status = "budget_exhausted";
+  const list = roomList(manager, 140, 6).lines;
+  expect(list[0]).toContain("1 running");
+  expect(list[0]).toContain("1 out of budget");
+  expect(list[0]).not.toContain("$1 ");
+  expect(list.join("\n")).toContain("2 of 3 workers");
+  expect(list.join("\n")).toContain("$0.21 of $1.00");
+  // Stale "running" marks do not count once the turn is over.
+  busy.controller = null;
+  expect(busy.workerCounts.running).toBe(0);
+  // The picker uses the same order and the whole objective, with cents kept.
+  busy.controller = new AbortController();
+  const label = roomLabel(busy, manager.focused ?? null);
+  expect(label).toContain("Compare fact-checker rating scales");
+  expect(label).toContain("2 of 3 workers");
+  expect(label).toContain("$0.21 of $1.00");
+});
+
+test("the study card pins status, budget, phase and what needs the user", () => {
+  const manager = new RoomManager();
+  manager.add(room("chat"));
+  const r = manager.add(room("study", "Compare fact-checker rating scales"));
+  r.study!.maxCostUsd = 1;
+  r.study!.spentCostMicros = 420_000;
+  r.controller = new AbortController();
+  r.startedAt = 1000;
+  expect(studyCard(manager.list()[0]!, 120, 0)).toEqual([]); // a plain chat has no study
+  const chatWith = manager.list()[0]!;
+  chatWith.session.research = r.study!;
+  expect(studyCard(chatWith, 120, 0)[0]).toContain("Compare fact-checker rating scales"); // chat with research on
+  chatWith.session.research = undefined;
+  expect(r.phase).toBe(0);
+  r.track({ type: "worker", workerId: "a", parentId: "p", task: "t", role: "researcher", model: "m", depth: 1, state: "running" } as never);
+  expect(r.phase).toBe(1);
+  const wide = studyCard(r, 120, 103_000);
+  expect(wide.length).toBe(5);
+  expect(wide[3]).toContain("Research team 1 · 1 researcher · 1 running");
+  expect(wide[0]).toContain("running 1m42");
+  expect(wide[0]).toContain("Compare fact-checker rating scales");
+  expect(wide[1]).toContain("$0.42 of $1.00");
+  expect(wide[1]).toContain("42%");
+  expect(wide[2]).toContain("✓ plan → ● research → ○ review → ○ report");
+  r.track({ type: "worker", workerId: "b", parentId: "p", task: "t", role: "reviewer", model: "m", depth: 1, state: "running" } as never);
+  expect(r.phase).toBe(2);
+  r.question = "Extend the budget by $0.50?";
+  const asked = studyCard(r, 120, 0);
+  expect(asked[asked.length - 1]).toContain("needs you: Extend the budget");
+  // Narrow terminals: no bar or phase strip.
+  const narrow = studyCard(r, 60, 0);
+  expect(narrow.join("\n")).not.toContain("█");
+  expect(narrow.join("\n")).not.toContain("phase");
+  r.study!.status = "completed";
+  expect(r.phase).toBe(3);
 });

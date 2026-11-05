@@ -19,6 +19,7 @@ const PRIORS: Record<string, { tok: number; usd?: number }> = {
   proc: { tok: 200 },
   machine_check: { tok: 300 },
   browser: { tok: 1500 },
+  scholar_search: { tok: 1500 },
   tavily_search: { tok: 1200, usd: 0.008 },
   tavily_extract: { tok: 2500, usd: 0.008 },
   tavily_map: { tok: 800, usd: 0.008 },

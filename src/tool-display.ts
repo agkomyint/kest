@@ -32,6 +32,7 @@ export function actionLabel(name: string, raw: string): string {
     spawn_subagent: "Delegate task",
     background_status: "Check background work",
     background_cancel: "Stop background work",
+    scholar_search: "Search papers",
     tavily_search: "Search the web",
     tavily_extract: "Read web pages",
     tavily_map: "Discover site pages",
@@ -49,11 +50,13 @@ export function actionLabel(name: string, raw: string): string {
     lsi_suggest: "Suggest LSI questions",
     research_prepare: "Prepare a research study",
     research_start_all: "Start all prepared studies",
+    research_resume_all: "Resume all paused studies",
     research_list: "List research studies",
     research_delete: "Delete a research study",
     lsi_add_topic: "Add an LSI topic",
     lsi_release: "Release an LSI claim",
     lsi_post_question: "Post an LSI question",
+    lsi_post_questions: "Post LSI questions in bulk",
     lsi_publish: "Publish research to LSI",
   };
   if (

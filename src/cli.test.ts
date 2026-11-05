@@ -9,6 +9,7 @@ import {
   loadSelectedModel,
   loadStore,
   modelProvider,
+  modelBaseURL,
   modelPricing,
   formatModelPricing,
   saveActiveKey,
@@ -185,6 +186,40 @@ test("model catalog covers both providers and resolves owners", () => {
   expect(modelProvider(BASETEN_MODEL)).toBe("baseten");
   expect(modelProvider(MODAL_MODEL)).toBe("modal");
   expect(modelProvider("no-such-model")).toBeNull();
+});
+
+test("modal models each get their own endpoint but share one proxy token", () => {
+  const modal = parseCredentials({
+    provider: "modal",
+    tokenId: "wk-id",
+    tokenSecret: "ws-secret",
+  });
+  const muse = endpointFor(modal);
+  expect(muse.baseURL).toBe(MODAL_BASE_URL);
+  expect(muse.model).toBe(MODAL_MODEL);
+  expect(endpointFor(modal, MODAL_MODEL)).toEqual(muse);
+  expect(endpointFor(modal, "no-such-model")).toEqual(muse);
+
+  const deepseek = endpointFor(modal, "deepseek-ai/DeepSeek-V4.1-Flash");
+  expect(deepseek.baseURL).toBe(
+    "https://myintkoaung4--ep-deepseek-v4-1-flash-server.us-west.modal.direct/v1",
+  );
+  expect(deepseek.model).toBe("deepseek-ai/DeepSeek-V4.1-Flash");
+  expect(deepseek.apiKey).toBe("wk-id.ws-secret");
+  expect(deepseek.apiKey).toBe(muse.apiKey);
+  expect(modelProvider("deepseek-ai/DeepSeek-V4.1-Flash")).toBe("modal");
+  expect(
+    modelPricing("modal", "deepseek-ai/DeepSeek-V4.1-Flash")?.note,
+  ).toContain("unverified");
+  // The Nebius DeepSeek id is a different model and must not move to Modal's URL.
+  expect(modelProvider("deepseek-ai/DeepSeek-V4.1-Flash-1017")).toBe("nebius");
+  expect(modelBaseURL("modal", "deepseek-ai/DeepSeek-V4.1-Flash", "x")).toBe(
+    deepseek.baseURL,
+  );
+  expect(modelBaseURL("modal", MODAL_MODEL, "x")).toBe(MODAL_BASE_URL);
+  expect(modelBaseURL("custom", "anything", "https://own/v1")).toBe(
+    "https://own/v1",
+  );
 });
 
 test("model prices are provider-specific and unknown models remain unpriced", () => {

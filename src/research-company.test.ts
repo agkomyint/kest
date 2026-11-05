@@ -10,6 +10,8 @@ import {
   recoverCompany,
   validateCompany,
 } from "./research-company";
+import { allowModelsForTests } from "./research-models";
+allowModelsForTests(["model-a","model-b","lead-model","review-model","worker-model"]);
 
 test("manual summaries reserve persisted project budget and cannot bypass its limit", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "kest-company-summary-"));

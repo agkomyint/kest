@@ -184,3 +184,31 @@ test("Bun automation guidance refreshes resumed contexts without duplication", (
   ).toHaveLength(2);
   expect(String(resumed.messages[0]!.content)).toContain("User goal:");
 });
+
+test("a user-chosen model is pinned: children ignore profile/model picks", async () => {
+  const agent = testAgent();
+  (agent as any).modelOverride = "deepseek-ai/DeepSeek-V4.1-Flash";
+  let seen: any;
+  agent.runChild = async (...a: any[]) => {
+    seen = a;
+    return "ok";
+  };
+  const out = await agent.executeSpawn(
+    JSON.stringify({ task: "Explore X", profile: "baseten", model: "other/model" }),
+    { provider: "baseten", apiKey: "k" },
+    new AbortController().signal,
+    () => {},
+  );
+  expect(out).toBe("ok");
+  expect(JSON.stringify(seen)).not.toContain("other/model");
+});
+
+test("headless runs never touch LSI unless --auto-publish", async () => {
+  const { lsiKey } = await import("./lsi");
+  process.env.KEST_NO_LSI = "1";
+  try {
+    expect(await lsiKey()).toBeNull();
+  } finally {
+    delete process.env.KEST_NO_LSI;
+  }
+});

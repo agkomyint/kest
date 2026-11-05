@@ -237,3 +237,13 @@ test("unused prestarted Bun is stopped and denied scripts never execute", async 
   await proc.exited;
   expect(tools["preparedShell"]).toBeNull();
 });
+
+test("an identical read_file repeated moments later collapses to a stub, and re-reads after a change", async () => {
+  await Bun.write(join(root, "a.txt"), "one\ntwo\n");
+  const first = await call("read_file", { path: "a.txt" });
+  expect(first).toContain("1  one");
+  const again = await call("read_file", { path: "a.txt" });
+  expect(again).toContain("Unchanged");
+  await Bun.write(join(root, "a.txt"), "one\nthree\n");
+  expect(await call("read_file", { path: "a.txt" })).toContain("three");
+});

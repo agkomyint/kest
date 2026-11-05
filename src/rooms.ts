@@ -1,3 +1,4 @@
+import { foldWorker, teamHead, workerRow, type WorkerStat } from "./team-view";
 import type { Agent, AgentEvent } from "./agent";
 import type { Approval } from "./tools";
 import type { Session } from "./sessions";
@@ -67,6 +68,25 @@ export class Room {
   /** Text of the director's latest reply, for the needs-you line. */
   lastText = "";
   startedAt = 0;
+  /** Workers this study has started, by state, for the "3 of 5 workers" part of its row. */
+  readonly workers = new Map<string, WorkerStat>();
+  /** Whether the pinned card lists the team's workers (^T toggles). */
+  teamOpen = true;
+  track(event: AgentEvent) {
+    if (event.type === "worker") foldWorker(this.workers, event as never, performance.now());
+  }
+  /** Where the study is: planning, researching, in review, or reported. Read from the workers started. */
+  get phase(): 0 | 1 | 2 | 3 {
+    if (this.research?.status === "completed") return 3;
+    const roles = [...this.workers.values()].map((w) => w.role.toLowerCase());
+    if (roles.some((r) => r.includes("review"))) return 2;
+    return roles.length ? 1 : 0;
+  }
+  /** Workers working now and workers started this run. Stale "running" marks do not count once the turn ended. */
+  get workerCounts() {
+    const states = [...this.workers.values()].map((w) => w.state);
+    return { running: this.running ? states.filter((v) => v === "running").length : 0, total: states.length };
+  }
   constructor(
     readonly id: string,
     readonly kind: RoomKind,
@@ -74,6 +94,11 @@ export class Room {
     public agent: Agent,
     readonly browser: BrowserSession,
   ) {}
+
+  /** The research state of this room, including a chat that has research switched on. */
+  get research(): CompanyState | null {
+    return this.study ?? this.agent.research ?? this.session.research ?? null;
+  }
 
   get study(): CompanyState | null {
     return this.kind === "study"
@@ -141,6 +166,70 @@ export function studySpentUsd(study: CompanyState | null): number {
     ? (study.spentCostMicros + study.estimatedCostMicros) / 1_000_000
     : 0;
 }
+
+const PHASES = ["plan", "research", "review", "report"];
+const BAR = 20;
+
+/**
+ * The pinned card above a study's transcript: objective, status and time; money as a bar;
+ * the phase strip; and what the study needs from the user. Empty for the chat room.
+ * Two rows on narrow terminals, four on wide ones.
+ */
+export function studyCard(room: Room, width: number, now: number): string[] {
+  const study = room.research;
+  if (!study) return [];
+  const spent = studySpentUsd(study);
+  const cap = study.maxCostUsd;
+  const status: RoomStatus = room.kind === "study" ? room.status : room.needsYou ? "needs-you" : study.status === "completed" ? "done" : study.status === "budget_exhausted" ? "budget" : room.running ? "running" : study.status === "ready" ? "ready" : "paused";
+  const age = room.startedAt && room.running ? ` ${clockText(now - room.startedAt)}` : "";
+  const { running, total } = room.workerCounts;
+  const crew = room.running && total ? ` · ${running} of ${total} workers` : "";
+  const objective = (study.objective ?? room.session.title).replace(/\s+/g, " ");
+  const money = cap === null ? `$${spent.toFixed(2)}` : `$${spent.toFixed(2)} of $${cap.toFixed(2)}`;
+  const state = `${statusSymbol(status)} ${statusWord(status)}${age}`;
+  const needs = room.pending.length
+    ? `needs you: approve ${room.pending[0]!.request}${room.pending.length > 1 ? ` (+${room.pending.length - 1})` : ""}`
+    : room.question
+      ? `needs you: ${room.question.replace(/\s+/g, " ")}`
+      : "";
+  const needsRow = needs ? [clip(`▲ ${needs}`, width).trimEnd()] : [];
+  if (width < 80) {
+    const short = cap === null ? `$${spent.toFixed(2)}` : `$${spent.toFixed(2)}/$${cap.toFixed(2)}`;
+    const line = `${statusSymbol(status)}${age} ${short}${room.running && total ? ` ${running}/${total}w` : ""} ${objective}`;
+    return [clip(line, width).trimEnd(), ...needsRow];
+  }
+  const filled = cap ? Math.min(BAR, Math.round((spent / cap) * BAR)) : 0;
+  const pct = cap ? ` ${Math.min(999, Math.round((spent / cap) * 100))}%` : "";
+  const bar = cap ? `${"█".repeat(filled)}${"░".repeat(BAR - filled)}${pct}` : "";
+  const phase = room.phase;
+  const strip = PHASES.map((name, i) => `${i < phase || status === "done" ? "✓" : i === phase ? (room.running ? "●" : "◐") : "○"} ${name}`).join(" → ");
+  return [
+    clip(`${state}  ${objective}`, width).trimEnd(),
+    clip(`${money}  ${bar}${crew}`, width).trimEnd(),
+    clip(`phase  ${strip}`, width).trimEnd(),
+    ...teamRows(room, width, now),
+    ...needsRow,
+  ];
+}
+
+/** Pinned team block: its head, then up to four live workers; finished ones are summarised. */
+function teamRows(room: Room, width: number, now: number): string[] {
+  const all = [...room.workers.values()];
+  if (!all.length || !room.teamOpen || (!room.running && !all.some((w) => w.state === "error"))) return [];
+  const live = all.filter((w) => w.state === "running" || w.state === "error");
+  const shown = live.slice(0, 4);
+  const base = Math.min(...all.map((w) => w.depth));
+  const rows = [teamHead(all, 1, now), ...shown.map((w) => `  ${workerRow(w, now, base)}`)];
+  if (live.length > shown.length) rows.push(`  … ${live.length - shown.length} more running`);
+  return rows.map((r) => clip(r, width).trimEnd());
+}
+
+const statusWord = (status: RoomStatus) =>
+  ({ chat: "chat", "needs-you": "needs you", budget: "out of budget", running: "running", paused: "paused", ready: "ready", done: "done" })[status];
+const clockText = (ms: number) => {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return s >= 60 ? `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}` : `${s}s`;
+};
 
 export class RoomManager {
   private readonly rooms = new Map<string, Room>();
@@ -223,7 +312,7 @@ const symbols: Record<RoomStatus, string> = {
   running: "●",
   "needs-you": "▲",
   paused: "⏸",
-  budget: "$",
+  budget: "⊘",
   done: "✓",
 };
 export const statusSymbol = (status: RoomStatus) => symbols[status];
@@ -269,7 +358,7 @@ const clip = (text: string, width: number) =>
 
 const stateSymbols: [RoomStatus, string][] = [
   ["needs-you", "▲"],
-  ["budget", "$"],
+  ["budget", "⊘"],
   ["running", "●"],
   ["paused", "⏸"],
   ["ready", "○"],
@@ -305,10 +394,20 @@ export function roomList(
   if (ordered.length < 2) return { lines: [], targets: [] };
   const studies = ordered.filter((room) => room.kind === "study");
   const count = (status: RoomStatus) => studies.filter((room) => room.status === status).length;
-  const counts = stateSymbols.filter(([status]) => count(status)).map(([status, symbol]) => `${symbol}${count(status)}`);
+  const words: Record<string, string> = { "needs-you": "need you", budget: "out of budget", running: "running", paused: "paused", ready: "ready", done: "done" };
+  const present = stateSymbols.filter(([status]) => count(status));
   const spent = manager.totalSpentUsd();
   const cap = manager.limits.totalUsd;
-  const header = `${counts.join(" ")}${note ? ` · ${note}` : ""} · ${studies.length} stud${studies.length === 1 ? "y" : "ies"} · ${money(spent)}${cap !== null ? `/${cap}` : ""}`;
+  const summary = `${note ? ` · ${note}` : ""} · ${studies.length} stud${studies.length === 1 ? "y" : "ies"} · ${money(spent)}${cap !== null ? ` of ${money(cap)}` : ""} spent`;
+  const wordy = present.map(([status, symbol]) => `${symbol}${count(status)} ${words[status]}`).join(" · ");
+  const compact = present.map(([status, symbol]) => `${symbol}${count(status)}`).join(" ");
+  // Words when they fit next to the hint, bare symbols otherwise.
+  const hintWidth = 24;
+  const active = present.filter(([status]) => status !== "ready" && status !== "done");
+  const idle = studies.length - active.reduce((n, [status]) => n + count(status), 0);
+  const medium = `${active.map(([status, symbol]) => `${symbol}${count(status)} ${words[status]}`).join(" · ")}${idle ? `${active.length ? " · " : ""}${idle} idle` : ""}`;
+  const fits = (head: string) => width >= head.length + summary.length + hintWidth + 4;
+  const header = `${fits(wordy) ? wordy : fits(medium) ? medium : compact}${summary}`;
   const hint = "Alt+↑↓ rooms · ^K list";
   const headerLine = width >= header.length + hint.length + 6 ? `  ${header}${" ".repeat(width - header.length - hint.length - 2)}${hint}` : `  ${header}`;
   const lines: string[] = [clip(headerLine, width).trimEnd()];
@@ -345,7 +444,9 @@ export function roomList(
     const study = room.study;
     const spentUsd = studySpentUsd(study);
     const budget = study && study.maxCostUsd !== null ? study.maxCostUsd : null;
-    const money_ = budget !== null ? `${money(spentUsd)}/${budget}` : "";
+    const money_ = budget !== null ? `${money(spentUsd)} of ${money(budget)}` : "";
+    const crew = room.workerCounts;
+    const crewText = room.kind === "study" && crew.total ? ` · ${crew.running ? `${crew.running} of ${crew.total} workers` : `${crew.total} workers`}` : "";
     const status = room.status === "needs-you" ? "needs you" : room.status === "budget" ? "out of budget" : room.status;
     const marker = room === manager.focused ? "▸" : " ";
     const live = room.status === "running" && room.startedAt ? ` ${clock(now - room.startedAt)}` : "";
@@ -354,7 +455,7 @@ export function roomList(
       room.kind === "chat"
         ? ""
         : width >= 52
-          ? `  ${status}${live}  ${bar}${money_}`.trimEnd()
+          ? `  ${status}${live}${width >= 70 ? crewText : ""}  ${bar}${money_}`.trimEnd()
           : money_
             ? ` ${money_}`
             : "";
@@ -382,4 +483,19 @@ export function roomList(
     targets.push(null);
   }
   return { lines, targets };
+}
+
+/**
+ * One line per room for the ^K picker: the same urgency order and wording as the list under the
+ * prompt, the whole objective (the list clips it), and money that does not round away cents.
+ */
+export function roomLabel(room: Room, here: Room | null, now = performance.now()): string {
+  const study = room.study;
+  const budget = study && study.maxCostUsd !== null ? study.maxCostUsd : null;
+  const spend = study ? `  ${money(studySpentUsd(study))}${budget !== null ? ` of ${money(budget)}` : ""}` : "";
+  const status = room.status === "needs-you" ? "needs you" : room.status === "budget" ? "out of budget" : room.status;
+  const live = room.status === "running" && room.startedAt ? ` ${clock(now - room.startedAt)}` : "";
+  const crew = room.workerCounts;
+  const workers = room.kind === "study" && crew.total ? ` · ${crew.running} of ${crew.total} workers` : "";
+  return `${statusSymbol(room.status)} ${fullTitle(room)}${room.kind === "chat" ? "" : `  ${status}${live}${workers}${spend}`}${room === here ? "  (here)" : ""}`;
 }

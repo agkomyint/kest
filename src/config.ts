@@ -6,6 +6,10 @@ import { mkdir, chmod } from "node:fs/promises";
 export const MODAL_BASE_URL =
   "https://myintkoaung4--ep-muse-spark-open-816b-a42b-server.us-west.modal.direct/v1";
 export const MODAL_MODEL = "meta-models/Muse-Spark-Open-816B-A42B";
+// DeepSeek V4.1 Flash served from the same Modal workspace; it reuses the Modal proxy token.
+export const MODAL_DEEPSEEK_BASE_URL =
+  "https://myintkoaung4--ep-deepseek-v4-1-flash-server.us-west.modal.direct/v1";
+export const MODAL_DEEPSEEK_MODEL = "deepseek-ai/DeepSeek-V4.1-Flash";
 export const BASETEN_BASE_URL = "https://inference.baseten.co/v1";
 export const BASETEN_MODEL = "meta-models/muse-spark-open-1026";
 // Kept for backwards compatibility with older imports; prefer the per-provider constants.
@@ -33,6 +37,8 @@ export type ModelPricing = {
   currency: "USD";
   inputUsdPerMillionTokens: number;
   outputUsdPerMillionTokens: number;
+  /** Rate for input tokens the provider served from its prompt cache; omitted when unknown (then cache hits cost the full input rate). */
+  cachedInputUsdPerMillionTokens?: number;
   source: string;
   checkedAt: string;
   note: string;
@@ -42,6 +48,8 @@ export type ModelOption = {
   id: string;
   label: string;
   pricing: ModelPricing;
+  /** Endpoint for this model when it differs from its provider's default (e.g. one Modal endpoint per model). */
+  baseURL?: string;
 };
 export const MODELS: ModelOption[] = [
   {
@@ -56,6 +64,20 @@ export const MODELS: ModelOption[] = [
         "https://nebius.com/blog/posts/three-new-open-weight-models-from-us-companies-give-builders-more-choice",
       checkedAt: "2026-10-30",
       note: "Published Token Factory rates; account-specific terms may differ.",
+    },
+  },
+  {
+    provider: "nebius",
+    id: "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+    label: "DeepSeek V4.1 Flash (Token Factory)",
+    pricing: {
+      currency: "USD",
+      inputUsdPerMillionTokens: 0.3,
+      outputUsdPerMillionTokens: 1.2,
+      cachedInputUsdPerMillionTokens: 0.006,
+      source: "https://tokenfactory.nebius.com/",
+      checkedAt: "2026-11-03",
+      note: "Token Factory endpoint rates; cache hits reported by the provider are billed at the $0.006/M cached-input rate.",
     },
   },
   {
@@ -84,7 +106,43 @@ export const MODELS: ModelOption[] = [
       note: "Public Shared Endpoint reference rates; billing for this custom Modal proxy is unverified.",
     },
   },
+  {
+    provider: "modal",
+    id: MODAL_DEEPSEEK_MODEL,
+    label: "DeepSeek V4.1 Flash (Modal)",
+    baseURL: MODAL_DEEPSEEK_BASE_URL,
+    pricing: {
+      currency: "USD",
+      inputUsdPerMillionTokens: 0.3,
+      outputUsdPerMillionTokens: 1.2,
+      cachedInputUsdPerMillionTokens: 0.006,
+      source: "https://tokenfactory.nebius.com/",
+      checkedAt: "2026-11-04",
+      note: "Reference rates for the same model on Nebius Token Factory (cached input $0.006/M); billing for this Modal endpoint (GPU time) is unverified.",
+    },
+  },
 ];
+
+function providerBaseURL(provider: string): string | null {
+  if (provider === "modal") return MODAL_BASE_URL;
+  if (provider === "baseten") return BASETEN_BASE_URL;
+  if (provider === "nebius") return NEBIUS_BASE_URL;
+  return null;
+}
+
+/**
+ * Endpoint for a catalogued model: its own `baseURL` when set, otherwise its
+ * provider's default. Unknown models (custom endpoints) keep `fallback`.
+ */
+export function modelBaseURL(
+  provider: string,
+  model: string | null | undefined,
+  fallback: string,
+): string {
+  const option = MODELS.find((m) => m.provider === provider && m.id === model);
+  if (!option) return fallback;
+  return option.baseURL ?? providerBaseURL(provider) ?? fallback;
+}
 
 // Match both provider and exact model ID. Custom research models must never
 // inherit the price of their provider's default model.
@@ -136,7 +194,10 @@ export function parseCredentials(value: unknown): Credentials {
   };
 }
 
-export function endpointFor(credentials: Credentials): {
+export function endpointFor(
+  credentials: Credentials,
+  model?: string | null,
+): {
   baseURL: string;
   apiKey: string;
   model: string;
@@ -155,10 +216,14 @@ export function endpointFor(credentials: Credentials): {
       model: BASETEN_MODEL,
     };
   }
+  // Each Modal model has its own endpoint but shares the workspace proxy token.
+  const picked = model
+    ? MODELS.find((m) => m.provider === "modal" && m.id === model)
+    : undefined;
   return {
-    baseURL: MODAL_BASE_URL,
+    baseURL: picked ? modelBaseURL("modal", picked.id, MODAL_BASE_URL) : MODAL_BASE_URL,
     apiKey: `${credentials.tokenId}.${credentials.tokenSecret}`,
-    model: MODAL_MODEL,
+    model: picked?.id ?? MODAL_MODEL,
   };
 }
 

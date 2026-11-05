@@ -11,6 +11,8 @@ import {
   recoverCompany,
   replaceCheckpoint,
 } from "./research-company";
+import { allowModelsForTests } from "./research-models";
+allowModelsForTests(["a","b","c"]);
 
 test("large research observations stay bounded for the model while full returned outputs remain journaled", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "kest-research-observations-"));
@@ -43,7 +45,9 @@ test("large research observations stay bounded for the model while full returned
         observations.push(
           ...body.messages
             .filter((m: any) => m.role === "tool")
-            .map((m: any) => m.content),
+            .map((m: any) =>
+              String(m.content).split("\n\n<research-cost-status>")[0],
+            ),
         );
       const calls =
         requests === 1
@@ -52,7 +56,10 @@ test("large research observations stay bounded for the model while full returned
               type: "function",
               function: {
                 name: "read_file",
-                arguments: JSON.stringify({ path: "evidence.txt" }),
+                arguments: JSON.stringify({
+                  path: "evidence.txt",
+                  limit: id === "first" ? 200 : 199,
+                }),
               },
             }))
           : [

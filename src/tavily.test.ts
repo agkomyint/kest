@@ -118,7 +118,7 @@ test("approved requests preserve source URLs and usage while keys stay out of pr
           results: [
             {
               url: "https://example.com/paper",
-              content: "Measured source text",
+              content: "Measured source text tvly-private-fixture",
               reflected: "tvly-private-fixture",
             },
           ],
@@ -258,4 +258,27 @@ test("with Tavily connected, workers keep the browser but search-engine pages ar
   process.env.TAVILY_API_KEY = "tvly-test";
   expect(names(worker)).toContain("browser"); // still there for niche sites and scraping
   expect(names(worker)).toContain("tavily_search");
+});
+
+test("search results are compacted and a repeated call is not paid for twice", async () => {
+  let calls = 0;
+  const tools = new TavilyTools(async () => true, {
+    key: () => "tvly-fixture",
+    fetch: async () => {
+      calls++;
+      return Response.json({
+        request_id: "r",
+        images: ["x"],
+        results: [{ url: "https://example.com/a", title: "A", score: 0.9, favicon: "f", content: "y".repeat(5000) }],
+      });
+    },
+  });
+  const first = await tools.execute("tavily_search", { query: "same" }, new AbortController().signal);
+  expect(first).toContain("https://example.com/a");
+  expect(first).not.toContain("favicon");
+  expect(first).not.toContain("images");
+  expect(first.length).toBeLessThan(2000);
+  const again = await tools.execute("tavily_search", { query: "same" }, new AbortController().signal);
+  expect(again).toContain("Duplicate request");
+  expect(calls).toBe(1);
 });

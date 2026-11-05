@@ -22,6 +22,7 @@ function offered(tier: Tier): string[] {
     const a = mk();
     a.onPrepareResearch = noop;
     a.onStartPrepared = noop;
+    a.onResumeAll = noop;
     a.onListResearch = noop;
     a.onDeleteResearch = noop;
     a.inboxState = () => "send";
@@ -66,7 +67,7 @@ test("a subagent never has a tool its researcher lacks, and nothing below the CE
 
 test("tools that ask for approval say what for, and parallel tools are read-only", () => {
   for (const [name, s] of Object.entries(REGISTRY)) {
-    if (isParallelTool(name)) expect(s.effect).toBe("read");
+    if (isParallelTool(name)) expect(["read", "net"]).toContain(s.effect);
     if (s.effect === "write" || s.effect === "exec") expect(s.approval).not.toBeNull();
     expect(s.ms).toBeGreaterThan(0);
     expect(s.tiers.length).toBeGreaterThan(0);
