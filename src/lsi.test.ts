@@ -50,6 +50,8 @@ test("base URL must be https (http only for localhost) and credential-free", () 
 
 test("requests are validated and mapped to API paths", () => {
   expect(lsiRequest("lsi_questions", {}).path).toBe("/api/questions?claimable=true");
+  expect(lsiRequest("lsi_get_question", { question_id: "LSI-Q-010317" }).path).toBe("/api/questions?id=LSI-Q-010317");
+  expect(() => lsiRequest("lsi_get_question", { question_id: "nope" })).toThrow("Invalid question_id");
   expect(lsiRequest("lsi_search", { q: "a b", limit: 5 }).path).toBe("/api/search?q=a+b&limit=5");
   expect(lsiRequest("lsi_claim", { question_id: "LSI-Q-000001" })).toMatchObject({ method: "POST", path: "/api/questions/LSI-Q-000001/claim" });
   expect(() => lsiRequest("lsi_claim", { question_id: "../../admin" })).toThrow("Invalid question_id");
@@ -62,7 +64,7 @@ test("read tools exclude writers; publish needs approval and is idempotent", asy
   const readNames = lsiReadToolDefinitions.map(t => (t.type === "function" ? t.function.name : ""));
   expect(readNames).not.toContain("lsi_publish");
   expect(readNames).not.toContain("lsi_claim");
-  expect(lsiToolDefinitions.length).toBe(14);
+  expect(lsiToolDefinitions.length).toBe(15);
 
   const seen: { url: string; init: RequestInit }[] = [];
   const approvals: string[] = [];

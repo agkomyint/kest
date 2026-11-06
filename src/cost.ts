@@ -28,6 +28,7 @@ const PRIORS: Record<string, { tok: number; usd?: number }> = {
   tavily_research_status: { tok: 300 },
   lsi_search: { tok: 600 },
   lsi_get_research: { tok: 2500 },
+  lsi_get_question: { tok: 400 },
   kest_guide: { tok: 400 },
   spawn_subagent: { tok: 800 },
   research_team: { tok: 800 },

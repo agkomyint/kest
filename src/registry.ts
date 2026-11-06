@@ -69,6 +69,7 @@ export const REGISTRY: Readonly<Record<string, ToolSpec>> = {
   // LSI (the shared repository)
   lsi_search: spec("lsi", "net", ALL, null, 1_000, true),
   lsi_get_research: spec("lsi", "net", ALL, null, 1_000, true),
+  lsi_get_question: spec("lsi", "net", ALL, null, 1_000, true),
   lsi_domains: spec("lsi", "net", ALL, null, 1_000, true),
   lsi_novelty: spec("lsi", "net", ALL, null, 1_000, true),
   lsi_questions: spec("lsi", "net", ALL, null, 1_000, true),

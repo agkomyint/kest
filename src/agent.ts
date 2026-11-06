@@ -1203,8 +1203,9 @@ export class Agent {
       throw new Error("Tool arguments must be a JSON object.");
     }
     const task = args.task;
-    if (typeof task !== "string" || !task.trim() || task.length > 2000) {
-      throw new Error("spawn_subagent needs a task description.");
+    if (typeof task !== "string" || !task.trim()) throw new Error("spawn_subagent needs a task description.");
+    if (task.length > 8000) {
+      throw new Error(`The task description is ${task.length} characters; the limit is 8000. Shorten it: name the files to read and the checks to make, and leave the detail in those files.`);
     }
     const background = args.background === true;
     if (background && !this.allowBackground)
@@ -1854,7 +1855,9 @@ Wrap-up stopped: ${error instanceof Error ? error.message : "could not complete"
             const next = !lsiCalls.has("lsi_domains")
               ? "Your next action must be a tool call: lsi_domains."
               : !lsiCalls.has("lsi_claim") && !/answers_question/.test(JSON.stringify(this.messages.slice(-6)))
-                ? "Your next action must be a tool call: lsi_questions (find the matching open question; or lsi_post_question if none), then lsi_claim."
+                ? (objectiveQuestion
+                  ? `Your next action must be a tool call: lsi_claim with question_id ${objectiveQuestion} (the task names this question; lsi_get_question reads it).`
+                  : "Your next action must be a tool call: lsi_questions (find the matching open question; or lsi_post_question if none), then lsi_claim.")
                 : "Your next action must be a tool call: lsi_publish with the full URS and answers_question set.";
             this.messages.push({
               role: "user",

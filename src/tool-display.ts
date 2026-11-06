@@ -44,6 +44,7 @@ export function actionLabel(name: string, raw: string): string {
     lsi_domains: "List LSI domains",
     lsi_questions: "List LSI questions",
     lsi_get_research: "Read an LSI record",
+    lsi_get_question: "Read an LSI question",
     lsi_stats: "LSI totals",
     lsi_set_published: "Unpublish or republish a finding",
     lsi_claim: "Claim an LSI question",
