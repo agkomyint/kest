@@ -673,3 +673,29 @@ test("persistent research executes parallel teams, real experiments, review, pap
     });
   }
 }, 60000);
+
+test("each checkpoint leaves a handoff note, and a demanded final line is enforced at completion", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "kest-handoff-"));
+  const state = newCompany("Measure it.\n\nEnd with one line exactly of the form\nANSWER: <value>");
+  state.maxCostUsd = 5;
+  state.reviews = 1;
+  const runtime = new CompanyRuntime(state, cwd);
+  await runtime.record("started", {});
+  await writeFile(join(runtime.directory!, "notes.md"), "partial findings");
+  await runtime.record("progress", {});
+  const handoff = await readFile(join(runtime.directory!, "handoff.md"), "utf8");
+  expect(handoff).toContain("Measure it.");
+  expect(handoff).toContain("notes.md");
+  expect(handoff).toContain("no final report yet");
+
+  const agent = new Agent(cwd, async () => false);
+  agent.research = state;
+  agent.useCompany(runtime, 0);
+  const reportPath = `research/${state.id}/report.md`;
+  await writeFile(join(cwd, reportPath), "# Report\nThe value is 4.\n");
+  await expect(agent.executeCompanyTool("research_complete", JSON.stringify({ reportPath }), { provider: "baseten", apiKey: "x" } as any, AbortSignal.timeout(5000), () => {})).rejects.toThrow(/ANSWER:/);
+  await writeFile(join(cwd, reportPath), "# Report\nThe value is 4.\n\nANSWER: 4\n");
+  const ok = await agent.executeCompanyTool("research_complete", JSON.stringify({ reportPath }), { provider: "baseten", apiKey: "x" } as any, AbortSignal.timeout(5000), () => {});
+  expect(ok).toContain("Study marked complete");
+  await rm(cwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
+});

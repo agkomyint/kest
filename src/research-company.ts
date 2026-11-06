@@ -4,6 +4,7 @@ import {
   writeFile,
   rename,
   readFile,
+  readdir,
   rm,
 } from "node:fs/promises";
 import { join } from "node:path";
@@ -380,6 +381,10 @@ export class CompanyRuntime {
         } finally {
           await rm(temporary, { force: true });
         }
+        // A readable handoff beside the raw state: another harness (or a later session) can resume from it.
+        try {
+          await writeFile(join(directory, "handoff.md"), await this.handoffText(directory));
+        } catch {}
       } catch (error) {
         // Keep the events for the next write instead of losing them.
         this.pending.unshift(...entries);
@@ -390,6 +395,31 @@ export class CompanyRuntime {
     // recover. A single failed write must not poison every sibling worker.
     this.tail = write.catch(() => {});
     await write;
+  }
+  /** Short, human- and agent-readable resume note: objective, status, money, and what files hold the work. */
+  async handoffText(directory: string) {
+    const st = this.state;
+    const files = (await readdir(directory).catch(() => [] as string[])).filter(
+      (f) => !/\.tmp$|^state\.|^events\.jsonl$|^handoff\.md$/.test(f),
+    );
+    const remaining = this.remainingCostMicros;
+    return [
+      `# Handoff: ${st.objective}`,
+      "",
+      `- Status: ${st.status}${st.finalReportPath ? ` (final report: ${st.finalReportPath})` : " (no final report yet)"}`,
+      `- Spent: ${formatUsd(st.spentCostMicros)} of ${st.maxCostUsd === null ? "an unset budget" : `$${st.maxCostUsd.toFixed(2)}`}${remaining === null ? "" : ` · remaining ${formatUsd(remaining)}`}`,
+      `- Model requests: ${st.requests} · delegates: ${st.agents} · independent reviews returned: ${st.reviews}`,
+      `- Updated: ${new Date().toISOString()}`,
+      "",
+      "## Where the work is",
+      ...(files.length ? files.map((f) => `- ${f}`) : ["- (no artifacts saved yet)"]),
+      "- events.jsonl: full ordered log of model calls and tool results",
+      "- state.json: raw run state",
+      "",
+      "## To pick this up",
+      "Read the report or the newest artifacts above, check events.jsonl for the last completed step, and continue from there. Do not repeat finished measurements; spend only the remaining allowance.",
+      "",
+    ].join("\n");
   }
   addAgent(depth: number, reviewer = false) {
     if (depth > this.state.maxDepth)

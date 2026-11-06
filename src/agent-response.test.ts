@@ -42,6 +42,10 @@ async function fixture(
     async fetch(request) {
       await request.json();
       const response = responses[Math.min(calls++, responses.length - 1)]!;
+      if (response.finish === "stall")
+        return new Response(new ReadableStream({ start() {} }), {
+          headers: { "Content-Type": "text/event-stream", Connection: "close" },
+        });
       const chunk = {
         id: "fixture",
         object: "chat.completion.chunk",
@@ -294,4 +298,23 @@ test("direction queued while a run is busy is delivered before the next model ro
       expect(agent.pendingNotes).toHaveLength(0);
     },
   );
+});
+
+test("a model stream that goes silent is aborted and retried instead of hanging the run", async () => {
+  process.env.KEST_FIRST_CHUNK_S = "0.4";
+  try {
+    await fixture(
+      [
+        { delta: {}, finish: "stall" },
+        { delta: { content: "Recovered after stall" }, finish: "stop" },
+      ],
+      async (agent, events) => {
+        await agent.run("hi", credentials, AbortSignal.timeout(8000), (event) => events.push(event));
+        expect(events.some((e) => e.type === "status" && /stalled/i.test(String((e as any).text)))).toBe(true);
+        expect(JSON.stringify(events)).toContain("Recovered after stall");
+      },
+    );
+  } finally {
+    delete process.env.KEST_FIRST_CHUNK_S;
+  }
 });

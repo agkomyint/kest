@@ -1099,6 +1099,12 @@ export class Agent {
           )
       )
         throw new Error("A nonempty final report is required.");
+      // When the task demanded a final line in a fixed form ("end with one line exactly of the form\nANSWER: ..."), the report must carry it.
+      const demanded = this.company.state.objective.match(/exactly of the form\s+([A-Z][A-Z_]{2,}):/);
+      if (demanded && !new RegExp(`^\\W*${demanded[1]}:`, "m").test(report.replace(/^\d+  /gm, "")))
+        throw new Error(
+          `The task required the report to end with a line starting "${demanded[1]}:". Add that line (one line, exactly in the requested form), then call research_complete again.`,
+        );
       this.company.state.status = "completed";
       this.company.state.finalReportPath = args.reportPath;
       // A finished study is published to LSI automatically (claim the best-fit question, then lsi_publish).
@@ -1662,21 +1668,36 @@ Wrap-up stopped: ${error instanceof Error ? error.message : "could not complete"
           ),
         );
         try {
-          const stream = await client.chat.completions.create(
-            {
-              model,
-              messages: withTrailingNote(this.messages, costStatus),
-              tools: this.toolDefs(),
-              temperature: 0.3,
-              max_tokens: maxOutput,
-              top_p: 0.95,
-              reasoning_effort: this.reasoningEffort(),
-              stream: true,
-              stream_options: { include_usage: true },
-            },
-            { signal },
-          );
+          // A stalled stream (provider accepted the request, then went silent) would otherwise hang the
+          // whole run forever: the client timeout only covers connecting. Abort just this request after
+          // an idle gap and retry it; real thinking still streams chunks, so slow replies are untouched.
+          const FIRST_CHUNK_MS = Number(process.env.KEST_FIRST_CHUNK_S ?? 180) * 1000;
+          const IDLE_MS = Number(process.env.KEST_IDLE_CHUNK_S ?? 120) * 1000;
+          for (let tryNo = 0; ; tryNo++) {
+            const idle = new AbortController();
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            const arm = (ms: number) => {
+              clearTimeout(timer);
+              timer = setTimeout(() => idle.abort(), ms);
+            };
+            arm(FIRST_CHUNK_MS);
+            try {
+              const stream = await client.chat.completions.create(
+                {
+                  model,
+                  messages: withTrailingNote(this.messages, costStatus),
+                  tools: this.toolDefs(),
+                  temperature: 0.3,
+                  max_tokens: maxOutput,
+                  top_p: 0.95,
+                  reasoning_effort: this.reasoningEffort(),
+                  stream: true,
+                  stream_options: { include_usage: true },
+                },
+                { signal: AbortSignal.any([signal, idle.signal]) },
+              );
           for await (const chunk of stream) {
+            arm(IDLE_MS);
             // The usage payload arrives on a final chunk with no choices.
             const chunkUsage = chunk.usage;
             if (chunkUsage) {
@@ -1708,6 +1729,19 @@ Wrap-up stopped: ${error instanceof Error ? error.message : "could not complete"
               if (call.function.arguments.length > 1_100_000)
                 throw new Error("Tool arguments are too large.");
               calls.set(delta.index, call);
+            }
+          }
+              break;
+            } catch (error) {
+              // Only an idle abort is retried; user cancel and real API errors propagate unchanged.
+              if (signal.aborted || !idle.signal.aborted || tryNo >= 2) throw idle.signal.aborted && !signal.aborted ? new Error(`The model stopped responding (no data for ${Math.round(IDLE_MS / 1000)}s) after ${tryNo + 1} tries.`) : error;
+              content = "";
+              finish = null;
+              usage = null;
+              calls.clear();
+              emit({ type: "status", text: "Model stalled · retrying" });
+            } finally {
+              clearTimeout(timer);
             }
           }
         } finally {
@@ -1877,7 +1911,7 @@ Wrap-up stopped: ${error instanceof Error ? error.message : "could not complete"
             });
             this.messages.push({
               role: "user",
-              content: `Research controller continuation: continue the original study with ${formatUsd(runtime.remainingCostMicros)} USD available. You manage model selection, delegation and experiments within this shared cost allowance. Do useful work toward the objective; do not spend just to consume credits. Review evidence, challenge weaknesses, implement and measure justified experiments, and preserve negative results. ${runtime.state.strictBudget ? "STRICT BUDGET: you may never propose or request more funding; plan the whole study to finish inside this allowance. Reserve the final 20% for independent review and the final report, then conclude with research_complete even if the result is partial or negative, stating limitations plainly." : "Reserve the final 20% for independent review, final evidence reconciliation and a funding proposal if incomplete."} Call research_complete only when the objective is supported by reviewed artifacts${runtime.state.strictBudget ? " or, under the strict budget, when the allowance leaves no room for more useful work" : ""}. Otherwise continue until the remaining budget cannot fit useful work.`,
+              content: `Research controller continuation: continue the original study with ${formatUsd(runtime.remainingCostMicros)} USD available. You manage model selection, delegation and experiments within this shared cost allowance. Do useful work toward the objective; do not spend just to consume credits. Review evidence, challenge weaknesses, implement and measure justified experiments, and preserve negative results. ${runtime.state.strictBudget ? "STRICT BUDGET: you may never propose or request more funding; plan the whole study to finish inside this allowance. Reserve the final 20% for independent review and the final report, then conclude with research_complete even if the result is partial or negative, stating limitations plainly." : "Reserve the final 20% for independent review, final evidence reconciliation and a funding proposal if incomplete."} If the saved report already answers the objective and a review or documented cross-check agrees, call research_complete NOW: extra polishing, re-verification of settled numbers and renaming files are waste, and finishing promptly is part of the job. Call research_complete only when the objective is supported by reviewed artifacts${runtime.state.strictBudget ? " or, under the strict budget, when the allowance leaves no room for more useful work" : ""}. Otherwise continue until the remaining budget cannot fit useful work.`,
             });
             continue;
           }
